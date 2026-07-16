@@ -1,11 +1,13 @@
 """
-Job Application Copilot — Streamlit frontend v8
+Job Application Copilot — Streamlit frontend v9
 
-Fixes in v8:
-- Removed ternary one-liner col_gem.success(...) if x else col_gem.warning(...)
-  which leaked a DeltaGenerator __repr__ / help() dump onto the page
-- Renamed local badge() -> status_pill() to avoid clash with st.badge() builtin
-- Cleaned up all other one-liner widget calls that could silently call st.help()
+v9 changes:
+- New '🧠 Agent Debate' tab: watch 5 AI agents argue about any job in real time
+- Each agent card: name, provider, opinion, colour-coded confidence bar
+- Synthesis panel: VERDICT, TOP 3 ACTIONS, RISK LEVEL, OVERALL CONFIDENCE
+- Company Tier badge, GOV.UK verification, ATS bypass tip, LinkedIn outreach,
+  follow-up schedule, hiring window indicator
+- All original tabs preserved and unchanged
 """
 import os
 import signal
@@ -268,7 +270,7 @@ def _patch(path, payload, timeout=10):
 
 
 # ---------------------------------------------------------------------------
-# Agent state  — lives in session_state so Streamlit reruns don’t wipe it
+# Agent state
 # ---------------------------------------------------------------------------
 
 def _agent_state() -> dict:
@@ -351,7 +353,6 @@ def launch_agent(config: dict):
 # ---------------------------------------------------------------------------
 
 def status_pill(s, custom_color=None):
-    """Coloured pill badge — renamed from badge() to avoid clash with st.badge()."""
     c = custom_color or {
         "running": "#0ea5e9", "completed": "#10b981", "failed": "#ef4444",
         "queued": "#f59e0b",  "starting":  "#f59e0b", "stopped": "#6b7280",
@@ -366,6 +367,319 @@ def status_pill(s, custom_color=None):
 
 def source_label(s):
     return SOURCE_ICONS.get((s or "").lower(), f"🔍 {s}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent strategy import helper
+# Works whether backend is running or not
+# ---------------------------------------------------------------------------
+
+def _import_strategy():
+    """Import sponsor_strategy without requiring backend to be running."""
+    try:
+        from backend.services.sponsor_strategy import run_multi_agent_debate, hiring_window_score
+        return run_multi_agent_debate, hiring_window_score
+    except ImportError:
+        # Try adding the app directory to sys.path
+        app_dir = str(BASE_DIR)
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        try:
+            from backend.services.sponsor_strategy import run_multi_agent_debate, hiring_window_score
+            return run_multi_agent_debate, hiring_window_score
+        except Exception:
+            return None, None
+
+
+# ---------------------------------------------------------------------------
+# Tab: Agent Debate Panel  🧠
+# ---------------------------------------------------------------------------
+
+AGENT_PROVIDER_COLOURS = {
+    "gemini":     ("#4285F4", "🔵", "Gemini 1.5 Flash"),
+    "huggingface":("#FF6B00", "🟠", "Mistral-7B (HuggingFace)"),
+    "openai":     ("#10a37f", "🟢", "GPT-4o-mini"),
+    "anthropic":  ("#6b46c1", "🟣", "Claude Haiku"),
+    "reddit_oracle": ("#FF4500", "🔴", "Reddit Oracle (Rule-based)"),
+}
+
+TIER_STYLE = {
+    "tier1": ("#10b981", "🏆 Tier 1 — GOV.UK verified + actively sponsoring"),
+    "tier2": ("#f59e0b", "✅ Tier 2 — GOV.UK verified sponsor licence"),
+    "tier3": ("#ef4444", "⚠️  Tier 3 — Not on GOV.UK register — HIGH RISK"),
+}
+
+def _confidence_bar(score, label=""):
+    """Render an HTML confidence bar."""
+    if score is None:
+        return "<em style='color:#888'>No response</em>"
+    color = "#10b981" if score >= 70 else ("#f59e0b" if score >= 40 else "#ef4444")
+    pct   = max(0, min(100, score))
+    return (
+        f'<div style="margin:4px 0">{label}'
+        f'<div style="background:#1e293b;border-radius:8px;height:10px;width:100%;margin-top:4px">'
+        f'<div style="background:{color};width:{pct}%;height:10px;border-radius:8px;"></div></div>'
+        f'<small style="color:{color};font-weight:700">{score}/100</small></div>'
+    )
+
+def _render_agent_card(result: dict):
+    """Render one agent opinion card."""
+    agent_id  = result.get("agent", "unknown")
+    name      = result.get("name", agent_id)
+    opinion   = result.get("opinion") or "*(no response — API key not set)*"
+    confidence= result.get("confidence")
+    colour, emoji, provider_label = AGENT_PROVIDER_COLOURS.get(
+        agent_id, ("#6b7280", "⚪", agent_id)
+    )
+
+    with st.container(border=True):
+        col_icon, col_body = st.columns([1, 9])
+        with col_icon:
+            st.markdown(
+                f'<div style="font-size:2rem;text-align:center;padding-top:8px">{emoji}</div>',
+                unsafe_allow_html=True,
+            )
+        with col_body:
+            st.markdown(
+                f'<span style="color:{colour};font-weight:700;font-size:15px">{name}</span> '
+                f'<span style="color:#888;font-size:12px">— {provider_label}</span>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(opinion)
+            st.markdown(
+                _confidence_bar(confidence, "Confidence: "),
+                unsafe_allow_html=True,
+            )
+
+def _render_synthesis(synthesis: str, consensus: int | None):
+    """Render the synthesis panel."""
+    st.markdown("### 🎯 Agent Synthesis — Final Verdict")
+    with st.container(border=True):
+        if consensus is not None:
+            color = "#10b981" if consensus >= 70 else ("#f59e0b" if consensus >= 40 else "#ef4444")
+            verdict_text = (
+                "APPLY" if consensus >= 70
+                else "APPLY WITH CAUTION" if consensus >= 40
+                else "SKIP"
+            )
+            st.markdown(
+                f'<div style="text-align:center;padding:12px 0">'
+                f'<span style="font-size:2rem;font-weight:900;color:{color}">{verdict_text}</span>'
+                f'<br><span style="color:{color};font-size:18px">'
+                f'Consensus confidence: {consensus}/100</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                _confidence_bar(consensus, "Overall consensus: "),
+                unsafe_allow_html=True,
+            )
+        if synthesis:
+            st.markdown("---")
+            st.markdown(synthesis)
+
+def tab_debate():
+    st.subheader("🧠 Multi-Agent Strategy Debate")
+    st.caption(
+        "Paste a job you're considering — 5 AI agents debate whether you should apply, "
+        "how to approach it, and what the risks are. The Reddit Oracle always runs (no API needed)."
+    )
+
+    # --- Hiring window banner ---
+    run_debate_fn, hiring_window_fn = _import_strategy()
+    if hiring_window_fn:
+        try:
+            win = hiring_window_fn()
+            win_color = "#10b981" if win["score"] >= 70 else ("#f59e0b" if win["score"] >= 40 else "#ef4444")
+            st.markdown(
+                f'<div style="padding:8px 16px;border-radius:8px;'
+                f'background:{win_color}22;border:1px solid {win_color}66;margin-bottom:12px">'
+                f'📅 <strong>Current hiring window ({win["month"]}):</strong> '
+                f'<span style="color:{win_color}">{win["advice"]}</span></div>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            pass
+
+    # --- Import check ---
+    if run_debate_fn is None:
+        st.error(
+            "❌ Could not import `sponsor_strategy.py`. "
+            "Make sure the backend directory is in your Python path and the file exists at "
+            "`backend/services/sponsor_strategy.py`."
+        )
+        return
+
+    # --- Profile ---
+    profile = st.session_state.get("resume_profile") or {}
+    if not profile:
+        st.warning("⚠️ No resume loaded — upload in **⚙️ Setup** for personalised agent opinions.")
+        profile = {"candidate_name": "Candidate", "skills": [], "years_of_experience_hint": "graduate"}
+
+    # --- Job input form ---
+    with st.form("debate_form"):
+        st.markdown("**Enter the job details:**")
+        c1, c2 = st.columns(2)
+        job_title   = c1.text_input("Job Title",   placeholder="e.g. Supply Chain Analyst")
+        company     = c2.text_input("Company",     placeholder="e.g. DHL")
+        c3, c4 = st.columns(2)
+        location    = c3.text_input("Location",   value="United Kingdom")
+        salary      = c4.text_input("Salary",     placeholder="e.g. £35,000")
+        spons_opts  = ["unknown", "yes", "no"]
+        spons_sel   = st.selectbox(
+            "Sponsorship status (from job posting)",
+            spons_opts,
+            format_func=lambda x: {
+                "yes": "✅ Confirmed — they offer sponsorship",
+                "no":  "❌ Explicitly no sponsorship",
+                "unknown": "❓ Not mentioned",
+            }[x],
+        )
+        job_desc    = st.text_area(
+            "Job description excerpt (optional — paste a snippet)",
+            height=100,
+            placeholder="Paste any part of the job description here...",
+        )
+        source      = st.text_input("Source", value="linkedin", placeholder="linkedin / reed / indeed...")
+        run_btn     = st.form_submit_button(
+            "🧠 Run Agent Debate", type="primary", use_container_width=True
+        )
+
+    if run_btn:
+        if not job_title or not company:
+            st.warning("Please enter at least a Job Title and Company.")
+        else:
+            job = {
+                "title":              job_title.strip(),
+                "company":            company.strip(),
+                "location":           location.strip(),
+                "salary":             salary.strip(),
+                "sponsorship_status": spons_sel,
+                "description":        job_desc.strip(),
+                "source":             source.strip(),
+                "url":                "",
+            }
+            with st.spinner("🧠 Agents are debating... (this may take 10–30 seconds depending on API keys)"):
+                try:
+                    result = run_debate_fn(job, profile)
+                    st.session_state["last_debate"] = result
+                except Exception as exc:
+                    st.error(f"Debate failed: {exc}")
+                    st.session_state.pop("last_debate", None)
+
+    # --- Render last debate result ---
+    result = st.session_state.get("last_debate")
+    if not result:
+        st.info(
+            "👆 Fill in the job details above and click **🧠 Run Agent Debate** to start.\n\n"
+            "**The 5 agents:**\n"
+            "- 🔵 **The Optimist** (Gemini) — Why this is a great fit\n"
+            "- 🟠 **The Realist** (Mistral) — Hard numbers, salary, competition\n"
+            "- 🟢 **The Tactician** (GPT-4o) — Exact outreach wording, ATS bypass\n"
+            "- 🟣 **The Risk Analyst** (Claude) — Visa risk, tier, fallback plan\n"
+            "- 🔴 **The Reddit Oracle** — Pattern-matched community wisdom (always runs)\n"
+        )
+        return
+
+    # --- Company tier badge ---
+    tier = result.get("company_tier", "tier3")
+    tier_colour, tier_label = TIER_STYLE.get(tier, ("#6b7280", "Unknown tier"))
+    govuk = result.get("govuk_verified")
+    govuk_html = (
+        '<span style="color:#10b981;font-weight:700">✅ GOV.UK Verified Sponsor</span>'
+        if govuk is True else
+        '<span style="color:#ef4444;font-weight:700">❌ NOT on GOV.UK Register</span>'
+        if govuk is False else
+        '<span style="color:#f59e0b;font-weight:700">❓ GOV.UK register could not be checked</span>'
+    )
+    st.markdown(
+        f'<div style="display:flex;gap:16px;align-items:center;padding:10px 16px;'
+        f'border-radius:8px;background:{tier_colour}22;border:1px solid {tier_colour}55;margin-bottom:16px">'
+        f'<span style="color:{tier_colour};font-weight:700;font-size:15px">{tier_label}</span>'
+        f'&nbsp;&nbsp;|&nbsp;&nbsp;{govuk_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Synthesis first (verdict at top) ---
+    _render_synthesis(
+        result.get("synthesis", ""),
+        result.get("consensus_confidence"),
+    )
+
+    st.markdown("---")
+    st.markdown("### 🗣️ Agent Opinions")
+
+    agents = result.get("agents") or []
+    for agent_result in agents:
+        _render_agent_card(agent_result)
+
+    st.markdown("---")
+
+    # --- ATS Bypass ---
+    ats = result.get("ats_bypass") or {}
+    if ats:
+        with st.expander("🤖 ATS Bypass Tip — How to answer 'Do you require sponsorship?'", expanded=True):
+            st.error(f"❌ **Don't say:** `{ats.get('naive_answer', 'Yes')}`  — many ATS auto-reject this")
+            smart = ats.get('smart_answer', '')
+            st.success(f"✅ **Say instead:**")
+            st.code(smart, language=None)
+            st.caption(ats.get('rationale', ''))
+
+    # --- LinkedIn outreach ---
+    outreach = result.get("linkedin_outreach") or ""
+    if outreach:
+        with st.expander("🔗 LinkedIn Outreach Message (curiosity approach — NOT asking for job)"):
+            st.info(
+                "💡 Per Reddit r/IndiansInUK: send 5 of these per day. Ask a genuine question "
+                "about their career path. Never mention visa. Never ask for a job directly."
+            )
+            st.text_area(
+                "LinkedIn message (edit before sending):",
+                value=outreach,
+                height=140,
+                key="linkedin_outreach_msg",
+            )
+
+    # --- Follow-up schedule ---
+    schedule = result.get("followup_schedule") or []
+    if schedule:
+        with st.expander("📅 Follow-up Schedule (every 5 days — max 3 times)"):
+            st.caption(
+                "Per Reddit consensus: follow up every 5 days after applying. Stop after 3 times. "
+                "Replace [Name], [Job Title], [Date] with real values."
+            )
+            for item in schedule:
+                st.markdown(f"**Day {item['day']} — send on {item['send_on']}**")
+                st.text_area(
+                    item["subject"],
+                    value=item["body"],
+                    height=120,
+                    key=f"followup_{item['day']}",
+                )
+
+    # --- Hiring window reminder ---
+    hw = result.get("hiring_window") or {}
+    if hw:
+        with st.expander("📅 Hiring Window Analysis"):
+            hw_color = "#10b981" if hw.get('score', 0) >= 70 else (
+                "#f59e0b" if hw.get('score', 0) >= 40 else "#ef4444"
+            )
+            st.markdown(
+                f'<strong style="color:{hw_color}">{hw.get("advice", "")}</strong>',
+                unsafe_allow_html=True,
+            )
+            apply_now = hw.get("apply_now", False)
+            if apply_now:
+                st.success("✅ Good time to apply — within peak hiring window.")
+            else:
+                st.warning(
+                    "⚠️ Outside peak window. Consider submitting now anyway for roles that "
+                    "close soon, but expect slower response times."
+                )
+
+    # --- Debug / raw JSON ---
+    with st.expander("🔬 Raw debate data (JSON)"):
+        import json
+        st.json(result)
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +734,6 @@ def tab_agent():
 
     p = st.session_state.get("resume_profile") or {}
 
-    # --- Backend / Gemini status (explicit if/else, no ternary widget calls) ---
     col_be, col_gem = st.columns(2)
     be_status, _ = backend_status_info()
     if be_status == "Running":
@@ -445,7 +758,6 @@ def tab_agent():
 
     default_kw = smart_keywords(p) if p else DEFAULT_KEYWORDS
 
-    # --- Launch form ---
     with st.form("agent_form"):
         c1, c2 = st.columns(2)
         keywords = c1.text_input(
@@ -487,7 +799,6 @@ def tab_agent():
             time.sleep(1.5)
             st.rerun()
 
-    # --- Read live state ---
     a             = _agent_state()
     running       = a.get("running", False)
     status        = a.get("status", "idle")
@@ -512,9 +823,6 @@ def tab_agent():
         )
         return
 
-    # ==========================================================================
-    # LIVE DASHBOARD
-    # ==========================================================================
     st.markdown("---")
 
     r1c1, r1c2 = st.columns([1, 3])
@@ -551,7 +859,7 @@ def tab_agent():
 
     if needs_review_jobs:
         st.markdown(f"### ⚠️ Needs Your Review ({len(needs_review_jobs)})")
-        st.caption("Matched but cover letter couldn’t be generated — apply manually via link.")
+        st.caption("Matched but cover letter couldn't be generated — apply manually via link.")
         for job in reversed(needs_review_jobs[-20:]):
             _render_job_card(job, review_mode=True)
 
@@ -803,14 +1111,23 @@ def main():
         if st.button("↻ Refresh", use_container_width=True):
             st.rerun()
 
-    t1, t2, t3, t4 = st.tabs(["⚙️ Setup", "🤖 AI Agent", "📋 Applications", "🩺 Health"])
+    # 5 tabs — Setup, AI Agent, Agent Debate, Applications, Health
+    t1, t2, t3, t4, t5 = st.tabs([
+        "⚙️ Setup",
+        "🤖 AI Agent",
+        "🧠 Agent Debate",
+        "📋 Applications",
+        "🩺 Health",
+    ])
     with t1:
         tab_setup()
     with t2:
         tab_agent()
     with t3:
-        tab_applications()
+        tab_debate()
     with t4:
+        tab_applications()
+    with t5:
         tab_health()
 
 
