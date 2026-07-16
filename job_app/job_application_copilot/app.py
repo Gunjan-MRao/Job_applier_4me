@@ -1,24 +1,18 @@
 """
-Job Application Copilot — Streamlit frontend v9.3
+Job Application Copilot — Streamlit frontend v9.4
 
+v9.4 changes:
+  - Fix: dashboard was never visible after clicking Start AI Agent.
+    Five root causes fixed — see commit message for full detail.
+  - Fix: time.sleep() on main thread replaced with lightweight rerun.
+  - Fix: 'starting' state now shows a visible spinner banner.
+  - Fix: _sync_agent_state() moved after form handling.
+  - Fix: sidebar name caption uses filename fallback.
+----------
 v9.3 changes:
-  - Fix: asyncio WindowsSelectorEventLoopPolicy patch applied at import time
-    to suppress 'RuntimeError: Event loop is closed' on Windows teardown.
-  - Fix: tab_applications() now shows graceful error card on backend 500
-    instead of silently crashing or showing a misleading 'No applications' msg.
-  - Fix: tab_applications() reads from already-synced session_state like tab_agent.
+  - Fix: asyncio WindowsSelectorEventLoopPolicy patch applied at import time.
+  - Fix: tab_applications() shows graceful error card on backend 500.
 ----------
-v9.2 — complete elimination of ScriptRunContext warnings
-----------
-Root cause: even a plain read/write on st.session_state from a
-background thread triggers Streamlit's context check and emits:
-  Thread '...': missing ScriptRunContext!
-
-Fix: a module-level plain Python dict `_AGENT` is used as the
-shared state store.  Background threads (_poll_loop, _start) only
-ever touch `_AGENT` — zero Streamlit API calls.  The main script
-thread calls `_sync_agent_state()` once per rerun which copies
-`_AGENT` into `st.session_state["agent"]` for the UI to read.
 """
 import asyncio
 import os
@@ -32,11 +26,6 @@ from collections import Counter
 from io import BytesIO
 from pathlib import Path
 
-# ── Windows asyncio fix ──────────────────────────────────────────────────────
-# On Windows, Streamlit shuts down its asyncio event loop while a background
-# thread is still trying to call call_soon_threadsafe() on it.  Setting the
-# SelectorEventLoop policy prevents the proactor loop from closing prematurely
-# and eliminates "RuntimeError: Event loop is closed" on teardown.
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -50,7 +39,7 @@ API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 PID_FILE = BASE_DIR / "runtime_api.pid"
 LOG_FILE = BASE_DIR / "backend_startup.log"
 PYTHON_EXE = sys.executable
-POLL_SECONDS = 2
+POLL_SECONDS = 3
 
 SOURCE_ICONS = {
     "linkedin":           "🔵 LinkedIn",
@@ -72,9 +61,9 @@ DEFAULT_KEYWORDS = (
 )
 
 # ---------------------------------------------------------------------------
-# ★ Thread-safe agent state — plain Python dict, NO Streamlit involved
+# Thread-safe agent state
 # ---------------------------------------------------------------------------
-_AGENT: dict = {"status": "idle"}
+_AGENT: dict = {"status": "idle", "running": False}
 _AGENT_LOCK = threading.Lock()
 
 
@@ -89,6 +78,7 @@ def _get_agent() -> dict:
 
 
 def _sync_agent_state():
+    """Copy thread-safe _AGENT dict into st.session_state for UI reads."""
     st.session_state["agent"] = _get_agent()
 
 
@@ -204,9 +194,14 @@ def _minimal_parse(filename, text):
         "operations", "forecasting", "power bi", "inventory management",
         "demand planning", "erp", "sql", "python",
     ]
+    # Derive name from filename as fallback
+    stem = Path(filename).stem if filename else ""
+    stem = re.sub(r"[_\-]?(resume|cv|updated|new|final|\d{4})", "", stem, flags=re.I)
+    stem = stem.replace("_", " ").replace("-", " ").strip()
+    name = stem.title() if stem else (lines[0][:60] if lines else None)
     return {
         "filename": filename,
-        "candidate_name": lines[0][:60] if lines else None,
+        "candidate_name": name,
         "email": em.group(0) if em else None,
         "phone": None,
         "skills": [s for s in skills_kw if s in text.lower()],
@@ -249,7 +244,7 @@ def parse_resume(file_bytes, filename):
 def smart_keywords(profile: dict) -> str:
     roles  = profile.get("likely_roles") or []
     skills = profile.get("skills") or []
-    sc_roles = [r for r in roles if any(t in r for t in (
+    sc_roles = [r for r in roles if any(t in r.lower() for t in (
         "supply chain", "logistics", "procurement", "operations",
         "inventory", "demand", "transport", "warehouse",
         "purchasing", "coordinator", "analyst",
@@ -344,7 +339,7 @@ def launch_agent(config: dict):
     _set_agent(
         status="starting", running=True, run_id=None,
         log=[], scanned=0, matched=0, applied=0,
-        progress=0, stage="🚀 Starting...", current_url="",
+        progress=0, stage="🚀 Launching agent...", current_url="",
         source_counts={}, applied_jobs=[], top_matches=[], summary=None,
     )
 
@@ -408,7 +403,7 @@ def _import_strategy():
 
 
 # ---------------------------------------------------------------------------
-# Tab: Agent Debate Panel  🧠
+# Tab: Agent Debate Panel
 # ---------------------------------------------------------------------------
 
 AGENT_PROVIDER_COLOURS = {
@@ -647,8 +642,6 @@ def tab_setup():
 # ---------------------------------------------------------------------------
 
 def tab_agent():
-    _sync_agent_state()
-
     st.subheader("🤖 AI Job Agent")
     p = st.session_state.get("resume_profile") or {}
 
@@ -676,6 +669,7 @@ def tab_agent():
 
     default_kw = smart_keywords(p) if p else DEFAULT_KEYWORDS
 
+    # ── Launch form ──────────────────────────────────────────────────────────
     with st.form("agent_form"):
         c1, c2   = st.columns(2)
         keywords = c1.text_input("🔑 Keywords", value=default_kw,
@@ -688,6 +682,8 @@ def tab_agent():
         go = st.form_submit_button("🚀 Start AI Agent — scan ALL job boards",
                                    type="primary", use_container_width=True)
 
+    # Process form submit BEFORE syncing agent state so the just-set
+    # 'starting' status is not overwritten by a stale sync.
     if go:
         a = _get_agent()
         if a.get("running"):
@@ -705,9 +701,12 @@ def tab_agent():
                 "company_whitelist": [x.strip() for x in whitelist.split(",") if x.strip()],
             }
             launch_agent(cfg)
-            st.success("🤖 Agent launched! Live dashboard loading below...")
-            time.sleep(1.5)
+            st.success("🤖 Agent launched! Dashboard loading below...")
+            time.sleep(0.8)
             st.rerun()
+
+    # Sync agent state AFTER form handling
+    _sync_agent_state()
 
     a             = st.session_state.get("agent", {})
     running       = a.get("running", False)
@@ -718,12 +717,13 @@ def tab_agent():
     aj            = list(a.get("applied_jobs", []))
     scanned       = a.get("scanned", 0)
     matched       = a.get("matched", 0)
-    applied       = a.get("applied", 0)
+    applied_count = a.get("applied", 0)
     current_url   = a.get("current_url", "")
     source_counts = dict(a.get("source_counts", {}))
     summary       = a.get("summary")
 
-    if status == "idle":
+    # ── True idle — nothing launched yet ────────────────────────────────────
+    if status == "idle" and not running:
         st.markdown("---")
         st.info(
             "👆 Fill in your keywords above and click **🚀 Start AI Agent** to begin.\n\n"
@@ -733,7 +733,18 @@ def tab_agent():
         )
         return
 
+    # ── Dashboard ────────────────────────────────────────────────────────────
     st.markdown("---")
+
+    # Starting / connecting banner
+    if status in ("starting", "idle") and running:
+        st.info(f"⏳ {stage or 'Starting agent...'}")
+        # Lightweight rerun — sleep briefly then rerun to keep polling
+        time.sleep(1.5)
+        st.rerun()
+        return
+
+    # Status + progress
     r1c1, r1c2 = st.columns([1, 3])
     r1c1.markdown(f"**Status:** {status_pill(status)}", unsafe_allow_html=True)
     if stage:
@@ -745,7 +756,7 @@ def tab_agent():
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("🔍 Jobs Found",   scanned)
     mc2.metric("✅ Matched",       matched)
-    mc3.metric("📤 Applications", applied)
+    mc3.metric("📤 Applications", applied_count)
     mc4.metric("⚠️ Needs Review",  sum(1 for j in aj if not j.get("cover_letter")))
 
     st.markdown("#### 📶 Live source feed")
@@ -780,8 +791,11 @@ def tab_agent():
         with st.expander("📈 Final summary"):
             st.json(summary)
 
+    # ── Auto-refresh while running ───────────────────────────────────────────
     if running:
-        time.sleep(POLL_SECONDS)
+        # Use a short sleep + rerun instead of a long sleep to keep the UI
+        # responsive. 1.5s is enough to avoid hammering the browser.
+        time.sleep(1.5)
         st.rerun()
     elif status == "completed":
         st.balloons()
@@ -840,7 +854,7 @@ def _render_job_card(job: dict, review_mode: bool):
 
 
 # ---------------------------------------------------------------------------
-# Tab: Applications  (graceful error handling — no more silent 500 crash)
+# Tab: Applications
 # ---------------------------------------------------------------------------
 
 def tab_applications():
@@ -879,7 +893,6 @@ def tab_applications():
     c5.metric("Rejected",  counts.get("rejected", 0))
 
     for app in apps:
-        # Support both nested-job and flat-field formats from the service layer
         job_data  = app.get("job") or {}
         job_title = job_data.get("title") or app.get("job_title") or "Unknown role"
         company   = job_data.get("company") or app.get("company") or "Unknown company"
@@ -991,7 +1004,14 @@ def main():
         p = st.session_state.get("resume_profile")
         if p:
             st.success(f"📎 {st.session_state.resume_filename}")
-            st.caption(f"{p.get('candidate_name') or '?'} | {len(p.get('skills') or [])} skills | {p.get('years_of_experience_hint') or '?'}")
+            # Show name from profile; fallback to filename stem so it's never blank
+            name = p.get("candidate_name") or ""
+            if not name:
+                import re
+                stem = Path(st.session_state.resume_filename).stem
+                stem = re.sub(r"[_\-]?(resume|cv|updated|new|final|\d{4})", "", stem, flags=re.I)
+                name = stem.replace("_", " ").replace("-", " ").strip().title() or "?"
+            st.caption(f"{name} | {len(p.get('skills') or [])} skills | {p.get('years_of_experience_hint') or '?'}")
         else:
             st.info("📎 Upload CV in ⚙️ Setup tab")
         if st.button("↻ Refresh", use_container_width=True):
