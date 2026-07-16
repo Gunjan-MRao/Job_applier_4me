@@ -12,10 +12,11 @@ class ResumeUploadResponse(BaseModel):
 
 class ResumeProfilePreview(BaseModel):
     filename: str
-    candidate_name: Optional[str]
-    email: Optional[str]
-    phone: Optional[str]
-    skills: List[str]
-    likely_roles: List[str]
-    years_of_experience_hint: Optional[str]
-    preview: str
+    candidate_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    skills: List[str] = []
+    likely_roles: List[str] = []
+    education: List[str] = []          # returned by build_profile_preview but was missing from schema
+    years_of_experience_hint: Optional[str] = None
+    preview: str = ""

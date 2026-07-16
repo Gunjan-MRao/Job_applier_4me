@@ -1,11 +1,18 @@
 """
-Job Application Copilot — Streamlit frontend v9.2
+Job Application Copilot — Streamlit frontend v9.3
 
+v9.3 changes:
+  - Fix: asyncio WindowsSelectorEventLoopPolicy patch applied at import time
+    to suppress 'RuntimeError: Event loop is closed' on Windows teardown.
+  - Fix: tab_applications() now shows graceful error card on backend 500
+    instead of silently crashing or showing a misleading 'No applications' msg.
+  - Fix: tab_applications() reads from already-synced session_state like tab_agent.
+----------
 v9.2 — complete elimination of ScriptRunContext warnings
 ----------
 Root cause: even a plain read/write on st.session_state from a
-background thread triggers Streamlit’s context check and emits:
-  Thread ‘...’: missing ScriptRunContext!
+background thread triggers Streamlit's context check and emits:
+  Thread '...': missing ScriptRunContext!
 
 Fix: a module-level plain Python dict `_AGENT` is used as the
 shared state store.  Background threads (_poll_loop, _start) only
@@ -13,6 +20,7 @@ ever touch `_AGENT` — zero Streamlit API calls.  The main script
 thread calls `_sync_agent_state()` once per rerun which copies
 `_AGENT` into `st.session_state["agent"]` for the UI to read.
 """
+import asyncio
 import os
 import signal
 import socket
@@ -23,6 +31,14 @@ import threading
 from collections import Counter
 from io import BytesIO
 from pathlib import Path
+
+# ── Windows asyncio fix ──────────────────────────────────────────────────────
+# On Windows, Streamlit shuts down its asyncio event loop while a background
+# thread is still trying to call call_soon_threadsafe() on it.  Setting the
+# SelectorEventLoop policy prevents the proactor loop from closing prematurely
+# and eliminates "RuntimeError: Event loop is closed" on teardown.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import requests
 import streamlit as st
@@ -58,30 +74,21 @@ DEFAULT_KEYWORDS = (
 # ---------------------------------------------------------------------------
 # ★ Thread-safe agent state — plain Python dict, NO Streamlit involved
 # ---------------------------------------------------------------------------
-# Background threads ONLY touch _AGENT.  st.session_state is touched
-# exclusively by _sync_agent_state() which runs on the main script thread.
-
 _AGENT: dict = {"status": "idle"}
 _AGENT_LOCK = threading.Lock()
 
 
 def _set_agent(**kwargs):
-    """Write into _AGENT from any thread.  Zero Streamlit calls."""
     with _AGENT_LOCK:
         _AGENT.update(kwargs)
 
 
 def _get_agent() -> dict:
-    """Read a snapshot of _AGENT from any thread."""
     with _AGENT_LOCK:
         return dict(_AGENT)
 
 
 def _sync_agent_state():
-    """
-    MAIN THREAD ONLY.  Copies _AGENT into st.session_state so the UI
-    can read it.  Called once at the top of tab_agent() each rerun.
-    """
     st.session_state["agent"] = _get_agent()
 
 
@@ -204,6 +211,7 @@ def _minimal_parse(filename, text):
         "phone": None,
         "skills": [s for s in skills_kw if s in text.lower()],
         "likely_roles": [],
+        "education": [],
         "years_of_experience_hint": None,
         "preview": " ".join(text.split())[:600],
     }
@@ -467,7 +475,7 @@ def _render_synthesis(synthesis: str, consensus):
 def tab_debate():
     st.subheader("🧠 Multi-Agent Strategy Debate")
     st.caption(
-        "Paste a job you’re considering — 5 AI agents debate whether you should apply, "
+        "Paste a job you're considering — 5 AI agents debate whether you should apply, "
         "how to approach it, and what the risks are. The Reddit Oracle always runs (no API needed)."
     )
     run_debate_fn, hiring_window_fn = _import_strategy()
@@ -561,7 +569,7 @@ def tab_debate():
     ats = result.get("ats_bypass") or {}
     if ats:
         with st.expander("🤖 ATS Bypass Tip", expanded=True):
-            st.error(f"❌ **Don’t say:** `{ats.get('naive_answer', 'Yes')}` — many ATS auto-reject this")
+            st.error(f"❌ **Don't say:** `{ats.get('naive_answer', 'Yes')}` — many ATS auto-reject this")
             st.success("✅ **Say instead:**")
             st.code(ats.get('smart_answer', ''), language=None)
             st.caption(ats.get('rationale', ''))
@@ -626,6 +634,9 @@ def tab_setup():
             skills_list = p.get("skills") or []
             st.write(f"🎯 **Roles detected:** {roles_str}")
             st.write(f"⚙️ **Skills ({len(skills_list)}):** {', '.join(skills_list) or '—'}")
+        edu_list = p.get("education") or []
+        if edu_list:
+            st.write(f"🎓 **Education:** {', '.join(edu_list)}")
         st.info(f"🔑 **Keywords for agent:** `{smart_keywords(p)}`")
         with st.expander("Resume text preview"):
             st.text(p.get("preview", ""))
@@ -636,8 +647,6 @@ def tab_setup():
 # ---------------------------------------------------------------------------
 
 def tab_agent():
-    # ★ Sync the background thread’s plain dict into st.session_state
-    # This is the ONLY place st.session_state["agent"] is written.
     _sync_agent_state()
 
     st.subheader("🤖 AI Job Agent")
@@ -700,7 +709,6 @@ def tab_agent():
             time.sleep(1.5)
             st.rerun()
 
-    # Read from the already-synced session_state snapshot
     a             = st.session_state.get("agent", {})
     running       = a.get("running", False)
     status        = a.get("status", "idle")
@@ -754,7 +762,7 @@ def tab_agent():
     ready_jobs        = [j for j in aj if j.get("cover_letter")]
     if needs_review_jobs:
         st.markdown(f"### ⚠️ Needs Your Review ({len(needs_review_jobs)})")
-        st.caption("Matched but cover letter couldn’t be generated — apply manually via link.")
+        st.caption("Matched but cover letter couldn't be generated — apply manually via link.")
         for job in reversed(needs_review_jobs[-20:]):
             _render_job_card(job, review_mode=True)
     if ready_jobs:
@@ -772,7 +780,6 @@ def tab_agent():
         with st.expander("📈 Final summary"):
             st.json(summary)
 
-    # ── ONLY the main script thread ever calls st.rerun() ───────────────
     if running:
         time.sleep(POLL_SECONDS)
         st.rerun()
@@ -833,47 +840,77 @@ def _render_job_card(job: dict, review_mode: bool):
 
 
 # ---------------------------------------------------------------------------
-# Tab: Applications
+# Tab: Applications  (graceful error handling — no more silent 500 crash)
 # ---------------------------------------------------------------------------
 
 def tab_applications():
     st.subheader("📋 Application Tracker")
     email = st.session_state.get("candidate_email", "")
     if not email:
-        st.info("Enter your email in the sidebar."); return
+        st.info("Enter your email in the sidebar to view your applications.")
+        return
     if not is_port_open():
-        st.warning("Start the backend first."); return
+        st.warning("⚠️ Backend is not running — start it from the sidebar to view applications.")
+        return
+
     data, err = _get(f"/applications/{email}")
+
     if err or not data:
-        st.info("No applications yet."); return
+        st.error(
+            "⚠️ Could not load applications from backend.\n\n"
+            f"**Detail:** `{err or 'empty response'}`\n\n"
+            "This is usually resolved by restarting the backend (■ Stop → ▶ Start in the sidebar)."
+        )
+        return
+
     apps = data.get("applications", [])
+    total = data.get("total_applications", len(apps))
+
+    if not apps:
+        st.info("📭 No applications tracked yet. Run the AI Agent to start applying!")
+        return
+
     counts = Counter((a.get("status") or "").lower() for a in apps)
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total",     len(apps))
+    c1.metric("Total",     total)
     c2.metric("Draft",     counts.get("draft", 0))
     c3.metric("Submitted", counts.get("submitted", 0))
     c4.metric("Interview", counts.get("interview", 0))
     c5.metric("Rejected",  counts.get("rejected", 0))
+
     for app in apps:
+        # Support both nested-job and flat-field formats from the service layer
+        job_data  = app.get("job") or {}
+        job_title = job_data.get("title") or app.get("job_title") or "Unknown role"
+        company   = job_data.get("company") or app.get("company") or "Unknown company"
+        job_url   = job_data.get("url") or app.get("job_url") or ""
+
         with st.container(border=True):
             ca, cb, cc = st.columns([2, 2, 2])
             with ca:
-                st.markdown(f"**{app['job']['title']}**")
-                st.write(app["job"]["company"])
-                if app["job"].get("url"): st.link_button("View", app["job"]["url"])
+                st.markdown(f"**{job_title}**")
+                st.write(company)
+                if job_url:
+                    st.link_button("View", job_url)
             with cb:
-                st.markdown(status_pill(app["status"]), unsafe_allow_html=True)
-                st.caption(f"Updated: {app['updated_at']}")
+                st.markdown(status_pill(app.get("status", "draft")), unsafe_allow_html=True)
+                st.caption(f"Updated: {app.get('updated_at', '—')}")
             with cc:
                 opts = ["draft", "ready", "submitted", "interview", "rejected"]
-                cur  = app["status"] if app["status"] in opts else "draft"
-                ns   = st.selectbox("Status", opts, index=opts.index(cur), key=f"s_{app['application_id']}")
-                notes = st.text_input("Notes", value=app.get("notes") or "", key=f"n_{app['application_id']}")
+                cur_status = app.get("status", "draft")
+                cur  = cur_status if cur_status in opts else "draft"
+                ns   = st.selectbox("Status", opts, index=opts.index(cur),
+                                    key=f"s_{app['application_id']}")
+                notes = st.text_input("Notes", value=app.get("notes") or "",
+                                      key=f"n_{app['application_id']}")
                 if st.button("Save", key=f"sv_{app['application_id']}"):
                     res, e2 = _patch(f"/applications/{app['application_id']}/status",
                                      {"status": ns, "notes": notes or None, "run_id": None})
-                    if res: st.success("Saved"); st.rerun()
-                    else:   st.error(e2)
+                    if res:
+                        st.success("Saved")
+                        st.rerun()
+                    else:
+                        st.error(e2)
 
 
 # ---------------------------------------------------------------------------

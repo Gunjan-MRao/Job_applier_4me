@@ -7,7 +7,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from backend.core.config import settings
 from backend.schemas.resume import ResumeProfilePreview, ResumeUploadResponse
-from backend.services.monitor.run_store import add_event, get_run
+from backend.services.monitor.run_store import add_event
 from backend.services.parser.resume_parser import build_profile_preview, extract_resume_text
 
 router = APIRouter(prefix="/resume", tags=["resume"])
@@ -58,10 +58,15 @@ async def parse_resume(
     file: UploadFile = File(...),
     run_id: Optional[str] = Form(default=None),
 ):
-    start = time.perf_counter()
+    """
+    Parse a resume file and return a structured profile.
 
-    if run_id and not get_run(run_id):
-        raise HTTPException(status_code=404, detail="Provided run_id was not found")
+    NOTE on run_id: automation runs are stored in-memory inside
+    automation_runtime.py, NOT in run_store's JSON file.  We therefore
+    no longer validate run_id existence here — if it is provided we still
+    log the event, but we never reject the request on its account.
+    """
+    start = time.perf_counter()
 
     try:
         safe_name, save_path = _validate_and_save_upload(file)
@@ -71,58 +76,45 @@ async def parse_resume(
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         if run_id:
-            add_event(
-                run_id,
-                {
-                    "step_name": "resume_parse",
-                    "step_type": "parser",
-                    "status": "completed",
-                    "message": "Resume parsed successfully",
-                    "input_summary": {
-                        "filename": safe_name
-                    },
-                    "output_summary": {
-                        "candidate_name": profile.get("candidate_name"),
-                        "email": profile.get("email"),
-                        "phone": profile.get("phone"),
-                        "years_of_experience_hint": profile.get("years_of_experience_hint"),
-                        "skills_found": len(profile.get("skills", [])),
-                        "likely_roles_found": len(profile.get("likely_roles", [])),
-                    },
-                    "latency_ms": latency_ms,
-                }
-            )
+            try:
+                add_event(
+                    run_id,
+                    {
+                        "step_name": "resume_parse",
+                        "step_type": "parser",
+                        "status": "completed",
+                        "message": "Resume parsed successfully",
+                        "input_summary": {"filename": safe_name},
+                        "output_summary": {
+                            "candidate_name": profile.get("candidate_name"),
+                            "email": profile.get("email"),
+                            "skills_found": len(profile.get("skills", [])),
+                        },
+                        "latency_ms": latency_ms,
+                    }
+                )
+            except Exception:
+                pass  # logging is best-effort; never fail the request
 
         return profile
 
-    except HTTPException as e:
-        if run_id:
-            latency_ms = int((time.perf_counter() - start) * 1000)
-            add_event(
-                run_id,
-                {
-                    "step_name": "resume_parse",
-                    "step_type": "parser",
-                    "status": "failed",
-                    "message": "Resume parse failed",
-                    "error_text": str(e.detail),
-                    "latency_ms": latency_ms,
-                }
-            )
+    except HTTPException:
         raise
 
     except Exception as e:
         if run_id:
-            latency_ms = int((time.perf_counter() - start) * 1000)
-            add_event(
-                run_id,
-                {
-                    "step_name": "resume_parse",
-                    "step_type": "parser",
-                    "status": "failed",
-                    "message": "Resume parse failed",
-                    "error_text": str(e),
-                    "latency_ms": latency_ms,
-                }
-            )
+            try:
+                add_event(
+                    run_id,
+                    {
+                        "step_name": "resume_parse",
+                        "step_type": "parser",
+                        "status": "failed",
+                        "message": "Resume parse failed",
+                        "error_text": str(e),
+                        "latency_ms": int((time.perf_counter() - start) * 1000),
+                    }
+                )
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"Could not parse resume: {e}")

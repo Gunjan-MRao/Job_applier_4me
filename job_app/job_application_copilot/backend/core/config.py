@@ -29,5 +29,8 @@ class Settings(BaseSettings):
     secret_key:   str  = "change-me-in-production"
     debug:        bool = False
 
+    # File storage paths
+    resume_dir: str = "storage/resumes"
+
 
 settings = Settings()

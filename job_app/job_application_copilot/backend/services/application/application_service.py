@@ -50,6 +50,7 @@ def create_application_package(payload: dict) -> dict:
     apps = _load()
     job = payload.get("job") or {}
     application_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
     entry = {
         "application_id":  application_id,
         "candidate_email": payload.get("candidate_email", ""),
@@ -60,10 +61,10 @@ def create_application_package(payload: dict) -> dict:
         "cold_email":      payload.get("cold_email", ""),
         "fit_score":       payload.get("fit_score", 0),
         "sponsorship":     job.get("sponsorship_status", "unknown"),
-        "status":          "pending",
+        "status":          "draft",       # was 'pending' — not a valid ApplicationStatus literal
         "next_action":     "submit",
-        "created_at":      datetime.utcnow().isoformat(),
-        "updated_at":      datetime.utcnow().isoformat(),
+        "created_at":      now,
+        "updated_at":      now,
         "run_id":          payload.get("run_id", ""),
     }
     apps.append(entry)
@@ -75,13 +76,14 @@ def get_applications_for_candidate(candidate_email: str) -> dict:
     """
     Returns all applications for a given candidate email.
     Response shape matches ApplicationListResponse schema.
+    FIX: key is now 'total_applications' (was 'total') to match schema.
     """
     apps = _load()
     matched = [a for a in apps if a.get("candidate_email", "").lower() == candidate_email.lower()]
     return {
-        "candidate_email": candidate_email,
-        "total": len(matched),
-        "applications": matched,
+        "candidate_email":    candidate_email,
+        "total_applications": len(matched),   # KEY FIX: was 'total'
+        "applications":       matched,
     }
 
 
@@ -109,12 +111,15 @@ def update_application_status(
                 "candidate_email": app.get("candidate_email", ""),
                 "next_action":     _next_action(new_status),
                 "updated_at":      app["updated_at"],
+                "notes":           app.get("notes"),
             }
     raise ValueError(f"Application {application_id} not found")
 
 
 def _next_action(status: str) -> str:
     return {
+        "draft":      "review",
+        "ready":      "submit",
         "pending":    "submit",
         "submitted":  "await_response",
         "interview":  "prepare",
