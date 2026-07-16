@@ -13,7 +13,7 @@ Job sources:
   JobSpy  : LinkedIn, Indeed, Google  (Glassdoor removed — broken upstream since May 2025)
   HTML    : Reed, CV-Library, TotalJobs, FindAJob, NHS, UKVisaSponsorships,
             CWJobs, Guardian Jobs, Glassdoor (direct HTML)
-  API     : Adzuna (free, 100 results/call, full descriptions)
+  API     : Adzuna (free UK job API, keyless fallback supported)
 """
 import math
 import threading
@@ -25,6 +25,8 @@ from typing import Dict, List, Optional
 from urllib.parse import quote_plus
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 try:
@@ -56,12 +58,14 @@ RUN_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# Glassdoor removed from JobSpy — broken upstream (400/403) since May 2025.
-# We scrape Glassdoor directly via _glassdoor_html() instead.
 JOBSPY_SITES          = ["linkedin", "indeed", "google"]
 JOBSPY_FALLBACK_URL   = "http://127.0.0.1:8010"
-JOBSPY_MAX_PER_SOURCE = 100   # raised from 50
-HTML_SOURCE_CAP       = 150   # raised from 100
+JOBSPY_MAX_PER_SOURCE = 100
+HTML_SOURCE_CAP       = 150
+
+# Minimum fit score to include a job in results.
+# Lowered to 10 so title-only matches (short LinkedIn descriptions) still surface.
+MIN_FIT_SCORE = 10
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -71,7 +75,28 @@ REQUEST_HEADERS = {
     ),
     "Accept-Language": "en-GB,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
+
+# ---------------------------------------------------------------------------
+# HTTP session with retry + backoff (avoids transient 429 / 503 blocks)
+# ---------------------------------------------------------------------------
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(REQUEST_HEADERS)
+    return session
 
 # ---------------------------------------------------------------------------
 # SEARCH TRACKS  —  Logistics & Supply Chain ONLY
@@ -236,11 +261,22 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
     title    = (job.get("title") or "").lower()
     desc     = (job.get("description") or "").lower()
     combined = f"{title} {desc}"
+    desc_is_short = len(desc.strip()) < 80  # LinkedIn often returns minimal description
 
-    kw_hits     = sum(1 for kw in keywords if kw and kw.strip().lower() in combined)
-    kw_score    = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
-    sc_hits     = sum(1 for t in SC_CORE_TERMS if t in combined)
-    sc_bonus    = min(sc_hits * 3, 20)
+    # Keyword score — if description is short, score from title only so jobs aren’t buried
+    target = title if desc_is_short else combined
+    kw_hits  = sum(1 for kw in keywords if kw and kw.strip().lower() in target)
+    kw_score = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
+
+    # SC term bonus — always check title regardless of description length
+    sc_hits  = sum(1 for t in SC_CORE_TERMS if t in title) + (
+               sum(1 for t in SC_CORE_TERMS if t in desc) if not desc_is_short else 0)
+    sc_bonus = min(sc_hits * 3, 20)
+
+    # Title always earns guaranteed minimum if it contains a supply chain term
+    title_sc_match = any(t in title for t in SC_CORE_TERMS)
+    title_floor    = 15 if title_sc_match else 0
+
     entry_bonus = 15 if any(t in title for t in ENTRY_LEVEL_TITLES) else 0
     spons_bonus = 10 if job.get("sponsorship_status") == "yes" else 0
 
@@ -249,7 +285,11 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
     has_experience = any(c.isdigit() for c in exp_hint)
     senior_penalty = -20 if any(t in title for t in senior_terms) and not has_experience else 0
 
-    score = max(0, min(kw_score + sc_bonus + entry_bonus + spons_bonus + senior_penalty, 100))
+    score = max(
+        title_floor,
+        min(kw_score + sc_bonus + entry_bonus + spons_bonus + senior_penalty, 100)
+    )
+    score = max(0, score)
     level = "strong" if score >= 60 else ("moderate" if score >= 30 else "weak")
     return {"fit_score": score, "fit_level": level, "reasons": [], "gaps": []}
 
@@ -258,7 +298,7 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
 # ---------------------------------------------------------------------------
 
 def _gemini(prompt: str, max_tokens: int = 500) -> Optional[str]:
-    key = settings.gemini_api_key
+    key = getattr(settings, "gemini_api_key", None)
     if not key:
         return None
     try:
@@ -277,7 +317,7 @@ def _gemini(prompt: str, max_tokens: int = 500) -> Optional[str]:
         return None
 
 def _huggingface(prompt: str, max_tokens: int = 500) -> Optional[str]:
-    key = settings.hf_api_key
+    key = getattr(settings, "hf_api_key", None)
     if not key:
         return None
     try:
@@ -299,7 +339,7 @@ def _huggingface(prompt: str, max_tokens: int = 500) -> Optional[str]:
         return None
 
 def _openai_llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
-    if not OPENAI_AVAILABLE or not settings.openai_api_key:
+    if not OPENAI_AVAILABLE or not getattr(settings, "openai_api_key", None):
         return None
     try:
         client = _openai.OpenAI(api_key=settings.openai_api_key)
@@ -313,7 +353,7 @@ def _openai_llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
         return None
 
 def _anthropic_llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
-    if not ANTHROPIC_AVAILABLE or not settings.anthropic_api_key:
+    if not ANTHROPIC_AVAILABLE or not getattr(settings, "anthropic_api_key", None):
         return None
     try:
         client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
@@ -460,7 +500,7 @@ def dedupe_jobs(jobs: List[dict]) -> List[dict]:
     return unique
 
 # ---------------------------------------------------------------------------
-# JobSpy scraping  (LinkedIn, Indeed, Google only — Glassdoor removed)
+# JobSpy scraping
 # ---------------------------------------------------------------------------
 
 def _safe_val(value):
@@ -536,7 +576,6 @@ def jobspy_fallback_http(site: str, keywords: List[str], location: str, run: dic
 def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dict]:
     fn = jobspy_scrape_site if JOBSPY_AVAILABLE else jobspy_fallback_http
     all_jobs: List[dict] = []
-    # Expanded to 4 keyword sets for wider coverage
     kw_sets = [
         keywords,
         SUPPLY_CHAIN_KEYWORDS[:5],
@@ -544,45 +583,54 @@ def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dic
         SUPPLY_CHAIN_BROAD[:3],
     ]
     tasks = [(site, kws) for kws in kw_sets for site in JOBSPY_SITES]
-    with ThreadPoolExecutor(max_workers=12) as ex:  # raised from 8
+    with ThreadPoolExecutor(max_workers=12) as ex:
         futures = {ex.submit(fn, site, kws, location, run): site for site, kws in tasks}
         for fut in as_completed(futures):
             try:
                 all_jobs.extend(fut.result())
             except Exception as exc:
                 add_log(run, "warning", f"[JobSpy] thread error: {exc}")
-    return dedupe_jobs(all_jobs)
+    deduped = dedupe_jobs(all_jobs)
+    add_log(run, "info", f"[JobSpy] total deduped: {len(deduped)}")
+    return deduped
 
 # ---------------------------------------------------------------------------
-# Adzuna API scraper  (free, ~100 results/call, full descriptions)
+# Adzuna API scraper
+# Tries settings.adzuna_app_id / settings.adzuna_app_key first;
+# falls back to unauthenticated endpoint if keys are absent.
 # ---------------------------------------------------------------------------
+
+ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs/gb/search"
 
 def _adzuna(keywords: List[str], run: dict) -> List[dict]:
-    """
-    Adzuna public API — no key required for basic calls.
-    Endpoint: https://api.adzuna.com/v1/api/jobs/gb/search/{page}
-    """
     jobs = []
     search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
-    add_log(run, "info", f"[Adzuna] '{search_term}'")
-    for page in range(1, 4):   # 3 pages × ~50 results = up to 150 per keyword set
+    app_id  = getattr(settings, "adzuna_app_id",  None) or ""
+    app_key = getattr(settings, "adzuna_app_key", None) or ""
+    add_log(run, "info", f"[Adzuna] '{search_term}' (auth={'yes' if app_id else 'no'})")
+    session = _make_session()
+    for page in range(1, 4):
         try:
-            resp = requests.get(
-                f"https://api.adzuna.com/v1/api/jobs/gb/search/{page}",
-                params={
-                    "app_id":       "a8bc89c5",   # public demo credentials
-                    "app_key":      "6c04b7e6b1e81ff38fe9e2b3a5e2d9a7",
-                    "results_per_page": 50,
-                    "what":         search_term,
-                    "where":        "UK",
-                    "content-type": "application/json",
-                },
-                headers=REQUEST_HEADERS,
-                timeout=(5, 20),
-            )
-            if resp.status_code != 200:
+            params: dict = {
+                "results_per_page": 50,
+                "what": search_term,
+                "where": "UK",
+                "content-type": "application/json",
+            }
+            if app_id and app_key:
+                params["app_id"]  = app_id
+                params["app_key"] = app_key
+            resp = session.get(f"{ADZUNA_BASE}/{page}", params=params, timeout=(5, 25))
+            if resp.status_code == 401:
+                add_log(run, "warning", "[Adzuna] 401 — API keys invalid or missing; skipping")
                 break
-            for item in resp.json().get("results", []):
+            if resp.status_code != 200:
+                add_log(run, "warning", f"[Adzuna] page {page} returned {resp.status_code}")
+                break
+            results = resp.json().get("results", [])
+            if not results:
+                break
+            for item in results:
                 desc = item.get("description") or ""
                 jobs.append({
                     "title":              item.get("title") or "Unknown title",
@@ -596,22 +644,24 @@ def _adzuna(keywords: List[str], run: dict) -> List[dict]:
                     "recruiter_email":    None,
                 })
         except Exception as exc:
-            add_log(run, "warning", f"[Adzuna] page {page} skipped: {exc}")
+            add_log(run, "warning", f"[Adzuna] page {page} error: {exc}")
             break
     add_log(run, "info", f"[Adzuna] → {len(jobs)} jobs")
     return jobs
 
 # ---------------------------------------------------------------------------
-# HTML board scraping
+# HTML board scraping  — uses per-call session with retry
 # ---------------------------------------------------------------------------
 
-def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels, sal_sels, desc_sels, base, limit):
+def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels,
+               sal_sels, desc_sels, base, limit):
     jobs = []
     try:
-        add_log(run, "info", f"[HTML] Searching {name}...")
-        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=(5, 20))
+        add_log(run, "info", f"[HTML] {name} → {url[:80]}")
+        session = _make_session()
+        resp = session.get(url, timeout=(8, 25))
         if resp.status_code != 200:
-            add_log(run, "warning", f"[HTML] {name} returned {resp.status_code}")
+            add_log(run, "warning", f"[HTML] {name} returned HTTP {resp.status_code}")
             return []
         soup = BeautifulSoup(resp.text, "html.parser")
         cards = []
@@ -619,6 +669,9 @@ def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels, sal_sel
             cards = soup.select(s)
             if cards:
                 break
+        if not cards:
+            add_log(run, "warning", f"[HTML] {name}: no cards matched selectors {card_sels}")
+            return []
         seen = set()
         for card in cards:
             title_text = href = ""
@@ -634,9 +687,9 @@ def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels, sal_sel
             if job_url in seen:
                 continue
             seen.add(job_url)
-            def _t(sels):
+            def _t(sels, _card=card):
                 for s in sels:
-                    el = card.select_one(s)
+                    el = _card.select_one(s)
                     if el:
                         return el.get_text(" ", strip=True)
                 return ""
@@ -656,87 +709,129 @@ def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels, sal_sel
                 break
         add_log(run, "info", f"[HTML] {name} → {len(jobs)} jobs")
     except Exception as exc:
-        add_log(run, "warning", f"[HTML] {name}: {exc}")
+        add_log(run, "warning", f"[HTML] {name} error: {exc}")
     return jobs
 
+# Reed — API-style URL (more reliable than slug URL)
 def _reed(kw, loc, run):
     q = quote_plus(" ".join(kw[:3]))
     l = quote_plus(loc or "united kingdom")
-    return _html_jobs(run, "reed", f"https://www.reed.co.uk/jobs/{q}-jobs-in-{l}",
-        ["article"], ["h2 a", "h3 a"], [".posted-by"], [".location"], [".salary"],
-        [".description"], "https://www.reed.co.uk", HTML_SOURCE_CAP)
+    return _html_jobs(
+        run, "reed",
+        f"https://www.reed.co.uk/jobs/{q}-jobs-in-{l}?pageno=1",
+        ["article.job-result", "article"],
+        ["h3.title a", "h2 a", "a.job-result-heading__title"],
+        ["a.gtmJobListingPostedBy", "span.posted-by", ".recruiter"],
+        ["li.location span", ".job-result-heading__metadata li"],
+        ["li.salary span", ".salary"],
+        [".job-result-description__details", ".description"],
+        "https://www.reed.co.uk", HTML_SOURCE_CAP)
 
 def _cvlibrary(kw, loc, run):
     q = quote_plus(" ".join(kw[:3]))
     l = quote_plus(loc or "United Kingdom")
-    return _html_jobs(run, "cvlibrary",
-        f"https://www.cv-library.co.uk/search-jobs?keywords={q}&geo={l}",
-        ["li.job", "article.job"], ["h2 a", "h3 a"],
-        [".company"], [".location"], [".salary"], [".description"],
+    return _html_jobs(
+        run, "cvlibrary",
+        f"https://www.cv-library.co.uk/search-jobs?keywords={q}&geo={l}&distance=50&action=search",
+        ["li.job", "article.job", ".job-item"],
+        ["a.job-title", "h2 a", "h3 a"],
+        [".company", ".employer-name"],
+        [".location", ".job-location"],
+        [".salary", ".job-salary"],
+        [".description", ".job-description"],
         "https://www.cv-library.co.uk", HTML_SOURCE_CAP)
 
 def _totaljobs(kw, loc, run):
-    q = "-".join((" ".join(kw[:2]) or "logistics").split())
-    l = "-".join((loc or "united-kingdom").split())
-    return _html_jobs(run, "totaljobs",
-        f"https://www.totaljobs.com/jobs/{q}/in-{l}",
-        ["article", ".job-result"], ["h2 a", "h3 a"],
-        [".company"], [".location"], [".salary"], [".description"],
+    q = quote_plus(" ".join(kw[:2]) or "logistics")
+    l = quote_plus(loc or "United Kingdom")
+    return _html_jobs(
+        run, "totaljobs",
+        f"https://www.totaljobs.com/jobs?keywords={q}&location={l}&radius=50",
+        ["article.job-result", "article", ".job-result"],
+        ["h2 a", "a.job-result-heading__title", "h3 a"],
+        [".job-result-heading__employer", ".company"],
+        [".job-result-heading__metadata .location", ".location"],
+        [".job-result-heading__metadata .salary", ".salary"],
+        [".job-result-description", ".description"],
         "https://www.totaljobs.com", HTML_SOURCE_CAP)
 
 def _cwjobs(kw, loc, run):
     q = quote_plus(" ".join(kw[:3]))
     l = quote_plus(loc or "United Kingdom")
-    return _html_jobs(run, "cwjobs",
-        f"https://www.cwjobs.co.uk/jobs/{q}/in-{l}",
-        ["article", ".job-result", "li.job"], ["h2 a", "h3 a"],
-        [".company", ".employer"], [".location"], [".salary"], [".description"],
+    return _html_jobs(
+        run, "cwjobs",
+        f"https://www.cwjobs.co.uk/jobs?keywords={q}&location={l}&radius=50",
+        ["article.job-result", "article", ".job-result"],
+        ["h2 a", "a.job-result-heading__title", "h3 a"],
+        [".job-result-heading__employer", ".company", ".employer"],
+        [".location"],
+        [".salary"],
+        [".job-result-description", ".description"],
         "https://www.cwjobs.co.uk", HTML_SOURCE_CAP)
 
 def _guardian(kw, run):
     q = quote_plus(" ".join(kw[:3]))
-    return _html_jobs(run, "guardian",
+    return _html_jobs(
+        run, "guardian",
         f"https://jobs.theguardian.com/jobs/{q}/",
-        [".job-posting", "article", "li.job"], ["h2 a", "h3 a", ".job-title a"],
-        [".company", ".employer"], [".location"], [".salary"], [".description"],
+        [".job-posting", "article", "li.job"],
+        ["h2 a", "h3 a", ".job-title a"],
+        [".company", ".employer"],
+        [".location"],
+        [".salary"],
+        [".description"],
         "https://jobs.theguardian.com", HTML_SOURCE_CAP)
 
 def _glassdoor_html(kw, run):
-    """Direct Glassdoor HTML scraper — bypasses JobSpy entirely."""
-    q  = quote_plus(" ".join(kw[:3]))
-    url = f"https://www.glassdoor.co.uk/Job/united-kingdom-{q}-jobs-SRCH_IL.0,14_IN2_{q}.htm"
-    return _html_jobs(run, "glassdoor_html",
-        url,
+    q = quote_plus(" ".join(kw[:3]))
+    return _html_jobs(
+        run, "glassdoor_html",
+        f"https://www.glassdoor.co.uk/Job/united-kingdom-{q}-jobs-SRCH_IL.0,14_IN2_KO15,{15+len(q)}.htm",
         ["li.react-job-listing", "li[data-brandviews]", "article"],
         ["a.jobLink", "a[data-test='job-link']", "h2 a"],
         [".employerName", "[data-test='employer-name']"],
         [".loc", "[data-test='job-location']"],
-        [".salary-estimate", "[data-test='detailSalary']"],
+        [".salary-estimate"],
         [".jobDescriptionContent", ".desc"],
         "https://www.glassdoor.co.uk", HTML_SOURCE_CAP)
 
 def _findajob(kw, run):
     q = quote_plus(" ".join(kw[:2]))
-    return _html_jobs(run, "findajob",
-        f"https://findajob.dwp.gov.uk/search?q={q}&where=UnitedKingdom&pp=25",
-        ["div.search-result", "li.search-result"], ["h3 a", "h2 a"],
-        [".employer"], [".location"], [".salary"], [".description"],
+    return _html_jobs(
+        run, "findajob",
+        f"https://findajob.dwp.gov.uk/search?q={q}&where=United+Kingdom&pp=25",
+        ["div.search-result", "li.search-result"],
+        ["h3 a", "h2 a"],
+        [".employer"],
+        [".location"],
+        [".salary"],
+        [".description"],
         "https://findajob.dwp.gov.uk", HTML_SOURCE_CAP)
 
 def _nhs(kw, run):
     q = quote_plus(" ".join(kw[:2]))
-    return _html_jobs(run, "nhs",
+    return _html_jobs(
+        run, "nhs",
         f"https://www.jobs.nhs.uk/candidate/search/results?keyword={q}&location=United%20Kingdom&distance=200",
-        ["li.vacancy", ".nhsuk-card"], ["h2 a", ".vacancy-title a"],
-        [".employer"], [".location"], [".salary"], [".description"],
+        ["li.vacancy", ".nhsuk-card"],
+        ["h2 a", ".vacancy-title a"],
+        [".employer"],
+        [".location"],
+        [".salary"],
+        [".description"],
         "https://www.jobs.nhs.uk", HTML_SOURCE_CAP)
 
 def _ukvisasponsorships(kw, run):
     q = quote_plus(" ".join(kw[:2]))
-    return _html_jobs(run, "ukvisasponsorships",
+    return _html_jobs(
+        run, "ukvisasponsorships",
         f"https://ukvisasponsorships.co.uk/jobs?q={q}",
-        ["div.job", "article", ".job-card"], ["h2 a", "h3 a"],
-        [".company"], [".location"], [".salary"], [".description"],
+        ["div.job", "article", ".job-card"],
+        ["h2 a", "h3 a"],
+        [".company"],
+        [".location"],
+        [".salary"],
+        [".description"],
         "https://ukvisasponsorships.co.uk", HTML_SOURCE_CAP)
 
 def scrape_all_html(keywords: List[str], location: str, run: dict) -> List[dict]:
@@ -745,43 +840,35 @@ def scrape_all_html(keywords: List[str], location: str, run: dict) -> List[dict]
     visa_kw  = ["visa sponsorship supply chain", "skilled worker logistics", "sponsorship procurement"]
 
     fetchers = [
-        # Reed — 2 keyword sets
-        lambda: _reed(sc_kw, location, run),
+        lambda: _reed(sc_kw,    location, run),
         lambda: _reed(broad_kw, location, run),
-        # CV-Library
         lambda: _cvlibrary(sc_kw, location, run),
-        # TotalJobs — 2 keyword sets
-        lambda: _totaljobs(sc_kw, location, run),
+        lambda: _totaljobs(sc_kw,    location, run),
         lambda: _totaljobs(broad_kw, location, run),
-        # CWJobs (new)
-        lambda: _cwjobs(sc_kw, location, run),
+        lambda: _cwjobs(sc_kw,    location, run),
         lambda: _cwjobs(broad_kw, location, run),
-        # Guardian Jobs (new)
         lambda: _guardian(sc_kw, run),
-        # Glassdoor direct HTML (replaces broken JobSpy Glassdoor)
-        lambda: _glassdoor_html(sc_kw, run),
+        lambda: _glassdoor_html(sc_kw,    run),
         lambda: _glassdoor_html(broad_kw, run),
-        # GOV.UK FindAJob
         lambda: _findajob(sc_kw, run),
-        # NHS Jobs
         lambda: _nhs(sc_kw, run),
-        # UK Visa Sponsorships — 2 keyword sets
-        lambda: _ukvisasponsorships(sc_kw, run),
+        lambda: _ukvisasponsorships(sc_kw,  run),
         lambda: _ukvisasponsorships(visa_kw, run),
-        # Adzuna API — multiple keyword sets
-        lambda: _adzuna(sc_kw, run),
+        lambda: _adzuna(sc_kw,    run),
         lambda: _adzuna(broad_kw, run),
-        lambda: _adzuna(visa_kw, run),
+        lambda: _adzuna(visa_kw,  run),
     ]
 
     all_jobs: List[dict] = []
-    with ThreadPoolExecutor(max_workers=10) as ex:  # raised from 6
+    with ThreadPoolExecutor(max_workers=10) as ex:
         for fut in as_completed([ex.submit(fn) for fn in fetchers]):
             try:
                 all_jobs.extend(fut.result())
-            except Exception:
-                pass
-    return dedupe_jobs(all_jobs)
+            except Exception as exc:
+                add_log(run, "warning", f"[HTML] thread error: {exc}")
+    deduped = dedupe_jobs(all_jobs)
+    add_log(run, "info", f"[HTML/API] total deduped: {len(deduped)}")
+    return deduped
 
 # ---------------------------------------------------------------------------
 # Filters
@@ -904,7 +991,8 @@ def run_automation_pipeline(run_id: str, payload) -> None:
             job["fit_score"] = score_data["fit_score"]
             job["fit_level"] = score_data["fit_level"]
 
-            if score_data["fit_score"] >= 25 and job.get("sponsorship_status") != "no":
+            # Use MIN_FIT_SCORE (10) — ensures title-only matches still appear
+            if score_data["fit_score"] >= MIN_FIT_SCORE and job.get("sponsorship_status") != "no":
                 matched += 1
                 update_run(run_id, jobs_matched=matched)
                 stream_apply_job(job, profile, payload.keywords, auto_apply, run, run_id)
