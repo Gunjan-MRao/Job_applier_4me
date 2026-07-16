@@ -14,6 +14,28 @@ Job sources:
   HTML    : Reed, CV-Library, TotalJobs, FindAJob, NHS, UKVisaSponsorships,
             CWJobs, Guardian Jobs, Glassdoor (direct HTML)
   API     : Adzuna (free UK job API, keyless fallback supported)
+
+VISA SPONSORSHIP STRATEGY (evidence-based, Jan 2027 deadline):
+  Source: Reddit r/SkilledWorkerVisaUK, r/ukvisa, GOV.UK, HirEdge 2026, VisaResume 2026
+
+  VERDICT: ALWAYS disclose visa need. But lead with VALUE, end with sponsorship.
+
+  Why disclose:
+    - Employers who cannot sponsor will filter out → saves application time for Jan deadline
+    - Employers who CAN sponsor must know upfront to initiate Certificate of Sponsorship (CoS)
+      process with UKVI — they cannot do this retroactively after offer
+    - Not disclosing = 'bait and switch' — damages trust, wastes interview slots
+    - Reddit consensus (r/SkilledWorkerVisaUK 2025-2026): "only apply to licensed sponsors,
+      disclose at first interaction"
+
+  How to frame it (NOT apologetic, NOT a request):
+    ✅ "I would require a Certificate of Sponsorship and note that [Company] holds a
+        Skilled Worker sponsor licence." — factual, confident, shows you've done homework
+    ❌ "I need sponsorship" — leads with cost, puts burden on them
+    ❌ Not mentioning it — employer finds out later, CoS process too late
+
+  Where to put it: FINAL paragraph of cover letter, LAST line of cold email.
+  Exception: if job posting explicitly mentions sponsorship available, reference it early.
 """
 import math
 import threading
@@ -66,6 +88,26 @@ HTML_SOURCE_CAP       = 150
 # Minimum fit score to include a job in results.
 # Lowered to 10 so title-only matches (short LinkedIn descriptions) still surface.
 MIN_FIT_SCORE = 10
+
+# ---------------------------------------------------------------------------
+# VISA SPONSORSHIP DISCLOSURE
+# Evidence-based strategy from Reddit r/SkilledWorkerVisaUK, r/ukvisa, GOV.UK.
+# Always disclose — but lead with value, end with sponsorship as logistics.
+# ---------------------------------------------------------------------------
+SPONSORSHIP_DISCLOSURE_CL = (
+    "I would require a Certificate of Sponsorship under the Skilled Worker route. "
+    "I have confirmed that {company} holds a sponsor licence and am fully prepared to "
+    "support the compliance process — this is straightforward from the candidate side."
+)
+SPONSORSHIP_DISCLOSURE_CL_UNKNOWN = (
+    "I would require a Certificate of Sponsorship under the Skilled Worker route. "
+    "I would welcome the chance to discuss whether {company} is able to support this — "
+    "I am prepared to make the process as simple as possible."
+)
+SPONSORSHIP_DISCLOSURE_EMAIL = (
+    "Note: I require a Certificate of Sponsorship (Skilled Worker route) — "
+    "happy to discuss this on a call."
+)
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -263,7 +305,7 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
     combined = f"{title} {desc}"
     desc_is_short = len(desc.strip()) < 80  # LinkedIn often returns minimal description
 
-    # Keyword score — if description is short, score from title only so jobs aren’t buried
+    # Keyword score — if description is short, score from title only so jobs aren't buried
     target = title if desc_is_short else combined
     kw_hits  = sum(1 for kw in keywords if kw and kw.strip().lower() in target)
     kw_score = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
@@ -375,6 +417,7 @@ def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 # Offline cover letter + cold email
+# Evidence-based structure: value first → achievement → sponsorship last (1-2 sentences)
 # ---------------------------------------------------------------------------
 
 def _offline_cover_letter(profile: dict, job: dict) -> str:
@@ -384,6 +427,7 @@ def _offline_cover_letter(profile: dict, job: dict) -> str:
     skills    = profile.get("skills") or []
     exp       = profile.get("years_of_experience_hint") or "relevant"
     roles     = profile.get("likely_roles") or []
+    spons     = job.get("sponsorship_status", "unknown")
     sc_skills = [s for s in skills if s in (
         "supply chain", "logistics", "procurement", "sap", "excel",
         "forecasting", "demand planning", "inventory management",
@@ -400,14 +444,32 @@ def _offline_cover_letter(profile: dict, job: dict) -> str:
         detail = "I have worked on demand forecasting and inventory optimisation, and I am confident I can contribute quickly."
     else:
         detail = "I am confident my background in supply chain and logistics aligns well with what you are looking for."
+
+    # Sponsorship disclosure — always include unless explicitly 'no'
+    if spons == "no":
+        spons_para = ""
+    elif spons == "yes":
+        spons_para = (
+            f"\n\nOne practical note: I would require a Certificate of Sponsorship under the "
+            f"Skilled Worker route. I have noted that {company} holds a sponsor licence and am "
+            f"fully prepared to support the compliance process — this is straightforward from "
+            f"the candidate side and I am happy to discuss it."
+        )
+    else:
+        spons_para = (
+            f"\n\nOne practical note: I would require a Certificate of Sponsorship under the "
+            f"Skilled Worker route. I would welcome the chance to discuss whether {company} is "
+            f"able to support this — I am prepared to make the process as simple as possible."
+        )
+
     return (
         f"Dear Hiring Team at {company},\n\n"
-        f"I am writing to express my strong interest in the {title} position at {company}.\n\n"
-        f"My background in {role_bg} has equipped me with {exp} of experience working with "
+        f"The {title} role at {company} is exactly the kind of position I have been working towards.\n\n"
+        f"My background in {role_bg} has given me {exp} of hands-on experience with "
         f"{top_skills}. {detail}\n\n"
-        f"I am actively seeking a role in the UK where I can grow and make a tangible impact. "
-        f"I would welcome the chance to discuss how I can contribute — "
-        f"would you be open to a brief call this week?\n\n"
+        f"I am ready to contribute from day one and would welcome the chance to discuss how "
+        f"I can add value — would you be open to a brief call this week?"
+        f"{spons_para}\n\n"
         f"Thank you for your consideration.\n\nKind regards,\n{name}"
     )
 
@@ -417,17 +479,28 @@ def _offline_cold_email(profile: dict, job: dict) -> str:
     company   = job.get("company", "your company")
     skills    = profile.get("skills") or []
     exp       = profile.get("years_of_experience_hint") or "relevant"
+    spons     = job.get("sponsorship_status", "unknown")
     sc_skills = [s for s in skills if s in (
         "supply chain", "logistics", "procurement", "sap", "excel", "operations",
     )]
     top_skills = ", ".join(sc_skills[:3]) if sc_skills else ", ".join(skills[:2]) or "supply chain"
+
+    if spons == "no":
+        spons_line = ""
+    else:
+        spons_line = (
+            "\n\nNote: I require a Certificate of Sponsorship (Skilled Worker route) — "
+            "happy to discuss this on a call."
+        )
+
     return (
         f"Subject: {title} — {name}\n\n"
         f"Hi,\n\n"
         f"I came across the {title} role at {company} and wanted to reach out directly.\n\n"
         f"I have {exp} experience in {top_skills} and am actively looking for a "
         f"supply chain or logistics role in the UK. "
-        f"I am a quick learner, detail-oriented, and ready to contribute from day one.\n\n"
+        f"I am a quick learner, detail-oriented, and ready to contribute from day one."
+        f"{spons_line}\n\n"
         f"Would you have 15 minutes for a quick chat?\n\nBest,\n{name}"
     )
 
@@ -439,6 +512,7 @@ def generate_cover_letter(profile: dict, job: dict) -> str:
     name      = profile.get("candidate_name") or "Applicant"
     title     = job.get("title", "the role")
     company   = job.get("company", "your company")
+    spons     = job.get("sponsorship_status", "unknown")
     sc_skills = [s for s in (profile.get("skills") or []) if s in (
         "supply chain", "logistics", "procurement", "sap", "excel",
         "forecasting", "demand planning", "inventory management",
@@ -447,33 +521,74 @@ def generate_cover_letter(profile: dict, job: dict) -> str:
     skills_str = ", ".join(sc_skills[:6]) or ", ".join((profile.get("skills") or [])[:6])
     exp        = profile.get("years_of_experience_hint") or "some"
     desc_snip  = (job.get("description") or "")[:400]
+
+    # Build the sponsorship instruction for the LLM based on job's sponsorship status
+    if spons == "no":
+        spons_instruction = (
+            "Do NOT mention visa sponsorship — this employer cannot sponsor."
+        )
+    elif spons == "yes":
+        spons_instruction = (
+            f"IMPORTANT: In the FINAL paragraph add exactly 1-2 sentences disclosing that "
+            f"{name} requires a Certificate of Sponsorship (Skilled Worker route), and that "
+            f"they have noted {company} holds a sponsor licence and are prepared to support "
+            f"the compliance process. Frame as logistics, NOT as a request. Confident tone. "
+            f"Do NOT apologise for needing sponsorship."
+        )
+    else:
+        spons_instruction = (
+            f"IMPORTANT: In the FINAL paragraph add exactly 1-2 sentences disclosing that "
+            f"{name} requires a Certificate of Sponsorship (Skilled Worker route), and would "
+            f"welcome the chance to discuss whether {company} is able to support this. "
+            f"Frame as logistics, NOT as a request. Confident tone. "
+            f"Do NOT apologise for needing sponsorship."
+        )
+
     prompt = (
         f"Write a concise, genuine cover letter for {name} applying for '{title}' at {company}. "
         f"The candidate has {exp} experience in supply chain and logistics with skills: {skills_str}. "
         f"Job excerpt: {desc_snip}. "
-        "Rules: under 220 words, warm human tone, no filler openers like 'I am writing to', "
-        "no square brackets, first sentence names role + company, include one specific supply chain example, "
-        "end with a direct ask for a call. Do NOT mention visa sponsorship."
+        f"Structure: (1) Opening — specific interest in role + company, "
+        f"(2) Value — strongest qualification matched to JD, "
+        f"(3) Evidence — one specific quantified supply chain achievement, "
+        f"(4) Sponsorship disclosure paragraph. "
+        f"Rules: under 230 words, warm human tone, no filler openers like 'I am writing to', "
+        f"no square brackets, first sentence names role + company, "
+        f"end paragraph 3 with a direct ask for a call. "
+        f"{spons_instruction}"
     )
-    return _llm(prompt, max_tokens=420) or _offline_cover_letter(profile, job)
+    return _llm(prompt, max_tokens=450) or _offline_cover_letter(profile, job)
 
 def generate_cold_email(profile: dict, job: dict) -> str:
     name      = profile.get("candidate_name") or "Applicant"
     title     = job.get("title", "the role")
     company   = job.get("company", "your company")
+    spons     = job.get("sponsorship_status", "unknown")
     sc_skills = [s for s in (profile.get("skills") or []) if s in (
         "supply chain", "logistics", "procurement", "sap", "excel", "operations",
     )]
     skills_str = ", ".join(sc_skills[:4]) or ", ".join((profile.get("skills") or [])[:3])
     exp        = profile.get("years_of_experience_hint") or "some"
+
+    if spons == "no":
+        spons_instruction = "Do NOT mention visa sponsorship — this employer cannot sponsor."
+    else:
+        spons_instruction = (
+            "IMPORTANT: Add a single final line disclosing that the candidate requires a "
+            "Certificate of Sponsorship (Skilled Worker route). Keep it brief, factual, "
+            "and confident — NOT apologetic. Example: "
+            "'Note: I require a Certificate of Sponsorship — happy to discuss on a call.'"
+        )
+
     prompt = (
         f"Write a short cold email from {name} to a recruiter at {company} about '{title}'. "
         f"Background: {exp} experience in supply chain / logistics, skills: {skills_str}. "
-        "Rules: subject line first starting 'Subject:', under 120 words, "
-        "sound human not corporate, no hollow openers, end with a low-friction ask for a call. "
-        "Do NOT mention visa sponsorship."
+        f"Rules: subject line first starting 'Subject:', under 130 words total, "
+        f"sound human not corporate, no hollow openers, "
+        f"end with a low-friction ask for a 15-minute call. "
+        f"{spons_instruction}"
     )
-    return _llm(prompt, max_tokens=280) or _offline_cold_email(profile, job)
+    return _llm(prompt, max_tokens=300) or _offline_cold_email(profile, job)
 
 def generate_resume_tailoring(profile: dict, job: dict) -> dict:
     try:
@@ -596,8 +711,6 @@ def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dic
 
 # ---------------------------------------------------------------------------
 # Adzuna API scraper
-# Tries settings.adzuna_app_id / settings.adzuna_app_key first;
-# falls back to unauthenticated endpoint if keys are absent.
 # ---------------------------------------------------------------------------
 
 ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs/gb/search"
@@ -650,7 +763,7 @@ def _adzuna(keywords: List[str], run: dict) -> List[dict]:
     return jobs
 
 # ---------------------------------------------------------------------------
-# HTML board scraping  — uses per-call session with retry
+# HTML board scraping
 # ---------------------------------------------------------------------------
 
 def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels,
@@ -712,7 +825,6 @@ def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels,
         add_log(run, "warning", f"[HTML] {name} error: {exc}")
     return jobs
 
-# Reed — API-style URL (more reliable than slug URL)
 def _reed(kw, loc, run):
     q = quote_plus(" ".join(kw[:3]))
     l = quote_plus(loc or "united kingdom")
@@ -991,7 +1103,6 @@ def run_automation_pipeline(run_id: str, payload) -> None:
             job["fit_score"] = score_data["fit_score"]
             job["fit_level"] = score_data["fit_level"]
 
-            # Use MIN_FIT_SCORE (10) — ensures title-only matches still appear
             if score_data["fit_score"] >= MIN_FIT_SCORE and job.get("sponsorship_status") != "no":
                 matched += 1
                 update_run(run_id, jobs_matched=matched)
