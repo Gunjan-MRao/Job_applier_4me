@@ -17,11 +17,7 @@ python-jobspy>=0.1.24
 beautifulsoup4>=4.12
 requests>=2.31
 
-# LLM cover letter + cold email (optional)
-openai>=1.30
-anthropic>=0.28
-
-# PDF export (optional)
+# PDF export (optional — app works without it)
 reportlab>=4.2
 
 # Frontend
@@ -29,3 +25,7 @@ streamlit>=1.35
 
 # Utilities
 python-multipart>=0.0.9
+
+# Optional paid LLMs (not required — Gemini/HuggingFace are free)
+# openai>=1.30
+# anthropic>=0.28

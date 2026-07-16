@@ -10,6 +10,11 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite:///./job_application_copilot.db"
 
+    # Free APIs (recommended)
+    gemini_api_key: str = ""       # FREE — aistudio.google.com
+    hf_api_key: str = ""           # FREE — huggingface.co/settings/tokens
+
+    # Optional paid APIs (not required)
     openai_api_key: str = ""
     anthropic_api_key: str = ""
 

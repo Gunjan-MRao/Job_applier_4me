@@ -1,16 +1,17 @@
 """
 automation_runtime.py  –  streaming apply pipeline
 
+LLM priority (all free first):
+  1. Google Gemini 1.5 Flash  — FREE, 1500 req/day  (aistudio.google.com)
+  2. HuggingFace Inference API — FREE tier           (huggingface.co)
+  3. Smart offline template   — ZERO API, always works
+  4. OpenAI / Anthropic       — optional paid fallback
+
 Key behaviours:
-- No max_jobs cap — scans everything it can find
-- As soon as each job is found and scored, it immediately:
-    1. Tailors the resume bullet guidance to that specific job
-    2. Generates a humanised cover letter (LLM or offline template)
-    3. Generates a personalised cold email to the recruiter
-    4. Logs all three to the run state so the UI can show them live
-- Parallel scraping: JobSpy (LinkedIn/Indeed/Glassdoor/Google) + HTML boards simultaneously
-- Blacklist / whitelist filtering
-- Sponsorship-aware (filters out confirmed no-sponsorship roles)
+- No max_jobs cap
+- Stream-apply: cover letter + cold email + resume guidance per match immediately
+- Parallel scraping all sources
+- Sponsorship-aware filtering
 """
 import math
 import threading
@@ -55,8 +56,8 @@ RUN_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 JOBSPY_SITES = ["linkedin", "indeed", "glassdoor", "google"]
 JOBSPY_FALLBACK_URL = "http://127.0.0.1:8010"
-JOBSPY_MAX_PER_SOURCE = 1000   # fetch as many as the site allows
-HTML_SOURCE_CAP = 500           # per HTML board
+JOBSPY_MAX_PER_SOURCE = 1000
+HTML_SOURCE_CAP = 500
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -119,7 +120,7 @@ def create_run(payload) -> dict:
         "logs": [],
         "result_summary": None,
         "top_matches": [],
-        "applied_jobs": [],      # full detail list for UI
+        "applied_jobs": [],
         "created_at": now_iso(),
     }
     add_log(run, "info", "Run created.")
@@ -200,34 +201,159 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
     return {"fit_score": score, "fit_level": level, "reasons": [], "gaps": []}
 
 # ---------------------------------------------------------------------------
-# LLM helpers — cover letter + cold email
+# LLM — FREE first, paid optional, offline always works
 # ---------------------------------------------------------------------------
 
-def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
-    """Try OpenAI then Anthropic; return None if neither available."""
-    if OPENAI_AVAILABLE and settings.openai_api_key:
-        try:
-            client = _openai.OpenAI(api_key=settings.openai_api_key)
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens, temperature=0.75,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception:
-            pass
-    if ANTHROPIC_AVAILABLE and settings.anthropic_api_key:
-        try:
-            client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
-            resp = client.messages.create(
-                model="claude-3-haiku-20240307", max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return resp.content[0].text.strip()
-        except Exception:
-            pass
-    return None
+def _gemini(prompt: str, max_tokens: int = 500) -> Optional[str]:
+    """Google Gemini 1.5 Flash — FREE, 1500 requests/day."""
+    key = settings.gemini_api_key
+    if not key:
+        return None
+    try:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-1.5-flash:generateContent?key={key}"
+        )
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.75},
+        }
+        resp = requests.post(url, json=body, timeout=30)
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception:
+        return None
 
+
+def _huggingface(prompt: str, max_tokens: int = 500) -> Optional[str]:
+    """HuggingFace Inference API — FREE tier, no credit card needed."""
+    key = settings.hf_api_key
+    if not key:
+        return None
+    try:
+        # Use Mistral-7B-Instruct — excellent free model
+        url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+        headers = {"Authorization": f"Bearer {key}"}
+        body = {
+            "inputs": prompt,
+            "parameters": {"max_new_tokens": max_tokens, "temperature": 0.75,
+                           "return_full_text": False},
+        }
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0].get("generated_text", "").strip()
+        return None
+    except Exception:
+        return None
+
+
+def _openai_llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
+    if not OPENAI_AVAILABLE or not settings.openai_api_key:
+        return None
+    try:
+        client = _openai.OpenAI(api_key=settings.openai_api_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens, temperature=0.75,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+
+def _anthropic_llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
+    if not ANTHROPIC_AVAILABLE or not settings.anthropic_api_key:
+        return None
+    try:
+        client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        resp = client.messages.create(
+            model="claude-3-haiku-20240307", max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    except Exception:
+        return None
+
+
+def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
+    """Try free APIs first, then paid, return None to trigger offline fallback."""
+    return (
+        _gemini(prompt, max_tokens)
+        or _huggingface(prompt, max_tokens)
+        or _openai_llm(prompt, max_tokens)
+        or _anthropic_llm(prompt, max_tokens)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Smart offline cover letter (no API needed — still personalised)
+# ---------------------------------------------------------------------------
+
+def _offline_cover_letter(profile: dict, job: dict) -> str:
+    name = profile.get("candidate_name") or "Applicant"
+    title = job.get("title", "the role")
+    company = job.get("company", "your company")
+    skills = profile.get("skills") or []
+    exp = profile.get("years_of_experience_hint") or "relevant"
+    roles = profile.get("likely_roles") or []
+    top_skill = skills[0] if skills else "my core skills"
+    second_skill = skills[1] if len(skills) > 1 else ""
+    skill_line = f"{top_skill} and {second_skill}" if second_skill else top_skill
+    role_context = f"My background in {roles[0]}" if roles else "My background"
+
+    # Extract a hint from job description to make it feel specific
+    desc = (job.get("description") or "").lower()
+    context_line = ""
+    if "excel" in desc:
+        context_line = "I have strong Excel and data analysis skills which I understand are central to this role."
+    elif "supply chain" in desc or "logistics" in desc:
+        context_line = "I have hands-on exposure to supply chain processes and am eager to grow further in this area."
+    elif "team" in desc or "collaboration" in desc:
+        context_line = "I thrive in collaborative environments and have consistently delivered results as part of cross-functional teams."
+    elif "customer" in desc:
+        context_line = "I have experience working in customer-facing contexts and understand the importance of service excellence."
+    else:
+        context_line = f"I am confident my background in {skill_line} aligns well with what you are looking for."
+
+    return (
+        f"Dear Hiring Team at {company},\n\n"
+        f"I was genuinely excited to come across the {title} opportunity at {company} "
+        f"and wanted to apply with enthusiasm.\n\n"
+        f"{role_context} has given me {exp} of experience in {skill_line}. "
+        f"{context_line}\n\n"
+        f"I am currently seeking a role where I can contribute from day one while "
+        f"continuing to grow. I would love the opportunity to speak with you — "
+        f"would you be open to a 20-minute call this week or next?\n\n"
+        f"Thank you for your time.\n\nKind regards,\n{name}"
+    )
+
+
+def _offline_cold_email(profile: dict, job: dict) -> str:
+    name = profile.get("candidate_name") or "Applicant"
+    title = job.get("title", "the role")
+    company = job.get("company", "your company")
+    skills = profile.get("skills") or []
+    exp = profile.get("years_of_experience_hint") or "relevant"
+    top_skills = ", ".join(skills[:3]) if skills else "relevant skills"
+
+    return (
+        f"Subject: {title} — {name}\n\n"
+        f"Hi,\n\n"
+        f"I noticed the {title} role at {company} and wanted to reach out directly "
+        f"rather than just submit an application into the void.\n\n"
+        f"I have {exp} experience with {top_skills}. "
+        f"I am motivated, quick to learn, and looking to make a real contribution at {company}.\n\n"
+        f"Would you have 15 minutes for a quick call this week?\n\n"
+        f"Best,\n{name}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public generation functions
+# ---------------------------------------------------------------------------
 
 def generate_cover_letter(profile: dict, job: dict) -> str:
     name = profile.get("candidate_name") or "Applicant"
@@ -236,28 +362,15 @@ def generate_cover_letter(profile: dict, job: dict) -> str:
     skills = ", ".join((profile.get("skills") or [])[:8])
     exp = profile.get("years_of_experience_hint") or "relevant"
     desc_snip = (job.get("description") or "")[:400]
-
     prompt = (
-        f"Write a concise, genuine, and specific cover letter for {name} applying for "
-        f"'{title}' at {company}. "
-        f"Candidate has {exp} experience. Key skills: {skills}. "
-        f"Job description excerpt: {desc_snip}. "
-        "Rules: under 220 words, no generic filler phrases like 'I am writing to express', "
-        "no placeholder brackets, first sentence must name the specific role and company, "
-        "one concrete example of relevant achievement, end with a specific ask for a call or interview."
+        f"Write a concise, genuine cover letter for {name} applying for '{title}' at {company}. "
+        f"Candidate: {exp} experience, skills: {skills}. "
+        f"Job excerpt: {desc_snip}. "
+        "Rules: under 220 words, no filler phrases like 'I am writing to express', "
+        "no brackets, first sentence names the role+company, one achievement example, "
+        "end with a specific ask for a call."
     )
-    result = _llm(prompt, max_tokens=420)
-    if result:
-        return result
-    # Offline fallback
-    return (
-        f"Dear Hiring Team at {company},\n\n"
-        f"I am excited to apply for the {title} position. With {exp} experience in {skills}, "
-        f"I am confident I can contribute meaningfully to your team from day one.\n\n"
-        f"I would welcome the opportunity to discuss how my background aligns with this role. "
-        f"Please feel free to reach out to arrange a call at your convenience.\n\n"
-        f"Kind regards,\n{name}"
-    )
+    return _llm(prompt, max_tokens=420) or _offline_cover_letter(profile, job)
 
 
 def generate_cold_email(profile: dict, job: dict) -> str:
@@ -266,38 +379,22 @@ def generate_cold_email(profile: dict, job: dict) -> str:
     company = job.get("company", "your company")
     skills = ", ".join((profile.get("skills") or [])[:5])
     exp = profile.get("years_of_experience_hint") or "relevant"
-    recruiter_email = job.get("recruiter_email") or "[recruiter email]"
-
     prompt = (
-        f"Write a short, humanised cold email from {name} to the recruiter at {company} "
-        f"about the '{title}' role. "
-        f"Candidate background: {exp} experience, skills include {skills}. "
-        "Rules: subject line on first line starting with 'Subject:', "
-        "under 120 words in the body, sound like a real human not a bot, "
-        "reference one specific thing about the company that shows genuine interest, "
-        "no hollow phrases like 'I hope this email finds you well', "
-        "end with a clear low-friction ask (e.g. '15-minute call this week?')."
+        f"Write a short humanised cold email from {name} to recruiter at {company} "
+        f"about '{title}'. Background: {exp} exp, skills: {skills}. "
+        "Rules: subject line first starting 'Subject:', under 120 words, "
+        "sound human not a bot, no hollow openers, end with a low-friction ask."
     )
-    result = _llm(prompt, max_tokens=280)
-    if result:
-        return result
-    return (
-        f"Subject: {title} application — {name}\n\n"
-        f"Hi,\n\n"
-        f"I came across the {title} role at {company} and wanted to reach out directly. "
-        f"I have {exp} experience in {skills} and believe I’d be a strong fit.\n\n"
-        f"Would you have 15 minutes for a quick call this week?\n\n"
-        f"Best,\n{name}"
-    )
+    return _llm(prompt, max_tokens=280) or _offline_cold_email(profile, job)
 
 
 def generate_resume_tailoring(profile: dict, job: dict) -> dict:
-    """Uses resume_tailor_service for keyword analysis + guidance."""
     try:
         from backend.services.resume.resume_tailor_service import tailor_resume
         return tailor_resume({"profile": profile, "job": job})
     except Exception:
         return {"note": "Resume tailoring unavailable"}
+
 
 # ---------------------------------------------------------------------------
 # Deduplication
@@ -315,6 +412,7 @@ def dedupe_jobs(jobs: List[dict]) -> List[dict]:
             seen.add(key)
             unique.append(job)
     return unique
+
 
 # ---------------------------------------------------------------------------
 # JobSpy scraping
@@ -402,6 +500,7 @@ def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dic
             except Exception as exc:
                 add_log(run, "warning", f"[JobSpy] thread error: {exc}")
     return dedupe_jobs(all_jobs)
+
 
 # ---------------------------------------------------------------------------
 # HTML board scraping
@@ -523,6 +622,7 @@ def scrape_all_html(keywords: List[str], location: str, run: dict) -> List[dict]
                 pass
     return dedupe_jobs(all_jobs)
 
+
 # ---------------------------------------------------------------------------
 # Filters
 # ---------------------------------------------------------------------------
@@ -541,76 +641,55 @@ def apply_filters(jobs, blacklist, whitelist):
         out.append(job)
     return out
 
+
 # ---------------------------------------------------------------------------
-# STREAM APPLY — process each job immediately as it is found
+# Stream apply
 # ---------------------------------------------------------------------------
 
 def stream_apply_job(job: dict, profile: Optional[dict], keywords: List[str],
                      auto_apply: bool, run: dict, run_id: str) -> None:
-    """
-    Called immediately for every job that passes scoring threshold.
-    Generates: tailored resume guidance + cover letter + cold email.
-    Results stored in run["applied_jobs"] for live UI display.
-    """
     title = job.get("title", "?")
     company = job.get("company", "?")
     fit = job.get("fit_score", 0)
-
     entry = {
-        "title": title,
-        "company": company,
-        "url": job.get("url", ""),
-        "fit_score": fit,
+        "title": title, "company": company,
+        "url": job.get("url", ""), "fit_score": fit,
         "sponsorship_status": job.get("sponsorship_status", "unknown"),
         "source": job.get("source", ""),
-        "cover_letter": None,
-        "cold_email": None,
-        "resume_guidance": None,
+        "cover_letter": None, "cold_email": None, "resume_guidance": None,
     }
-
     if auto_apply and profile:
-        # 1. Resume tailoring
         try:
-            job_for_tailor = {
-                "title": title, "company": company,
-                "description": job.get("description", ""),
-                "skills": [], "url": job.get("url", ""),
-            }
-            guidance = generate_resume_tailoring(profile, job_for_tailor)
-            entry["resume_guidance"] = guidance
+            entry["resume_guidance"] = generate_resume_tailoring(
+                profile, {"title": title, "company": company,
+                          "description": job.get("description", ""),
+                          "skills": [], "url": job.get("url", "")})
         except Exception as exc:
-            add_log(run, "warning", f"Resume tailoring failed for {title}: {exc}")
-
-        # 2. Cover letter
+            add_log(run, "warning", f"Tailoring failed for {title}: {exc}")
         try:
             entry["cover_letter"] = generate_cover_letter(profile, job)
         except Exception as exc:
             add_log(run, "warning", f"Cover letter failed for {title}: {exc}")
-
-        # 3. Cold email
         try:
             entry["cold_email"] = generate_cold_email(profile, job)
         except Exception as exc:
             add_log(run, "warning", f"Cold email failed for {title}: {exc}")
-
         add_log(run, "info",
-                f"✅ Processed: {title} at {company} | fit={fit}% | "
-                f"sponsorship={job.get('sponsorship_status')} | "
-                f"cover_letter={'yes' if entry['cover_letter'] else 'no'} | "
-                f"cold_email={'yes' if entry['cold_email'] else 'no'}")
+                f"✅ {title} @ {company} | fit={fit}% | "
+                f"cl={'yes' if entry['cover_letter'] else 'no'} | "
+                f"email={'yes' if entry['cold_email'] else 'no'}")
     else:
-        add_log(run, "info", f"📌 Matched: {title} at {company} | fit={fit}%")
-
+        add_log(run, "info", f"📌 Matched: {title} @ {company} | fit={fit}%")
     with RUN_LOCK:
         run_obj = RUNS.get(run_id)
         if run_obj:
             run_obj["applied_jobs"].append(entry)
             run_obj["jobs_applied"] = len(run_obj["applied_jobs"])
-            # keep top_matches sorted by fit score
             run_obj["top_matches"] = sorted(
                 run_obj["applied_jobs"],
                 key=lambda x: x.get("fit_score", 0), reverse=True
             )[:20]
+
 
 # ---------------------------------------------------------------------------
 # Main pipeline
@@ -620,88 +699,65 @@ def run_automation_pipeline(run_id: str, payload) -> None:
     run = get_run(run_id)
     if not run:
         return
-
     try:
         update_run(run_id, status="running", stage="scraping", progress_percent=5)
         add_log(run, "info",
                 f"Pipeline start | email={payload.candidate_email} | "
-                f"keywords={payload.keywords} | location={payload.location} | "
-                f"unlimited scan mode")
+                f"keywords={payload.keywords} | location={payload.location}")
+        profile = getattr(payload, "resume_profile", None)
+        blacklist = getattr(payload, "company_blacklist", []) or []
+        whitelist = getattr(payload, "company_whitelist", []) or []
+        auto_apply = getattr(payload, "auto_apply", True)
 
-        profile: Optional[dict] = getattr(payload, "resume_profile", None)
-        blacklist: List[str] = getattr(payload, "company_blacklist", []) or []
-        whitelist: List[str] = getattr(payload, "company_whitelist", []) or []
-        auto_apply: bool = getattr(payload, "auto_apply", True)
-
-        # Stage 1: Parallel scrape (JobSpy + HTML boards simultaneously)
         update_run(run_id, stage="scraping_all_sources", progress_percent=5)
-        add_log(run, "info", "Scraping all sources in parallel (no cap)...")
-
-        jobspy_jobs: List[dict] = []
-        html_jobs: List[dict] = []
-
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_jobspy = ex.submit(scrape_all_jobspy, payload.keywords, payload.location, run)
-            f_html   = ex.submit(scrape_all_html,   payload.keywords, payload.location, run)
-            jobspy_jobs = f_jobspy.result()
-            html_jobs   = f_html.result()
+            f_js = ex.submit(scrape_all_jobspy, payload.keywords, payload.location, run)
+            f_ht = ex.submit(scrape_all_html, payload.keywords, payload.location, run)
+            jobspy_jobs = f_js.result()
+            html_jobs = f_ht.result()
 
         all_jobs = dedupe_jobs(jobspy_jobs + html_jobs)
         all_jobs = apply_filters(all_jobs, blacklist, whitelist)
         update_run(run_id, jobs_scanned=len(all_jobs), progress_percent=50)
-        add_log(run, "info",
-                f"Total unique jobs after dedup+filter: {len(all_jobs)} "
-                f"(jobspy={len(jobspy_jobs)}, html={len(html_jobs)})")
-
+        add_log(run, "info", f"Total: {len(all_jobs)} unique jobs (jobspy={len(jobspy_jobs)}, html={len(html_jobs)})")
         if not all_jobs:
-            add_log(run, "warning", "No live jobs found — using fallback sample jobs")
+            add_log(run, "warning", "No live jobs — using fallback samples")
             all_jobs = FALLBACK_JOBS[:]
 
-        # Stage 2: Score + stream apply IMMEDIATELY for each passing job
         update_run(run_id, stage="scoring_and_applying", progress_percent=50)
         matched = 0
-
         for idx, job in enumerate(all_jobs):
             score_data = ai_fit_score(job, profile, payload.keywords)
             job["fit_score"] = score_data["fit_score"]
             job["fit_level"] = score_data["fit_level"]
-
-            sponsorship_ok = job.get("sponsorship_status") != "no"
-
-            if score_data["fit_score"] >= 30 and sponsorship_ok:
+            if score_data["fit_score"] >= 30 and job.get("sponsorship_status") != "no":
                 matched += 1
                 update_run(run_id, jobs_matched=matched)
-                # Stream: process immediately, don’t wait for all jobs
                 stream_apply_job(job, profile, payload.keywords, auto_apply, run, run_id)
-
             if idx % 20 == 0:
                 pct = 50 + int((idx / max(len(all_jobs), 1)) * 45)
-                update_run(run_id, progress_percent=min(pct, 95),
-                           current_url=job.get("url"))
+                update_run(run_id, progress_percent=min(pct, 95), current_url=job.get("url"))
 
+        final_run = get_run(run_id) or {}
         summary = {
-            "keywords": payload.keywords,
-            "location": payload.location,
-            "jobs_seen": len(all_jobs),
-            "matched_jobs": matched,
-            "applied_jobs": len(get_run(run_id).get("applied_jobs", [])),
+            "keywords": payload.keywords, "location": payload.location,
+            "jobs_seen": len(all_jobs), "matched_jobs": matched,
+            "applied_jobs": len(final_run.get("applied_jobs", [])),
             "jobspy_direct": JOBSPY_AVAILABLE,
-            "llm_available": (OPENAI_AVAILABLE and bool(settings.openai_api_key))
-                             or (ANTHROPIC_AVAILABLE and bool(settings.anthropic_api_key)),
+            "llm_used": bool(settings.gemini_api_key or settings.hf_api_key
+                             or settings.openai_api_key or settings.anthropic_api_key),
             "top_matches": [
                 {"title": j["title"], "company": j["company"],
                  "fit_score": j.get("fit_score"), "url": j["url"]}
-                for j in sorted(get_run(run_id).get("applied_jobs", []),
+                for j in sorted(final_run.get("applied_jobs", []),
                                 key=lambda x: x.get("fit_score", 0), reverse=True)[:10]
             ],
         }
-
         update_run(run_id, status="completed", stage="completed",
                    progress_percent=100, current_url=None, result_summary=summary)
         add_log(run, "info",
                 f"✅ Done: {len(all_jobs)} scanned, {matched} matched, "
-                f"{summary['applied_jobs']} processed with cover letter + cold email")
-
+                f"{summary['applied_jobs']} processed")
     except Exception as exc:
         run = get_run(run_id)
         if run:
@@ -711,7 +767,7 @@ def run_automation_pipeline(run_id: str, payload) -> None:
 
 def start_run_thread(payload) -> dict:
     run = create_run(payload)
-    t = threading.Thread(
-        target=run_automation_pipeline, args=(run["run_id"], payload), daemon=True)
-    t.start()
+    threading.Thread(
+        target=run_automation_pipeline, args=(run["run_id"], payload), daemon=True
+    ).start()
     return run
