@@ -1,9 +1,11 @@
 """
 automation_runtime.py – streaming apply pipeline
 
+Focused on: Logistics & Supply Chain Management roles (UK)
+
 LLM priority (all free first):
-  1. Google Gemini 1.5 Flash  — FREE, 1500 req/day  (aistudio.google.com)
-  2. HuggingFace Inference API — FREE tier           (huggingface.co)
+  1. Google Gemini 1.5 Flash  — FREE, 1500 req/day
+  2. HuggingFace Inference API — FREE tier
   3. Smart offline template   — ZERO API, always works
   4. OpenAI / Anthropic       — optional paid fallback
 """
@@ -48,9 +50,9 @@ RUN_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-JOBSPY_SITES     = ["linkedin", "indeed", "glassdoor", "google"]
+JOBSPY_SITES          = ["linkedin", "indeed", "glassdoor", "google"]
 JOBSPY_FALLBACK_URL   = "http://127.0.0.1:8010"
-JOBSPY_MAX_PER_SOURCE = 50   # keep reasonable — quality over quantity
+JOBSPY_MAX_PER_SOURCE = 50
 HTML_SOURCE_CAP       = 100
 
 REQUEST_HEADERS = {
@@ -62,34 +64,70 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
-# Two focused search tracks for Bindu (and users like her)
-# These are used when the profile suggests supply chain OR data science background
+# ---------------------------------------------------------------------------
+# SEARCH TRACKS  —  Logistics & Supply Chain ONLY
+# ---------------------------------------------------------------------------
+# Primary track: specific role titles that appear on job boards
 SUPPLY_CHAIN_KEYWORDS = [
-    "supply chain analyst", "logistics coordinator", "procurement analyst",
-    "demand planner", "inventory analyst", "operations analyst",
-    "supply chain graduate", "graduate supply chain",
+    "supply chain analyst",
+    "logistics coordinator",
+    "procurement analyst",
+    "demand planner",
+    "inventory analyst",
+    "operations analyst",
+    "supply chain coordinator",
+    "logistics analyst",
+    "supply chain graduate",
+    "graduate logistics",
+    "warehouse operations",
+    "transport planner",
+    "import export coordinator",
+    "purchasing analyst",
+    "s&op analyst",
 ]
 
-DATA_SCIENCE_KEYWORDS = [
-    "junior data analyst", "graduate data analyst", "entry level data analyst",
-    "data analyst graduate scheme", "junior data scientist",
-    "business intelligence analyst", "reporting analyst",
-    "analytics graduate",
+# Secondary track: broader terms to catch roles not using exact titles
+SUPPLY_CHAIN_BROAD = [
+    "supply chain",
+    "logistics",
+    "procurement",
+    "operations",
 ]
 
+# Fallback sample jobs shown if all scrapers return nothing
 FALLBACK_JOBS = [
-    {"title": "Supply Chain Analyst", "company": "DHL", "location": "United Kingdom",
-     "url": "https://www.dhl.com/gb-en/home/careers.html", "sponsorship_status": "yes",
-     "description": "Supply chain analyst, transport planning, forecasting, Excel, SAP.",
-     "source": "fallback", "recruiter_email": None},
-    {"title": "Junior Data Analyst", "company": "NHS", "location": "United Kingdom",
-     "url": "https://www.jobs.nhs.uk", "sponsorship_status": "yes",
-     "description": "Data analyst, Python, SQL, Excel, Power BI, reporting, NHS.",
-     "source": "fallback", "recruiter_email": None},
-    {"title": "Graduate Logistics Coordinator", "company": "Amazon", "location": "United Kingdom",
-     "url": "https://www.amazon.jobs", "sponsorship_status": "unknown",
-     "description": "Graduate logistics, operations, supply chain, Excel, analytical.",
-     "source": "fallback", "recruiter_email": None},
+    {
+        "title": "Supply Chain Analyst", "company": "DHL",
+        "location": "United Kingdom",
+        "url": "https://www.dhl.com/gb-en/home/careers.html",
+        "sponsorship_status": "yes",
+        "description": "Supply chain analyst, transport planning, forecasting, Excel, SAP, logistics.",
+        "source": "fallback", "recruiter_email": None,
+    },
+    {
+        "title": "Graduate Logistics Coordinator", "company": "Amazon",
+        "location": "United Kingdom",
+        "url": "https://www.amazon.jobs",
+        "sponsorship_status": "unknown",
+        "description": "Graduate logistics, supply chain operations, Excel, analytical skills, coordinator.",
+        "source": "fallback", "recruiter_email": None,
+    },
+    {
+        "title": "Procurement Analyst", "company": "NHS Supply Chain",
+        "location": "United Kingdom",
+        "url": "https://www.jobs.nhs.uk",
+        "sponsorship_status": "yes",
+        "description": "Procurement analyst, supply chain, vendor management, SAP, Excel, operations.",
+        "source": "fallback", "recruiter_email": None,
+    },
+    {
+        "title": "Demand Planning Analyst", "company": "Unilever",
+        "location": "United Kingdom",
+        "url": "https://careers.unilever.com",
+        "sponsorship_status": "yes",
+        "description": "Demand planning, S&OP, forecasting, supply chain, Excel, SAP, analytics.",
+        "source": "fallback", "recruiter_email": None,
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -167,7 +205,7 @@ def classify_sponsorship(description: str) -> str:
     return "unknown"
 
 # ---------------------------------------------------------------------------
-# Fit scoring  — entry-level friendly
+# Fit scoring  —  supply chain / logistics focused
 # ---------------------------------------------------------------------------
 
 ENTRY_LEVEL_TITLES = [
@@ -175,30 +213,41 @@ ENTRY_LEVEL_TITLES = [
     "assistant", "associate", "coordinator", "analyst", "apprentice",
 ]
 
+SC_CORE_TERMS = [
+    "supply chain", "logistics", "procurement", "operations",
+    "warehouse", "transport", "inventory", "demand plan", "forecasting",
+    "s&op", "purchasing", "vendor", "freight", "distribution",
+    "sap", "erp", "excel",
+]
+
 def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dict:
-    """Score a job. Biased toward entry-level supply chain + data roles."""
-    title  = (job.get("title") or "").lower()
-    desc   = (job.get("description") or "").lower()
+    """Score a job for supply chain / logistics fit."""
+    title    = (job.get("title") or "").lower()
+    desc     = (job.get("description") or "").lower()
     combined = f"{title} {desc}"
 
-    # Keyword match
-    kw_hits = sum(1 for kw in keywords if kw and kw.strip().lower() in combined)
-    kw_score = min(int(kw_hits / max(len(keywords), 1) * 100), 60)
+    # Keyword match against user keywords
+    kw_hits  = sum(1 for kw in keywords if kw and kw.strip().lower() in combined)
+    kw_score = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
 
-    # Bonus: entry-level title match (very important for grad job seekers)
-    entry_bonus = 20 if any(t in title for t in ENTRY_LEVEL_TITLES) else 0
+    # Bonus: SC core terms in title/description
+    sc_hits    = sum(1 for t in SC_CORE_TERMS if t in combined)
+    sc_bonus   = min(sc_hits * 3, 20)
 
-    # Bonus: sponsorship
+    # Bonus: entry-level / graduate title
+    entry_bonus = 15 if any(t in title for t in ENTRY_LEVEL_TITLES) else 0
+
+    # Bonus: confirmed sponsorship
     spons_bonus = 10 if job.get("sponsorship_status") == "yes" else 0
 
-    # Penalty: senior/manager roles unless profile has 3+ years
-    senior_terms = ["senior", "lead", "head of", "director", "principal", "vp ", "manager"]
-    exp_hint = (profile or {}).get("years_of_experience_hint") or ""
+    # Penalty: senior roles (unless candidate already has experience)
+    senior_terms  = ["senior", "lead", "head of", "director", "principal", "vp ", "manager"]
+    exp_hint      = (profile or {}).get("years_of_experience_hint") or ""
     has_experience = any(c.isdigit() for c in exp_hint)
     senior_penalty = -20 if any(t in title for t in senior_terms) and not has_experience else 0
 
-    score = max(0, min(kw_score + entry_bonus + spons_bonus + senior_penalty, 100))
-    level = "strong" if score >= 65 else ("moderate" if score >= 35 else "weak")
+    score = max(0, min(kw_score + sc_bonus + entry_bonus + spons_bonus + senior_penalty, 100))
+    level = "strong" if score >= 60 else ("moderate" if score >= 30 else "weak")
     return {"fit_score": score, "fit_level": level, "reasons": [], "gaps": []}
 
 # ---------------------------------------------------------------------------
@@ -206,7 +255,6 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
 # ---------------------------------------------------------------------------
 
 def _gemini(prompt: str, max_tokens: int = 500) -> Optional[str]:
-    """Google Gemini 1.5 Flash — FREE, 1500 requests/day."""
     key = settings.gemini_api_key
     if not key:
         return None
@@ -281,7 +329,7 @@ def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
     )
 
 # ---------------------------------------------------------------------------
-# Smart offline cover letter + cold email
+# Smart offline cover letter + cold email (SC/logistics flavoured)
 # ---------------------------------------------------------------------------
 
 def _offline_cover_letter(profile: dict, job: dict) -> str:
@@ -291,37 +339,34 @@ def _offline_cover_letter(profile: dict, job: dict) -> str:
     skills  = profile.get("skills") or []
     exp     = profile.get("years_of_experience_hint") or "relevant"
     roles   = profile.get("likely_roles") or []
-    top_skill    = skills[0] if skills else "my core skills"
-    second_skill = skills[1] if len(skills) > 1 else ""
-    skill_line   = f"{top_skill} and {second_skill}" if second_skill else top_skill
-    role_context = f"My background in {roles[0]}" if roles else "My background"
-    desc = (job.get("description") or "").lower()
 
-    if "data" in desc or "python" in desc or "sql" in desc or "analytics" in desc:
-        context_line = (
-            "I have been building my data skills through hands-on projects in Python, SQL, "
-            "and Excel, and I am eager to apply them in a real business setting."
-        )
-    elif "supply chain" in desc or "logistics" in desc:
-        context_line = (
-            "I have hands-on exposure to supply chain processes — from demand planning "
-            "to inventory management — and I am confident I can add value from day one."
-        )
-    elif "excel" in desc:
-        context_line = "I have strong Excel and data analysis skills which I understand are central to this role."
+    sc_skills = [s for s in skills if s in (
+        "supply chain", "logistics", "procurement", "sap", "excel",
+        "forecasting", "demand planning", "inventory management",
+        "operations", "erp", "power bi", "sql",
+    )]
+    top_skills = ", ".join(sc_skills[:3]) if sc_skills else ", ".join(skills[:3]) or "my skills"
+    role_bg    = roles[0].title() if roles else "supply chain and logistics"
+
+    desc = (job.get("description") or "").lower()
+    if "sap" in desc:
+        detail = "I have hands-on experience with SAP which I understand is central to this role."
+    elif "excel" in desc or "spreadsheet" in desc:
+        detail = "I am proficient in Excel and comfortable building models and dashboards from scratch."
+    elif "forecasting" in desc or "demand" in desc:
+        detail = "I have worked on demand forecasting and inventory optimisation, and I am confident I can contribute quickly."
     else:
-        context_line = f"I am confident my background in {skill_line} aligns well with what you are looking for."
+        detail = "I am confident my background in supply chain and logistics aligns well with what you are looking for."
 
     return (
         f"Dear Hiring Team at {company},\n\n"
-        f"I was excited to come across the {title} opportunity at {company} "
-        f"and am applying with genuine enthusiasm.\n\n"
-        f"{role_context} has given me {exp} of experience in {skill_line}. "
-        f"{context_line}\n\n"
-        f"I am actively seeking a role where I can grow quickly and contribute "
-        f"from day one. I would love the opportunity to speak with you — "
-        f"would you be open to a 20-minute call this week?\n\n"
-        f"Thank you for your time.\n\nKind regards,\n{name}"
+        f"I am writing to express my strong interest in the {title} position at {company}.\n\n"
+        f"My background in {role_bg} has equipped me with {exp} of experience working with "
+        f"{top_skills}. {detail}\n\n"
+        f"I am actively seeking a role in the UK where I can grow and make a tangible impact. "
+        f"I would welcome the chance to discuss how I can contribute — "
+        f"would you be open to a brief call this week?\n\n"
+        f"Thank you for your consideration.\n\nKind regards,\n{name}"
     )
 
 def _offline_cold_email(profile: dict, job: dict) -> str:
@@ -330,15 +375,18 @@ def _offline_cold_email(profile: dict, job: dict) -> str:
     company = job.get("company", "your company")
     skills  = profile.get("skills") or []
     exp     = profile.get("years_of_experience_hint") or "relevant"
-    top_skills = ", ".join(skills[:3]) if skills else "relevant skills"
+    sc_skills = [s for s in skills if s in (
+        "supply chain", "logistics", "procurement", "sap", "excel", "operations",
+    )]
+    top_skills = ", ".join(sc_skills[:3]) if sc_skills else ", ".join(skills[:2]) or "supply chain"
     return (
         f"Subject: {title} — {name}\n\n"
         f"Hi,\n\n"
-        f"I noticed the {title} role at {company} and wanted to reach out directly.\n\n"
-        f"I have {exp} experience with {top_skills} and am actively looking for "
-        f"an entry-level or graduate position in the UK — ideally with visa sponsorship. "
-        f"I am a fast learner and motivated to make a real contribution.\n\n"
-        f"Would you have 15 minutes for a quick call?\n\nBest,\n{name}"
+        f"I came across the {title} role at {company} and wanted to reach out directly.\n\n"
+        f"I have {exp} experience in {top_skills} and am actively looking for a "
+        f"supply chain or logistics role in the UK. "
+        f"I am a quick learner, detail-oriented, and ready to contribute from day one.\n\n"
+        f"Would you have 15 minutes for a quick chat?\n\nBest,\n{name}"
     )
 
 # ---------------------------------------------------------------------------
@@ -346,35 +394,42 @@ def _offline_cold_email(profile: dict, job: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def generate_cover_letter(profile: dict, job: dict) -> str:
-    name    = profile.get("candidate_name") or "Applicant"
-    title   = job.get("title", "the role")
-    company = job.get("company", "your company")
-    skills  = ", ".join((profile.get("skills") or [])[:8])
-    exp     = profile.get("years_of_experience_hint") or "some"
-    desc_snip = (job.get("description") or "")[:400]
+    name      = profile.get("candidate_name") or "Applicant"
+    title     = job.get("title", "the role")
+    company   = job.get("company", "your company")
+    sc_skills = [s for s in (profile.get("skills") or []) if s in (
+        "supply chain", "logistics", "procurement", "sap", "excel",
+        "forecasting", "demand planning", "inventory management",
+        "operations", "erp", "power bi", "sql", "s&op",
+    )]
+    skills_str = ", ".join(sc_skills[:6]) or ", ".join((profile.get("skills") or [])[:6])
+    exp        = profile.get("years_of_experience_hint") or "some"
+    desc_snip  = (job.get("description") or "")[:400]
     prompt = (
         f"Write a concise, genuine cover letter for {name} applying for '{title}' at {company}. "
-        f"Candidate has {exp} experience and skills: {skills}. "
+        f"The candidate has {exp} experience in supply chain and logistics with skills: {skills_str}. "
         f"Job excerpt: {desc_snip}. "
-        "Rules: under 220 words, warm and human tone, no filler openers like 'I am writing to', "
-        "no square brackets, first sentence names role + company, include one specific example, "
-        "end with a direct ask for a call. The candidate may need visa sponsorship — do NOT mention it "
-        "unless the job explicitly offers it."
+        "Rules: under 220 words, warm human tone, no filler openers like 'I am writing to', "
+        "no square brackets, first sentence names role + company, include one specific supply chain example, "
+        "end with a direct ask for a call. Do NOT mention visa sponsorship."
     )
     return _llm(prompt, max_tokens=420) or _offline_cover_letter(profile, job)
 
 def generate_cold_email(profile: dict, job: dict) -> str:
-    name    = profile.get("candidate_name") or "Applicant"
-    title   = job.get("title", "the role")
-    company = job.get("company", "your company")
-    skills  = ", ".join((profile.get("skills") or [])[:5])
-    exp     = profile.get("years_of_experience_hint") or "some"
+    name      = profile.get("candidate_name") or "Applicant"
+    title     = job.get("title", "the role")
+    company   = job.get("company", "your company")
+    sc_skills = [s for s in (profile.get("skills") or []) if s in (
+        "supply chain", "logistics", "procurement", "sap", "excel", "operations",
+    )]
+    skills_str = ", ".join(sc_skills[:4]) or ", ".join((profile.get("skills") or [])[:3])
+    exp        = profile.get("years_of_experience_hint") or "some"
     prompt = (
         f"Write a short cold email from {name} to a recruiter at {company} about '{title}'. "
-        f"Background: {exp} experience, skills: {skills}. "
+        f"Background: {exp} experience in supply chain / logistics, skills: {skills_str}. "
         "Rules: subject line first starting 'Subject:', under 120 words, "
         "sound human not corporate, no hollow openers, end with a low-friction ask for a call. "
-        "Candidate is entry-level / graduate level. Do NOT mention visa sponsorship."
+        "Do NOT mention visa sponsorship."
     )
     return _llm(prompt, max_tokens=280) or _offline_cold_email(profile, job)
 
@@ -414,7 +469,7 @@ def _safe_val(value):
     return value
 
 def jobspy_scrape_site(site: str, keywords: List[str], location: str, run: dict) -> List[dict]:
-    search_term = " ".join(keywords[:3]).strip() or "supply chain graduate"
+    search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
     add_log(run, "info", f"[JobSpy] {site} → '{search_term}'")
     try:
         df = _jobspy_scrape(
@@ -447,7 +502,7 @@ def jobspy_scrape_site(site: str, keywords: List[str], location: str, run: dict)
         return []
 
 def jobspy_fallback_http(site: str, keywords: List[str], location: str, run: dict) -> List[dict]:
-    search_term = " ".join(keywords[:3]).strip() or "supply chain graduate"
+    search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
     params = {"site_name": site, "search_term": search_term,
                "location": location or "United Kingdom",
                "results_wanted": JOBSPY_MAX_PER_SOURCE, "offset": 0}
@@ -477,8 +532,12 @@ def jobspy_fallback_http(site: str, keywords: List[str], location: str, run: dic
 def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dict]:
     fn = jobspy_scrape_site if JOBSPY_AVAILABLE else jobspy_fallback_http
     all_jobs: List[dict] = []
-    # Run two keyword sets in parallel across all sites
-    kw_sets = [keywords, SUPPLY_CHAIN_KEYWORDS[:3], DATA_SCIENCE_KEYWORDS[:3]]
+    # Three targeted keyword sets across all job sites
+    kw_sets = [
+        keywords,                      # user-provided / smart-extracted
+        SUPPLY_CHAIN_KEYWORDS[:4],     # specific SC titles
+        SUPPLY_CHAIN_BROAD[:2],        # broad catch-all
+    ]
     tasks = [(site, kws) for kws in kw_sets for site in JOBSPY_SITES]
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(fn, site, kws, location, run): site for site, kws in tasks}
@@ -592,18 +651,16 @@ def _ukvisasponsorships(kw, run):
         "https://ukvisasponsorships.co.uk", HTML_SOURCE_CAP)
 
 def scrape_all_html(keywords: List[str], location: str, run: dict) -> List[dict]:
-    # Run both SC and DS keyword sets across HTML boards
-    sc_kw = keywords + SUPPLY_CHAIN_KEYWORDS[:2]
-    ds_kw = DATA_SCIENCE_KEYWORDS[:2]
+    sc_kw    = keywords + SUPPLY_CHAIN_KEYWORDS[:3]
+    broad_kw = SUPPLY_CHAIN_BROAD[:2]
     fetchers = [
         lambda: _reed(sc_kw, location, run),
-        lambda: _reed(ds_kw, location, run),
+        lambda: _reed(broad_kw, location, run),
         lambda: _cvlibrary(sc_kw, location, run),
-        lambda: _cvlibrary(ds_kw, location, run),
         lambda: _totaljobs(sc_kw, location, run),
+        lambda: _totaljobs(broad_kw, location, run),
         lambda: _findajob(sc_kw, run),
-        lambda: _findajob(ds_kw, run),
-        lambda: _nhs(ds_kw, run),
+        lambda: _nhs(sc_kw, run),
         lambda: _ukvisasponsorships(sc_kw, run),
     ]
     all_jobs: List[dict] = []
@@ -630,7 +687,6 @@ def apply_filters(jobs, blacklist, whitelist, sponsorship_required: bool = False
             continue
         if wl and not any(w in co or w in ti for w in wl):
             continue
-        # Filter out confirmed no-sponsorship jobs if sponsorship is required
         if sponsorship_required and job.get("sponsorship_status") == "no":
             continue
         out.append(job)
@@ -700,13 +756,17 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         update_run(run_id, status="running", stage="scraping", progress_percent=5)
         add_log(run, "info",
                 f"Pipeline start | keywords={payload.keywords} | location={payload.location}")
-        profile          = getattr(payload, "resume_profile", None)
-        blacklist        = getattr(payload, "company_blacklist", []) or []
-        whitelist        = getattr(payload, "company_whitelist", []) or []
-        auto_apply       = getattr(payload, "auto_apply", True)
-        spons_required   = getattr(payload, "sponsorship_required", False)
+        profile        = getattr(payload, "resume_profile", None)
+        blacklist      = getattr(payload, "company_blacklist", []) or []
+        whitelist      = getattr(payload, "company_whitelist", []) or []
+        auto_apply     = getattr(payload, "auto_apply", True)
+        spons_required = getattr(payload, "sponsorship_required", False)
 
-        update_run(run_id, stage="📡 Searching all job boards simultaneously...", progress_percent=5)
+        update_run(run_id,
+                   stage="📡 Searching LinkedIn, Indeed, Glassdoor, Reed, CV-Library, "
+                         "TotalJobs, GOV.UK, NHS Jobs, UK Visa Sponsorships...",
+                   progress_percent=5)
+
         with ThreadPoolExecutor(max_workers=2) as ex:
             f_js = ex.submit(scrape_all_jobspy, payload.keywords, payload.location, run)
             f_ht = ex.submit(scrape_all_html,   payload.keywords, payload.location, run)
@@ -724,14 +784,16 @@ def run_automation_pipeline(run_id: str, payload) -> None:
             add_log(run, "warning", "No live jobs found — showing sample jobs")
             all_jobs = FALLBACK_JOBS[:]
 
-        update_run(run_id, stage="🤖 Scoring & generating applications...", progress_percent=50)
+        update_run(run_id,
+                   stage="🤖 Scoring jobs and generating cover letters...",
+                   progress_percent=50)
         matched = 0
         for idx, job in enumerate(all_jobs):
             score_data = ai_fit_score(job, profile, payload.keywords)
             job["fit_score"] = score_data["fit_score"]
             job["fit_level"] = score_data["fit_level"]
 
-            # Accept fit >= 25 for entry-level search (generous threshold)
+            # Accept 25%+ — generous threshold for graduate/entry-level search
             if score_data["fit_score"] >= 25 and job.get("sponsorship_status") != "no":
                 matched += 1
                 update_run(run_id, jobs_matched=matched)
@@ -745,11 +807,11 @@ def run_automation_pipeline(run_id: str, payload) -> None:
 
         final_run = get_run(run_id) or {}
         summary = {
-            "keywords":      payload.keywords,
-            "location":      payload.location,
-            "jobs_seen":     len(all_jobs),
-            "matched_jobs":  matched,
-            "applied_jobs":  len(final_run.get("applied_jobs", [])),
+            "keywords":     payload.keywords,
+            "location":     payload.location,
+            "jobs_seen":    len(all_jobs),
+            "matched_jobs": matched,
+            "applied_jobs": len(final_run.get("applied_jobs", [])),
             "top_matches": [
                 {"title": j["title"], "company": j["company"],
                  "fit_score": j.get("fit_score"), "url": j["url"]}
@@ -757,7 +819,7 @@ def run_automation_pipeline(run_id: str, payload) -> None:
                                 key=lambda x: x.get("fit_score", 0), reverse=True)[:10]
             ],
         }
-        update_run(run_id, status="completed", stage="✅ Complete!",
+        update_run(run_id, status="completed", stage="✅ Done!",
                    progress_percent=100, current_url=None, result_summary=summary)
         add_log(run, "info",
                 f"✅ Done: {len(all_jobs)} scanned, {matched} matched, "
