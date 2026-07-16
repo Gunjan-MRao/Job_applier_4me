@@ -1,8 +1,9 @@
 # Core API
 fastapi>=0.111
 uvicorn[standard]>=0.29
-pydantic>=2.7
+pydantic[email]>=2.7
 pydantic-settings>=2.2
+email-validator>=2.1
 
 # Database
 sqlalchemy>=2.0
@@ -26,6 +27,6 @@ streamlit>=1.35
 # Utilities
 python-multipart>=0.0.9
 
-# Optional paid LLMs (not required — Gemini/HuggingFace are free)
+# Optional paid LLMs (not required — Gemini is free)
 # openai>=1.30
 # anthropic>=0.28
