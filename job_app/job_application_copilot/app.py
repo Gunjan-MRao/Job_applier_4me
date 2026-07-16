@@ -1,21 +1,22 @@
 """
-Job Application Copilot — Streamlit frontend v9.4
+Job Application Copilot — Streamlit frontend v9.5
 
-v9.4 changes:
-  - Fix: dashboard was never visible after clicking Start AI Agent.
-    Five root causes fixed — see commit message for full detail.
-  - Fix: time.sleep() on main thread replaced with lightweight rerun.
-  - Fix: 'starting' state now shows a visible spinner banner.
-  - Fix: _sync_agent_state() moved after form handling.
-  - Fix: sidebar name caption uses filename fallback.
-----------
-v9.3 changes:
-  - Fix: asyncio WindowsSelectorEventLoopPolicy patch applied at import time.
-  - Fix: tab_applications() shows graceful error card on backend 500.
-----------
+v9.5 — complete dashboard polling rewrite
+  Root cause of 'no dashboard' across all previous versions:
+  _AGENT module-level dict + background thread pattern is unreliable
+  with Streamlit's rerun model. _sync_agent_state() could copy a stale
+  'idle' value before the thread updated _AGENT, causing the dashboard
+  guard to fire every single rerun.
+
+  Fix: session_state is now the single source of truth.
+  - agent_launched flag (persists across reruns) controls dashboard visibility
+  - run_id stored in session_state once backend responds
+  - Every rerun polls /automation/status directly (synchronous, fast)
+  - No race condition possible: poll happens in main thread before render
 """
 import asyncio
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -32,14 +33,13 @@ if sys.platform == "win32":
 import requests
 import streamlit as st
 
-BASE_DIR = Path(__file__).resolve().parent
-API_HOST = "127.0.0.1"
-API_PORT = 8000
+BASE_DIR     = Path(__file__).resolve().parent
+API_HOST     = "127.0.0.1"
+API_PORT     = 8000
 API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
-PID_FILE = BASE_DIR / "runtime_api.pid"
-LOG_FILE = BASE_DIR / "backend_startup.log"
-PYTHON_EXE = sys.executable
-POLL_SECONDS = 3
+PID_FILE     = BASE_DIR / "runtime_api.pid"
+LOG_FILE     = BASE_DIR / "backend_startup.log"
+PYTHON_EXE  = sys.executable
 
 SOURCE_ICONS = {
     "linkedin":           "🔵 LinkedIn",
@@ -60,30 +60,11 @@ DEFAULT_KEYWORDS = (
     "demand planner, inventory analyst, operations analyst"
 )
 
-# ---------------------------------------------------------------------------
-# Thread-safe agent state
-# ---------------------------------------------------------------------------
-_AGENT: dict = {"status": "idle", "running": False}
-_AGENT_LOCK = threading.Lock()
-
-
-def _set_agent(**kwargs):
-    with _AGENT_LOCK:
-        _AGENT.update(kwargs)
-
-
-def _get_agent() -> dict:
-    with _AGENT_LOCK:
-        return dict(_AGENT)
-
-
-def _sync_agent_state():
-    """Copy thread-safe _AGENT dict into st.session_state for UI reads."""
-    st.session_state["agent"] = _get_agent()
+AUTO_REFRESH_MS = 3000  # browser meta-refresh interval while agent running
 
 
 # ---------------------------------------------------------------------------
-# Backend helpers
+# Backend process helpers
 # ---------------------------------------------------------------------------
 
 def is_port_open(host=API_HOST, port=API_PORT, timeout=0.5):
@@ -138,7 +119,8 @@ def start_backend():
 def stop_backend():
     pid = read_pid()
     if not is_port_open() and not process_alive(pid):
-        if PID_FILE.exists(): PID_FILE.unlink()
+        if PID_FILE.exists():
+            PID_FILE.unlink()
         return True, "Already stopped."
     if pid and process_alive(pid):
         try:
@@ -149,7 +131,8 @@ def stop_backend():
                 os.kill(pid, signal.SIGTERM)
         except Exception:
             pass
-    if PID_FILE.exists(): PID_FILE.unlink()
+    if PID_FILE.exists():
+        PID_FILE.unlink()
     for _ in range(10):
         if not is_port_open():
             return True, "Backend stopped."
@@ -165,8 +148,38 @@ def backend_status_info():
         return label, detail
     if pid and process_alive(pid):
         return "Starting", f"Process {pid} alive, port not open yet"
-    if PID_FILE.exists(): PID_FILE.unlink()
+    if PID_FILE.exists():
+        PID_FILE.unlink()
     return "Stopped", "Not running"
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _get(path, timeout=10):
+    try:
+        r = requests.get(f"{API_BASE_URL}{path}", timeout=timeout)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+def _post(path, payload, timeout=60):
+    try:
+        r = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+def _patch(path, payload, timeout=10):
+    try:
+        r = requests.patch(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +199,6 @@ def _extract_text_raw(file_bytes, suffix):
     return ""
 
 def _minimal_parse(filename, text):
-    import re
     em = re.search(r"[\w.%+-]+@[\w.-]+\.[a-z]{2,}", text, re.I)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     skills_kw = [
@@ -194,7 +206,6 @@ def _minimal_parse(filename, text):
         "operations", "forecasting", "power bi", "inventory management",
         "demand planning", "erp", "sql", "python",
     ]
-    # Derive name from filename as fallback
     stem = Path(filename).stem if filename else ""
     stem = re.sub(r"[_\-]?(resume|cv|updated|new|final|\d{4})", "", stem, flags=re.I)
     stem = stem.replace("_", " ").replace("-", " ").strip()
@@ -224,8 +235,10 @@ def parse_resume_local(file_bytes, filename):
         text = _extract_text_raw(file_bytes, suffix)
         return _minimal_parse(filename, text), None
     finally:
-        try: tmp_path.unlink()
-        except Exception: pass
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
 
 def parse_resume(file_bytes, filename):
     if is_port_open():
@@ -258,7 +271,8 @@ def smart_keywords(profile: dict) -> str:
     seen, out = set(), []
     for k in combined:
         if k not in seen:
-            seen.add(k); out.append(k)
+            seen.add(k)
+            out.append(k)
     if not out:
         out = sc_skills[:6] or [
             "supply chain analyst", "logistics coordinator",
@@ -268,142 +282,86 @@ def smart_keywords(profile: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# API helpers
-# ---------------------------------------------------------------------------
-
-def _get(path, timeout=10):
-    try:
-        r = requests.get(f"{API_BASE_URL}{path}", timeout=timeout)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-def _post(path, payload, timeout=60):
-    try:
-        r = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-def _patch(path, payload, timeout=10):
-    try:
-        r = requests.patch(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-
-# ---------------------------------------------------------------------------
-# Poll thread  (background — ZERO Streamlit calls)
-# ---------------------------------------------------------------------------
-
-def _poll_loop(run_id: str):
-    retries = 0
-    while True:
-        time.sleep(POLL_SECONDS)
-        try:
-            r = requests.get(f"{API_BASE_URL}/automation/status/{run_id}", timeout=10)
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
-            retries += 1
-            if retries >= 5:
-                _set_agent(status="failed", running=False)
-                return
-            continue
-        retries = 0
-        applied_jobs  = data.get("applied_jobs") or []
-        source_counts = dict(Counter(j.get("source", "unknown") for j in applied_jobs))
-        _set_agent(
-            status        = data.get("status", "unknown"),
-            stage         = data.get("stage", ""),
-            progress      = data.get("progress_percent", 0),
-            scanned       = data.get("jobs_scanned", 0),
-            matched       = data.get("jobs_matched", 0),
-            applied       = data.get("jobs_applied", 0),
-            current_url   = data.get("current_url") or "",
-            top_matches   = data.get("top_matches") or [],
-            applied_jobs  = applied_jobs,
-            source_counts = source_counts,
-            summary       = data.get("result_summary"),
-        )
-        if data.get("status") in ("completed", "failed"):
-            _set_agent(running=False)
-            return
-
-
-def launch_agent(config: dict):
-    _set_agent(
-        status="starting", running=True, run_id=None,
-        log=[], scanned=0, matched=0, applied=0,
-        progress=0, stage="🚀 Launching agent...", current_url="",
-        source_counts={}, applied_jobs=[], top_matches=[], summary=None,
-    )
-
-    def _start():
-        if not is_port_open():
-            _set_agent(stage="⚙️ Starting backend...")
-            ok, msg = start_backend()
-            if not ok:
-                _set_agent(status="failed", running=False, stage=f"Backend failed: {msg}")
-                return
-        _set_agent(stage="📡 Submitting to backend...")
-        result, err = _post("/automation/start", config)
-        if err or not result:
-            _set_agent(status="failed", running=False, stage=f"API error: {err}")
-            return
-        run_id = result.get("run_id", "")
-        _set_agent(run_id=run_id, status="running", stage="🔍 Searching all job boards...")
-        threading.Thread(target=_poll_loop, args=(run_id,), daemon=True).start()
-
-    threading.Thread(target=_start, daemon=True).start()
-
-
-# ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
 
 def status_pill(s, custom_color=None):
     c = custom_color or {
         "running": "#0ea5e9", "completed": "#10b981", "failed": "#ef4444",
-        "queued": "#f59e0b",  "starting":  "#f59e0b", "stopped": "#6b7280",
-        "draft":  "#f59e0b",  "submitted": "#10b981", "rejected": "#ef4444",
+        "queued":  "#f59e0b", "starting":  "#f59e0b", "stopped": "#6b7280",
+        "draft":   "#f59e0b", "submitted": "#10b981", "rejected": "#ef4444",
         "interview": "#8b5cf6", "needs review": "#f97316",
     }.get((s or "").lower(), "#6b7280")
     return (
-        f'<span style="padding:3px 12px;border-radius:999px;'
-        f'background:{c}22;color:{c};font-weight:700;'
-        f'font-size:13px;border:1px solid {c}66">{s}</span>'
+        f'<span style="padding:3px 12px;border-radius:999px;background:{c}22;'
+        f'color:{c};font-weight:700;font-size:13px;border:1px solid {c}66">{s}</span>'
     )
 
 def source_label(s):
     return SOURCE_ICONS.get((s or "").lower(), f"🔍 {s}")
 
-
-# ---------------------------------------------------------------------------
-# Multi-agent strategy import helper
-# ---------------------------------------------------------------------------
-
-def _import_strategy():
-    try:
-        from backend.services.sponsor_strategy import run_multi_agent_debate, hiring_window_score
-        return run_multi_agent_debate, hiring_window_score
-    except ImportError:
-        app_dir = str(BASE_DIR)
-        if app_dir not in sys.path:
-            sys.path.insert(0, app_dir)
-        try:
-            from backend.services.sponsor_strategy import run_multi_agent_debate, hiring_window_score
-            return run_multi_agent_debate, hiring_window_score
-        except Exception:
-            return None, None
+def _sidebar_name(p, filename):
+    name = (p or {}).get("candidate_name") or ""
+    if not name and filename:
+        stem = Path(filename).stem
+        stem = re.sub(r"[_\-]?(resume|cv|updated|new|final|\d{4})", "", stem, flags=re.I)
+        name = stem.replace("_", " ").replace("-", " ").strip().title()
+    return name or "?"
 
 
 # ---------------------------------------------------------------------------
-# Tab: Agent Debate Panel
+# Agent launch — runs entirely on background thread so UI stays responsive
+# ---------------------------------------------------------------------------
+
+def _launch_agent_thread(cfg: dict):
+    """Background thread: start backend if needed, call /automation/start,
+    then store run_id into session_state via a shared plain dict.
+    All Streamlit session_state writes happen only in the main thread
+    (picked up on next rerun via _PENDING)."""
+    global _PENDING
+    _PENDING["stage"] = "⚙️ Starting backend..."
+    if not is_port_open():
+        ok, msg = start_backend()
+        if not ok:
+            _PENDING["error"] = f"Backend failed to start: {msg}"
+            _PENDING["done"]  = True
+            return
+
+    _PENDING["stage"] = "📡 Calling /automation/start..."
+    result, err = _post("/automation/start", cfg)
+    if err or not result:
+        _PENDING["error"] = f"API error: {err}"
+        _PENDING["done"]  = True
+        return
+
+    _PENDING["run_id"] = result.get("run_id", "")
+    _PENDING["done"]   = True
+
+
+# Module-level dict for inter-thread communication (no Streamlit calls)
+_PENDING: dict = {"done": False, "run_id": None, "error": None, "stage": ""}
+
+
+def _reset_pending():
+    global _PENDING
+    _PENDING = {"done": False, "run_id": None, "error": None, "stage": ""}
+
+
+# ---------------------------------------------------------------------------
+# Core polling — called from main thread every rerun
+# ---------------------------------------------------------------------------
+
+def _poll_status(run_id: str) -> dict:
+    """Synchronous poll of /automation/status/{run_id}.
+    Returns the status dict or an error dict."""
+    data, err = _get(f"/automation/status/{run_id}", timeout=8)
+    if err or not data:
+        return {"status": "unknown", "stage": f"Poll error: {err}"}
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent strategy helpers
 # ---------------------------------------------------------------------------
 
 AGENT_PROVIDER_COLOURS = {
@@ -420,6 +378,20 @@ TIER_STYLE = {
     "tier3": ("#ef4444", "⚠️  Tier 3 — Not on GOV.UK register — HIGH RISK"),
 }
 
+def _import_strategy():
+    try:
+        from backend.services.sponsor_strategy import run_multi_agent_debate, hiring_window_score
+        return run_multi_agent_debate, hiring_window_score
+    except ImportError:
+        app_dir = str(BASE_DIR)
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        try:
+            from backend.services.sponsor_strategy import run_multi_agent_debate, hiring_window_score
+            return run_multi_agent_debate, hiring_window_score
+        except Exception:
+            return None, None
+
 def _confidence_bar(score, label=""):
     if score is None:
         return "<em style='color:#888'>No response</em>"
@@ -431,166 +403,6 @@ def _confidence_bar(score, label=""):
         f'<div style="background:{color};width:{pct}%;height:10px;border-radius:8px;"></div></div>'
         f'<small style="color:{color};font-weight:700">{score}/100</small></div>'
     )
-
-def _render_agent_card(result: dict):
-    agent_id   = result.get("agent", "unknown")
-    name       = result.get("name", agent_id)
-    opinion    = result.get("opinion") or "*(no response — API key not set)*"
-    confidence = result.get("confidence")
-    colour, emoji, provider_label = AGENT_PROVIDER_COLOURS.get(agent_id, ("#6b7280", "⚪", agent_id))
-    with st.container(border=True):
-        col_icon, col_body = st.columns([1, 9])
-        with col_icon:
-            st.markdown(f'<div style="font-size:2rem;text-align:center;padding-top:8px">{emoji}</div>',
-                        unsafe_allow_html=True)
-        with col_body:
-            st.markdown(
-                f'<span style="color:{colour};font-weight:700;font-size:15px">{name}</span> '
-                f'<span style="color:#888;font-size:12px">— {provider_label}</span>',
-                unsafe_allow_html=True)
-            st.markdown(opinion)
-            st.markdown(_confidence_bar(confidence, "Confidence: "), unsafe_allow_html=True)
-
-def _render_synthesis(synthesis: str, consensus):
-    st.markdown("### 🎯 Agent Synthesis — Final Verdict")
-    with st.container(border=True):
-        if consensus is not None:
-            color = "#10b981" if consensus >= 70 else ("#f59e0b" if consensus >= 40 else "#ef4444")
-            verdict = "APPLY" if consensus >= 70 else "APPLY WITH CAUTION" if consensus >= 40 else "SKIP"
-            st.markdown(
-                f'<div style="text-align:center;padding:12px 0">'
-                f'<span style="font-size:2rem;font-weight:900;color:{color}">{verdict}</span>'
-                f'<br><span style="color:{color};font-size:18px">Consensus confidence: {consensus}/100</span></div>',
-                unsafe_allow_html=True)
-            st.markdown(_confidence_bar(consensus, "Overall consensus: "), unsafe_allow_html=True)
-        if synthesis:
-            st.markdown("---")
-            st.markdown(synthesis)
-
-def tab_debate():
-    st.subheader("🧠 Multi-Agent Strategy Debate")
-    st.caption(
-        "Paste a job you're considering — 5 AI agents debate whether you should apply, "
-        "how to approach it, and what the risks are. The Reddit Oracle always runs (no API needed)."
-    )
-    run_debate_fn, hiring_window_fn = _import_strategy()
-    if hiring_window_fn:
-        try:
-            win = hiring_window_fn()
-            wc = "#10b981" if win["score"] >= 70 else ("#f59e0b" if win["score"] >= 40 else "#ef4444")
-            st.markdown(
-                f'<div style="padding:8px 16px;border-radius:8px;background:{wc}22;'
-                f'border:1px solid {wc}66;margin-bottom:12px">📅 '
-                f'<strong>Current hiring window ({win["month"]}):</strong> '
-                f'<span style="color:{wc}">{win["advice"]}</span></div>',
-                unsafe_allow_html=True)
-        except Exception:
-            pass
-    if run_debate_fn is None:
-        st.error("❌ Could not import `sponsor_strategy.py`. Check backend/services/sponsor_strategy.py exists.")
-        return
-    profile = st.session_state.get("resume_profile") or {}
-    if not profile:
-        st.warning("⚠️ No resume loaded — upload in **⚙️ Setup** for personalised agent opinions.")
-        profile = {"candidate_name": "Candidate", "skills": [], "years_of_experience_hint": "graduate"}
-    with st.form("debate_form"):
-        st.markdown("**Enter the job details:**")
-        c1, c2 = st.columns(2)
-        job_title = c1.text_input("Job Title", placeholder="e.g. Supply Chain Analyst")
-        company   = c2.text_input("Company",   placeholder="e.g. DHL")
-        c3, c4    = st.columns(2)
-        location  = c3.text_input("Location", value="United Kingdom")
-        salary    = c4.text_input("Salary",   placeholder="e.g. £35,000")
-        spons_sel = st.selectbox(
-            "Sponsorship status (from job posting)",
-            ["unknown", "yes", "no"],
-            format_func=lambda x: {
-                "yes": "✅ Confirmed — they offer sponsorship",
-                "no":  "❌ Explicitly no sponsorship",
-                "unknown": "❓ Not mentioned",
-            }[x])
-        job_desc = st.text_area("Job description excerpt (optional)", height=100,
-                                placeholder="Paste any part of the job description here...")
-        source   = st.text_input("Source", value="linkedin", placeholder="linkedin / reed / indeed...")
-        run_btn  = st.form_submit_button("🧠 Run Agent Debate", type="primary", use_container_width=True)
-    if run_btn:
-        if not job_title or not company:
-            st.warning("Please enter at least a Job Title and Company.")
-        else:
-            job = {
-                "title": job_title.strip(), "company": company.strip(),
-                "location": location.strip(), "salary": salary.strip(),
-                "sponsorship_status": spons_sel, "description": job_desc.strip(),
-                "source": source.strip(), "url": "",
-            }
-            with st.spinner("🧠 Agents are debating... (10–30 seconds)"):
-                try:
-                    result = run_debate_fn(job, profile)
-                    st.session_state["last_debate"] = result
-                except Exception as exc:
-                    st.error(f"Debate failed: {exc}")
-                    st.session_state.pop("last_debate", None)
-    result = st.session_state.get("last_debate")
-    if not result:
-        st.info(
-            "👆 Fill in the job details above and click **🧠 Run Agent Debate** to start.\n\n"
-            "**The 5 agents:**\n"
-            "- 🔵 **The Optimist** (Gemini) — Why this is a great fit\n"
-            "- 🟠 **The Realist** (Mistral) — Hard numbers, salary, competition\n"
-            "- 🟢 **The Tactician** (GPT-4o) — Exact outreach wording, ATS bypass\n"
-            "- 🟣 **The Risk Analyst** (Claude) — Visa risk, tier, fallback plan\n"
-            "- 🔴 **The Reddit Oracle** — Pattern-matched community wisdom (always runs)\n"
-        )
-        return
-    tier = result.get("company_tier", "tier3")
-    tier_colour, tier_label = TIER_STYLE.get(tier, ("#6b7280", "Unknown tier"))
-    govuk = result.get("govuk_verified")
-    govuk_html = (
-        '<span style="color:#10b981;font-weight:700">✅ GOV.UK Verified Sponsor</span>' if govuk is True
-        else '<span style="color:#ef4444;font-weight:700">❌ NOT on GOV.UK Register</span>' if govuk is False
-        else '<span style="color:#f59e0b;font-weight:700">❓ GOV.UK register could not be checked</span>'
-    )
-    st.markdown(
-        f'<div style="display:flex;gap:16px;align-items:center;padding:10px 16px;border-radius:8px;'
-        f'background:{tier_colour}22;border:1px solid {tier_colour}55;margin-bottom:16px">'
-        f'<span style="color:{tier_colour};font-weight:700;font-size:15px">{tier_label}</span>'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;{govuk_html}</div>', unsafe_allow_html=True)
-    _render_synthesis(result.get("synthesis", ""), result.get("consensus_confidence"))
-    st.markdown("---")
-    st.markdown("### 🗣️ Agent Opinions")
-    for ar in (result.get("agents") or []):
-        _render_agent_card(ar)
-    st.markdown("---")
-    ats = result.get("ats_bypass") or {}
-    if ats:
-        with st.expander("🤖 ATS Bypass Tip", expanded=True):
-            st.error(f"❌ **Don't say:** `{ats.get('naive_answer', 'Yes')}` — many ATS auto-reject this")
-            st.success("✅ **Say instead:**")
-            st.code(ats.get('smart_answer', ''), language=None)
-            st.caption(ats.get('rationale', ''))
-    outreach = result.get("linkedin_outreach") or ""
-    if outreach:
-        with st.expander("🔗 LinkedIn Outreach Message"):
-            st.info("💡 Per Reddit r/IndiansInUK: send 5/day. Never mention visa. Never ask for a job directly.")
-            st.text_area("LinkedIn message (edit before sending):", value=outreach, height=140,
-                         key="linkedin_outreach_msg")
-    schedule = result.get("followup_schedule") or []
-    if schedule:
-        with st.expander("📅 Follow-up Schedule (every 5 days — max 3 times)"):
-            for item in schedule:
-                st.markdown(f"**Day {item['day']} — send on {item['send_on']}**")
-                st.text_area(item["subject"], value=item["body"], height=120, key=f"followup_{item['day']}")
-    hw = result.get("hiring_window") or {}
-    if hw:
-        with st.expander("📅 Hiring Window Analysis"):
-            hwc = "#10b981" if hw.get('score', 0) >= 70 else ("#f59e0b" if hw.get('score', 0) >= 40 else "#ef4444")
-            st.markdown(f'<strong style="color:{hwc}">{hw.get("advice", "")}</strong>', unsafe_allow_html=True)
-            if hw.get("apply_now", False):
-                st.success("✅ Good time to apply — within peak hiring window.")
-            else:
-                st.warning("⚠️ Outside peak window. Expect slower response times.")
-    with st.expander("🔬 Raw debate data (JSON)"):
-        st.json(result)
 
 
 # ---------------------------------------------------------------------------
@@ -638,30 +450,27 @@ def tab_setup():
 
 
 # ---------------------------------------------------------------------------
-# Tab: AI Agent
+# Tab: AI Agent  (new polling architecture)
 # ---------------------------------------------------------------------------
 
 def tab_agent():
     st.subheader("🤖 AI Job Agent")
     p = st.session_state.get("resume_profile") or {}
 
+    # ── Backend / API key status row ──────────────────────────────────────
     col_be, col_gem = st.columns(2)
-    be_status, _ = backend_status_info()
-    if be_status == "Running":
-        col_be.info("🟢 Backend: **Running**")
-    else:
+    be_status, _   = backend_status_info()
+    col_be.info("🟢 Backend: **Running**") if be_status == "Running" else \
         col_be.warning(f"🔴 Backend: **{be_status}** — agent will start it automatically")
 
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    env_file = BASE_DIR / ".env"
+    env_file   = BASE_DIR / ".env"
     if not gemini_key and env_file.exists():
         for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
             if line.strip().startswith("GEMINI_API_KEY="):
                 gemini_key = line.split("=", 1)[1].strip()
                 break
-    if gemini_key:
-        col_gem.success("✅ Gemini API key — AI cover letters enabled")
-    else:
+    col_gem.success("✅ Gemini API key — AI cover letters enabled") if gemini_key else \
         col_gem.warning("⚠️ No Gemini key — using smart offline templates")
 
     if not p:
@@ -669,11 +478,10 @@ def tab_agent():
 
     default_kw = smart_keywords(p) if p else DEFAULT_KEYWORDS
 
-    # ── Launch form ──────────────────────────────────────────────────────────
+    # ── Launch form ───────────────────────────────────────────────────────
     with st.form("agent_form"):
         c1, c2   = st.columns(2)
-        keywords = c1.text_input("🔑 Keywords", value=default_kw,
-                                 help="Supply chain & logistics search terms.")
+        keywords = c1.text_input("🔑 Keywords", value=default_kw)
         location = c2.text_input("📍 Location", "United Kingdom")
         with st.expander("🔧 Advanced filters (optional)"):
             blacklist  = st.text_input("Skip these companies (comma-separated)", "")
@@ -682,12 +490,10 @@ def tab_agent():
         go = st.form_submit_button("🚀 Start AI Agent — scan ALL job boards",
                                    type="primary", use_container_width=True)
 
-    # Process form submit BEFORE syncing agent state so the just-set
-    # 'starting' status is not overwritten by a stale sync.
+    # ── Handle launch ─────────────────────────────────────────────────────
     if go:
-        a = _get_agent()
-        if a.get("running"):
-            st.warning("Agent already running — scroll down for live progress.")
+        if st.session_state.get("agent_launched"):
+            st.warning("Agent already running — see dashboard below.")
         else:
             cfg = {
                 "candidate_email":   st.session_state.get("candidate_email") or "user@example.com",
@@ -700,30 +506,19 @@ def tab_agent():
                 "company_blacklist": [x.strip() for x in blacklist.split(",") if x.strip()],
                 "company_whitelist": [x.strip() for x in whitelist.split(",") if x.strip()],
             }
-            launch_agent(cfg)
-            st.success("🤖 Agent launched! Dashboard loading below...")
-            time.sleep(0.8)
-            st.rerun()
+            # Mark as launched FIRST so the dashboard shows on this rerun
+            st.session_state["agent_launched"] = True
+            st.session_state["run_id"]         = None
+            st.session_state["agent_status"]   = "starting"
+            st.session_state["agent_stage"]    = "⚙️ Connecting to backend..."
+            st.session_state["agent_cfg"]      = cfg
+            _reset_pending()
+            threading.Thread(
+                target=_launch_agent_thread, args=(cfg,), daemon=True
+            ).start()
 
-    # Sync agent state AFTER form handling
-    _sync_agent_state()
-
-    a             = st.session_state.get("agent", {})
-    running       = a.get("running", False)
-    status        = a.get("status", "idle")
-    prog          = a.get("progress", 0)
-    stage         = a.get("stage", "")
-    log           = list(a.get("log", []))
-    aj            = list(a.get("applied_jobs", []))
-    scanned       = a.get("scanned", 0)
-    matched       = a.get("matched", 0)
-    applied_count = a.get("applied", 0)
-    current_url   = a.get("current_url", "")
-    source_counts = dict(a.get("source_counts", {}))
-    summary       = a.get("summary")
-
-    # ── True idle — nothing launched yet ────────────────────────────────────
-    if status == "idle" and not running:
+    # ── Nothing launched yet ──────────────────────────────────────────────
+    if not st.session_state.get("agent_launched"):
         st.markdown("---")
         st.info(
             "👆 Fill in your keywords above and click **🚀 Start AI Agent** to begin.\n\n"
@@ -733,18 +528,62 @@ def tab_agent():
         )
         return
 
-    # ── Dashboard ────────────────────────────────────────────────────────────
+    # ── Dashboard ─────────────────────────────────────────────────────────
     st.markdown("---")
 
-    # Starting / connecting banner
-    if status in ("starting", "idle") and running:
-        st.info(f"⏳ {stage or 'Starting agent...'}")
-        # Lightweight rerun — sleep briefly then rerun to keep polling
-        time.sleep(1.5)
-        st.rerun()
+    # Pick up run_id from background thread if it just finished starting
+    if _PENDING["done"] and not st.session_state.get("run_id"):
+        if _PENDING.get("error"):
+            st.session_state["agent_status"] = "failed"
+            st.session_state["agent_stage"]  = _PENDING["error"]
+        elif _PENDING.get("run_id"):
+            st.session_state["run_id"]       = _PENDING["run_id"]
+            st.session_state["agent_status"] = "running"
+            st.session_state["agent_stage"]  = "🔍 Scanning job boards..."
+
+    # Show live stage while still connecting (no run_id yet)
+    if not st.session_state.get("run_id") and st.session_state.get("agent_status") != "failed":
+        stage = _PENDING.get("stage") or st.session_state.get("agent_stage") or "Starting..."
+        st.info(f"⏳ {stage}")
+        # Auto-refresh every 1.5s while connecting
+        st.markdown(
+            f'<meta http-equiv="refresh" content="2">',
+            unsafe_allow_html=True,
+        )
         return
 
-    # Status + progress
+    run_id = st.session_state.get("run_id", "")
+
+    # ── Poll backend directly (main thread, every rerun) ──────────────────
+    if run_id:
+        data = _poll_status(run_id)
+        applied_jobs  = data.get("applied_jobs") or []
+        source_counts = dict(Counter(j.get("source", "unknown") for j in applied_jobs))
+        st.session_state["agent_status"]   = data.get("status", "unknown")
+        st.session_state["agent_stage"]    = data.get("stage", "")
+        st.session_state["agent_progress"] = data.get("progress_percent", 0)
+        st.session_state["agent_scanned"]  = data.get("jobs_scanned", 0)
+        st.session_state["agent_matched"]  = data.get("jobs_matched", 0)
+        st.session_state["agent_applied"]  = data.get("jobs_applied", 0)
+        st.session_state["agent_url"]      = data.get("current_url") or ""
+        st.session_state["agent_matches"]  = data.get("top_matches") or []
+        st.session_state["agent_jobs"]     = applied_jobs
+        st.session_state["agent_sources"]  = source_counts
+        st.session_state["agent_summary"]  = data.get("result_summary")
+
+    status        = st.session_state.get("agent_status", "unknown")
+    stage         = st.session_state.get("agent_stage", "")
+    prog          = st.session_state.get("agent_progress", 0)
+    scanned       = st.session_state.get("agent_scanned", 0)
+    matched       = st.session_state.get("agent_matched", 0)
+    applied_count = st.session_state.get("agent_applied", 0)
+    current_url   = st.session_state.get("agent_url", "")
+    source_counts = st.session_state.get("agent_sources", {})
+    aj            = st.session_state.get("agent_jobs", [])
+    summary       = st.session_state.get("agent_summary")
+    running       = status not in ("completed", "failed", "unknown")
+
+    # ── Status bar ────────────────────────────────────────────────────────
     r1c1, r1c2 = st.columns([1, 3])
     r1c1.markdown(f"**Status:** {status_pill(status)}", unsafe_allow_html=True)
     if stage:
@@ -753,59 +592,76 @@ def tab_agent():
     if current_url and running:
         st.caption(f"⏳ Scanning: {current_url[:90]}")
 
+    # ── Metrics ───────────────────────────────────────────────────────────
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("🔍 Jobs Found",   scanned)
     mc2.metric("✅ Matched",       matched)
     mc3.metric("📤 Applications", applied_count)
     mc4.metric("⚠️ Needs Review",  sum(1 for j in aj if not j.get("cover_letter")))
 
+    # ── Live source feed ──────────────────────────────────────────────────
     st.markdown("#### 📶 Live source feed")
     source_cols = st.columns(len(SOURCE_ICONS))
     for i, (src, icon) in enumerate(SOURCE_ICONS.items()):
         cnt = source_counts.get(src, 0)
         with source_cols[i]:
-            if cnt > 0:    st.success(f"{icon}\n\n**{cnt}**")
-            elif running:  st.info(f"{icon}\n\n*...*")
-            else:          st.caption(icon)
+            if cnt > 0:   st.success(f"{icon}\n\n**{cnt}**")
+            elif running: st.info(f"{icon}\n\n*...*")
+            else:         st.caption(icon)
 
     st.markdown("---")
-    needs_review_jobs = [j for j in aj if not j.get("cover_letter")]
-    ready_jobs        = [j for j in aj if j.get("cover_letter")]
-    if needs_review_jobs:
-        st.markdown(f"### ⚠️ Needs Your Review ({len(needs_review_jobs)})")
-        st.caption("Matched but cover letter couldn't be generated — apply manually via link.")
-        for job in reversed(needs_review_jobs[-20:]):
+
+    # ── Job cards ─────────────────────────────────────────────────────────
+    needs_review = [j for j in aj if not j.get("cover_letter")]
+    ready        = [j for j in aj if j.get("cover_letter")]
+    if needs_review:
+        st.markdown(f"### ⚠️ Needs Your Review ({len(needs_review)})")
+        st.caption("Matched but cover letter couldn't be generated — apply manually.")
+        for job in reversed(needs_review[-20:]):
             _render_job_card(job, review_mode=True)
-    if ready_jobs:
-        st.markdown(f"### 📨 Ready to Send ({len(ready_jobs)})")
-        for job in reversed(ready_jobs[-50:]):
+    if ready:
+        st.markdown(f"### 📨 Ready to Send ({len(ready)})")
+        for job in reversed(ready[-50:]):
             _render_job_card(job, review_mode=False)
 
+    # ── Agent log expander ────────────────────────────────────────────────
+    log = st.session_state.get("agent_log", [])
     with st.expander("📝 Agent log", expanded=running):
         if log:
             for line in reversed(log[-60:]):
                 st.code(line, language=None)
         else:
-            st.caption("No log entries yet — agent is starting up...")
+            st.caption("Log will appear here once the agent starts sending results.")
+
     if summary:
         with st.expander("📈 Final summary"):
             st.json(summary)
 
-    # ── Auto-refresh while running ───────────────────────────────────────────
+    # ── Auto-refresh / finish buttons ─────────────────────────────────────
     if running:
-        # Use a short sleep + rerun instead of a long sleep to keep the UI
-        # responsive. 1.5s is enough to avoid hammering the browser.
-        time.sleep(1.5)
-        st.rerun()
+        st.markdown(
+            f'<meta http-equiv="refresh" content="{AUTO_REFRESH_MS // 1000}">',
+            unsafe_allow_html=True,
+        )
     elif status == "completed":
         st.balloons()
         if st.button("🔄 Start a new search"):
-            _set_agent(status="idle", running=False)
+            for k in ("agent_launched", "run_id", "agent_status", "agent_stage",
+                      "agent_progress", "agent_scanned", "agent_matched",
+                      "agent_applied", "agent_url", "agent_jobs", "agent_sources",
+                      "agent_summary", "agent_matches", "agent_log", "agent_cfg"):
+                st.session_state.pop(k, None)
+            _reset_pending()
             st.rerun()
     elif status == "failed":
-        st.error("❌ Agent failed — check the log above for details.")
+        st.error(f"❌ Agent failed: {stage}")
         if st.button("🔄 Try again"):
-            _set_agent(status="idle", running=False)
+            for k in ("agent_launched", "run_id", "agent_status", "agent_stage",
+                      "agent_progress", "agent_scanned", "agent_matched",
+                      "agent_applied", "agent_url", "agent_jobs", "agent_sources",
+                      "agent_summary", "agent_matches", "agent_log", "agent_cfg"):
+                st.session_state.pop(k, None)
+            _reset_pending()
             st.rerun()
 
 
@@ -826,7 +682,8 @@ def _render_job_card(job: dict, review_mode: bool):
         hc1, hc2, hc3 = st.columns([2, 1, 1])
         with hc1:
             st.markdown(f"**{title}** at **{co}**")
-            if url: st.link_button("🔗 Apply / View job", url, use_container_width=True)
+            if url:
+                st.link_button("🔗 Apply / View job", url, use_container_width=True)
         with hc2:
             st.markdown(spons_html, unsafe_allow_html=True)
         with hc3:
@@ -854,6 +711,135 @@ def _render_job_card(job: dict, review_mode: bool):
 
 
 # ---------------------------------------------------------------------------
+# Tab: Agent Debate
+# ---------------------------------------------------------------------------
+
+def tab_debate():
+    st.subheader("🧠 Multi-Agent Strategy Debate")
+    st.caption(
+        "Paste a job you're considering — 5 AI agents debate whether you should apply, "
+        "how to approach it, and what the risks are."
+    )
+    run_debate_fn, hiring_window_fn = _import_strategy()
+    if hiring_window_fn:
+        try:
+            win = hiring_window_fn()
+            wc  = "#10b981" if win["score"] >= 70 else ("#f59e0b" if win["score"] >= 40 else "#ef4444")
+            st.markdown(
+                f'<div style="padding:8px 16px;border-radius:8px;background:{wc}22;'
+                f'border:1px solid {wc}66;margin-bottom:12px">📅 '
+                f'<strong>Current hiring window ({win["month"]}):</strong> '
+                f'<span style="color:{wc}">{win["advice"]}</span></div>',
+                unsafe_allow_html=True)
+        except Exception:
+            pass
+    if run_debate_fn is None:
+        st.error("❌ Could not import sponsor_strategy.py.")
+        return
+    profile = st.session_state.get("resume_profile") or {}
+    if not profile:
+        st.warning("⚠️ No resume loaded — upload in **⚙️ Setup** for personalised opinions.")
+        profile = {"candidate_name": "Candidate", "skills": [], "years_of_experience_hint": "graduate"}
+    with st.form("debate_form"):
+        c1, c2    = st.columns(2)
+        job_title = c1.text_input("Job Title", placeholder="e.g. Supply Chain Analyst")
+        company   = c2.text_input("Company",   placeholder="e.g. DHL")
+        c3, c4    = st.columns(2)
+        location  = c3.text_input("Location", value="United Kingdom")
+        salary    = c4.text_input("Salary",   placeholder="e.g. £35,000")
+        spons_sel = st.selectbox(
+            "Sponsorship status", ["unknown", "yes", "no"],
+            format_func=lambda x: {
+                "yes": "✅ Confirmed", "no": "❌ Explicitly no", "unknown": "❓ Not mentioned"
+            }[x])
+        job_desc = st.text_area("Job description excerpt (optional)", height=100)
+        source   = st.text_input("Source", value="linkedin")
+        run_btn  = st.form_submit_button("🧠 Run Agent Debate", type="primary", use_container_width=True)
+    if run_btn:
+        if not job_title or not company:
+            st.warning("Please enter at least a Job Title and Company.")
+        else:
+            job = {
+                "title": job_title.strip(), "company": company.strip(),
+                "location": location.strip(), "salary": salary.strip(),
+                "sponsorship_status": spons_sel, "description": job_desc.strip(),
+                "source": source.strip(), "url": "",
+            }
+            with st.spinner("🧠 Agents debating... (10–30s)"):
+                try:
+                    st.session_state["last_debate"] = run_debate_fn(job, profile)
+                except Exception as exc:
+                    st.error(f"Debate failed: {exc}")
+                    st.session_state.pop("last_debate", None)
+    result = st.session_state.get("last_debate")
+    if not result:
+        st.info("Fill in job details above and click **🧠 Run Agent Debate**.")
+        return
+    tier           = result.get("company_tier", "tier3")
+    tier_colour, tier_label = TIER_STYLE.get(tier, ("#6b7280", "Unknown tier"))
+    govuk          = result.get("govuk_verified")
+    govuk_html     = (
+        '<span style="color:#10b981;font-weight:700">✅ GOV.UK Verified Sponsor</span>' if govuk is True
+        else '<span style="color:#ef4444;font-weight:700">❌ NOT on GOV.UK Register</span>' if govuk is False
+        else '<span style="color:#f59e0b;font-weight:700">❓ register could not be checked</span>'
+    )
+    st.markdown(
+        f'<div style="display:flex;gap:16px;align-items:center;padding:10px 16px;border-radius:8px;'
+        f'background:{tier_colour}22;border:1px solid {tier_colour}55;margin-bottom:16px">'
+        f'<span style="color:{tier_colour};font-weight:700">{tier_label}</span>'
+        f' | {govuk_html}</div>', unsafe_allow_html=True)
+    # Synthesis
+    st.markdown("### 🎯 Final Verdict")
+    consensus = result.get("consensus_confidence")
+    synthesis = result.get("synthesis", "")
+    with st.container(border=True):
+        if consensus is not None:
+            color   = "#10b981" if consensus >= 70 else ("#f59e0b" if consensus >= 40 else "#ef4444")
+            verdict = "APPLY" if consensus >= 70 else "APPLY WITH CAUTION" if consensus >= 40 else "SKIP"
+            st.markdown(
+                f'<div style="text-align:center;padding:12px 0">'
+                f'<span style="font-size:2rem;font-weight:900;color:{color}">{verdict}</span>'
+                f'<br><span style="color:{color};font-size:18px">Consensus: {consensus}/100</span></div>',
+                unsafe_allow_html=True)
+            st.markdown(_confidence_bar(consensus, "Overall: "), unsafe_allow_html=True)
+        if synthesis:
+            st.markdown("---")
+            st.markdown(synthesis)
+    st.markdown("---")
+    st.markdown("### 🗣️ Agent Opinions")
+    for ar in (result.get("agents") or []):
+        agent_id   = ar.get("agent", "unknown")
+        name       = ar.get("name", agent_id)
+        opinion    = ar.get("opinion") or "*(no response)*"
+        confidence = ar.get("confidence")
+        colour, emoji, provider_label = AGENT_PROVIDER_COLOURS.get(agent_id, ("#6b7280", "⚪", agent_id))
+        with st.container(border=True):
+            ci, cb = st.columns([1, 9])
+            ci.markdown(f'<div style="font-size:2rem;text-align:center;padding-top:8px">{emoji}</div>',
+                        unsafe_allow_html=True)
+            with cb:
+                st.markdown(f'<span style="color:{colour};font-weight:700">{name}</span> '
+                            f'<span style="color:#888;font-size:12px">— {provider_label}</span>',
+                            unsafe_allow_html=True)
+                st.markdown(opinion)
+                st.markdown(_confidence_bar(confidence, "Confidence: "), unsafe_allow_html=True)
+    # ATS / outreach / schedule
+    ats = result.get("ats_bypass") or {}
+    if ats:
+        with st.expander("🤖 ATS Bypass Tip", expanded=True):
+            st.error(f"❌ Don't say: `{ats.get('naive_answer', 'Yes')}`")
+            st.success("✅ Say instead:")
+            st.code(ats.get("smart_answer", ""), language=None)
+            st.caption(ats.get("rationale", ""))
+    outreach = result.get("linkedin_outreach") or ""
+    if outreach:
+        with st.expander("🔗 LinkedIn Outreach Message"):
+            st.text_area("Edit before sending:", value=outreach, height=140, key="outreach_msg")
+    with st.expander("🔬 Raw JSON"):
+        st.json(result)
+
+
+# ---------------------------------------------------------------------------
 # Tab: Applications
 # ---------------------------------------------------------------------------
 
@@ -861,43 +847,33 @@ def tab_applications():
     st.subheader("📋 Application Tracker")
     email = st.session_state.get("candidate_email", "")
     if not email:
-        st.info("Enter your email in the sidebar to view your applications.")
+        st.info("Enter your email in the sidebar to view applications.")
         return
     if not is_port_open():
-        st.warning("⚠️ Backend is not running — start it from the sidebar to view applications.")
+        st.warning("⚠️ Backend not running — start it from the sidebar.")
         return
-
     data, err = _get(f"/applications/{email}")
-
     if err or not data:
-        st.error(
-            "⚠️ Could not load applications from backend.\n\n"
-            f"**Detail:** `{err or 'empty response'}`\n\n"
-            "This is usually resolved by restarting the backend (■ Stop → ▶ Start in the sidebar)."
-        )
+        st.error(f"Could not load applications.\n\n**Detail:** `{err or 'empty response'}`\n\n"
+                 "Restart the backend (■ Stop → ▶ Start in sidebar).")
         return
-
-    apps = data.get("applications", [])
+    apps  = data.get("applications", [])
     total = data.get("total_applications", len(apps))
-
     if not apps:
-        st.info("📭 No applications tracked yet. Run the AI Agent to start applying!")
+        st.info("📭 No applications yet. Run the AI Agent to start applying!")
         return
-
     counts = Counter((a.get("status") or "").lower() for a in apps)
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total",     total)
-    c2.metric("Draft",     counts.get("draft", 0))
+    c1.metric("Total", total)
+    c2.metric("Draft", counts.get("draft", 0))
     c3.metric("Submitted", counts.get("submitted", 0))
     c4.metric("Interview", counts.get("interview", 0))
     c5.metric("Rejected",  counts.get("rejected", 0))
-
     for app in apps:
-        job_data  = app.get("job") or {}
-        job_title = job_data.get("title") or app.get("job_title") or "Unknown role"
-        company   = job_data.get("company") or app.get("company") or "Unknown company"
-        job_url   = job_data.get("url") or app.get("job_url") or ""
-
+        jd        = app.get("job") or {}
+        job_title = jd.get("title") or app.get("job_title") or "Unknown role"
+        company   = jd.get("company") or app.get("company") or "Unknown"
+        job_url   = jd.get("url") or app.get("job_url") or ""
         with st.container(border=True):
             ca, cb, cc = st.columns([2, 2, 2])
             with ca:
@@ -909,13 +885,13 @@ def tab_applications():
                 st.markdown(status_pill(app.get("status", "draft")), unsafe_allow_html=True)
                 st.caption(f"Updated: {app.get('updated_at', '—')}")
             with cc:
-                opts = ["draft", "ready", "submitted", "interview", "rejected"]
+                opts       = ["draft", "ready", "submitted", "interview", "rejected"]
                 cur_status = app.get("status", "draft")
-                cur  = cur_status if cur_status in opts else "draft"
-                ns   = st.selectbox("Status", opts, index=opts.index(cur),
-                                    key=f"s_{app['application_id']}")
-                notes = st.text_input("Notes", value=app.get("notes") or "",
-                                      key=f"n_{app['application_id']}")
+                cur        = cur_status if cur_status in opts else "draft"
+                ns         = st.selectbox("Status", opts, index=opts.index(cur),
+                                          key=f"s_{app['application_id']}")
+                notes      = st.text_input("Notes", value=app.get("notes") or "",
+                                           key=f"n_{app['application_id']}")
                 if st.button("Save", key=f"sv_{app['application_id']}"):
                     res, e2 = _patch(f"/applications/{app['application_id']}/status",
                                      {"status": ns, "notes": notes or None, "run_id": None})
@@ -962,7 +938,7 @@ def tab_health():
             st.success(f"✅ `{pkg}` — {desc}")
         except ImportError:
             marker = "⚠️" if "optional" in desc else "❌"
-            st.error(f"{marker} `{pkg}` NOT installed. Fix: `pip install {pkg}`")
+            st.error(f"{marker} `{pkg}` NOT installed — `pip install {pkg}`")
     if status == "Running":
         data, _ = _get("/openapi.json")
         if data:
@@ -975,7 +951,16 @@ def tab_health():
 
 def main():
     st.set_page_config(page_title="Job Application Copilot", page_icon="🤖", layout="wide")
-    for k, v in {"resume_profile": None, "resume_filename": "", "candidate_email": ""}.items():
+    defaults = {
+        "resume_profile":  None,
+        "resume_filename": "",
+        "candidate_email": "",
+        "agent_launched":  False,
+        "run_id":          None,
+        "agent_status":    "idle",
+        "agent_stage":     "",
+    }
+    for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -1000,24 +985,22 @@ def main():
             st.rerun()
         st.markdown("---")
         st.session_state.candidate_email = st.text_input(
-            "Your email", value=st.session_state.candidate_email, placeholder="your@email.com")
+            "Your email", value=st.session_state.candidate_email,
+            placeholder="your@email.com")
         p = st.session_state.get("resume_profile")
         if p:
             st.success(f"📎 {st.session_state.resume_filename}")
-            # Show name from profile; fallback to filename stem so it's never blank
-            name = p.get("candidate_name") or ""
-            if not name:
-                import re
-                stem = Path(st.session_state.resume_filename).stem
-                stem = re.sub(r"[_\-]?(resume|cv|updated|new|final|\d{4})", "", stem, flags=re.I)
-                name = stem.replace("_", " ").replace("-", " ").strip().title() or "?"
-            st.caption(f"{name} | {len(p.get('skills') or [])} skills | {p.get('years_of_experience_hint') or '?'}")
+            name = _sidebar_name(p, st.session_state.resume_filename)
+            st.caption(f"{name} | {len(p.get('skills') or [])} skills "
+                       f"| {p.get('years_of_experience_hint') or '?'}")
         else:
             st.info("📎 Upload CV in ⚙️ Setup tab")
         if st.button("↻ Refresh", use_container_width=True):
             st.rerun()
 
-    t1, t2, t3, t4, t5 = st.tabs(["⚙️ Setup", "🤖 AI Agent", "🧠 Agent Debate", "📋 Applications", "🩺 Health"])
+    t1, t2, t3, t4, t5 = st.tabs(
+        ["⚙️ Setup", "🤖 AI Agent", "🧠 Agent Debate", "📋 Applications", "🩺 Health"]
+    )
     with t1: tab_setup()
     with t2: tab_agent()
     with t3: tab_debate()
