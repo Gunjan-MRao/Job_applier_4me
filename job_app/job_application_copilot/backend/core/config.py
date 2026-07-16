@@ -10,6 +10,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    # App identity
+    app_name: str = "Job Application Copilot"
+    app_env:  str = "development"
+
     # LLM keys (all optional — free/offline fallbacks always work)
     gemini_api_key:    Optional[str] = None
     hf_api_key:        Optional[str] = None
@@ -21,8 +25,8 @@ class Settings(BaseSettings):
     adzuna_app_key: Optional[str] = None
 
     # App internals
-    database_url: str = "sqlite:///./storage/jobs.db"
-    secret_key:   str = "change-me-in-production"
+    database_url: str  = "sqlite:///./storage/jobs.db"
+    secret_key:   str  = "change-me-in-production"
     debug:        bool = False
 
 
