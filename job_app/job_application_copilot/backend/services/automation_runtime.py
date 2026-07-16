@@ -55,6 +55,20 @@ JOBSPY_FALLBACK_URL   = "http://127.0.0.1:8010"
 JOBSPY_MAX_PER_SOURCE = 50
 HTML_SOURCE_CAP       = 100
 
+# Glassdoor rejects "United Kingdom" — needs a city.
+# We map common broad inputs to a city JobSpy/Glassdoor will accept.
+_GLASSDOOR_LOCATION_MAP = {
+    "united kingdom": "London, England",
+    "uk":             "London, England",
+    "england":        "London, England",
+    "great britain":  "London, England",
+    "britain":        "London, England",
+}
+
+def _glassdoor_location(location: str) -> str:
+    """Return a Glassdoor-safe location string."""
+    return _GLASSDOOR_LOCATION_MAP.get((location or "").strip().lower(), location)
+
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -67,7 +81,6 @@ REQUEST_HEADERS = {
 # ---------------------------------------------------------------------------
 # SEARCH TRACKS  —  Logistics & Supply Chain ONLY
 # ---------------------------------------------------------------------------
-# Primary track: specific role titles that appear on job boards
 SUPPLY_CHAIN_KEYWORDS = [
     "supply chain analyst",
     "logistics coordinator",
@@ -86,7 +99,6 @@ SUPPLY_CHAIN_KEYWORDS = [
     "s&op analyst",
 ]
 
-# Secondary track: broader terms to catch roles not using exact titles
 SUPPLY_CHAIN_BROAD = [
     "supply chain",
     "logistics",
@@ -94,7 +106,6 @@ SUPPLY_CHAIN_BROAD = [
     "operations",
 ]
 
-# Fallback sample jobs shown if all scrapers return nothing
 FALLBACK_JOBS = [
     {
         "title": "Supply Chain Analyst", "company": "DHL",
@@ -158,21 +169,21 @@ def list_runs() -> List[dict]:
 def create_run(payload) -> dict:
     run_id = str(uuid.uuid4())
     run = {
-        "run_id": run_id,
+        "run_id":           run_id,
         "candidate_email": payload.candidate_email,
-        "status": "queued",
-        "stage": "queued",
+        "status":          "queued",
+        "stage":           "queued",
         "progress_percent": 0,
-        "jobs_scanned": 0,
-        "jobs_matched": 0,
-        "jobs_applied": 0,
-        "jobs_failed": 0,
-        "current_url": None,
-        "logs": [],
-        "result_summary": None,
-        "top_matches": [],
-        "applied_jobs": [],
-        "created_at": now_iso(),
+        "jobs_scanned":    0,
+        "jobs_matched":    0,
+        "jobs_applied":    0,
+        "jobs_failed":     0,
+        "current_url":     None,
+        "logs":            [],
+        "result_summary":  None,
+        "top_matches":     [],
+        "applied_jobs":    [],
+        "created_at":      now_iso(),
     }
     add_log(run, "info", "Run created.")
     with RUN_LOCK:
@@ -205,7 +216,7 @@ def classify_sponsorship(description: str) -> str:
     return "unknown"
 
 # ---------------------------------------------------------------------------
-# Fit scoring  —  supply chain / logistics focused
+# Fit scoring
 # ---------------------------------------------------------------------------
 
 ENTRY_LEVEL_TITLES = [
@@ -221,28 +232,19 @@ SC_CORE_TERMS = [
 ]
 
 def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dict:
-    """Score a job for supply chain / logistics fit."""
     title    = (job.get("title") or "").lower()
     desc     = (job.get("description") or "").lower()
     combined = f"{title} {desc}"
 
-    # Keyword match against user keywords
     kw_hits  = sum(1 for kw in keywords if kw and kw.strip().lower() in combined)
     kw_score = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
-
-    # Bonus: SC core terms in title/description
-    sc_hits    = sum(1 for t in SC_CORE_TERMS if t in combined)
-    sc_bonus   = min(sc_hits * 3, 20)
-
-    # Bonus: entry-level / graduate title
+    sc_hits  = sum(1 for t in SC_CORE_TERMS if t in combined)
+    sc_bonus = min(sc_hits * 3, 20)
     entry_bonus = 15 if any(t in title for t in ENTRY_LEVEL_TITLES) else 0
-
-    # Bonus: confirmed sponsorship
     spons_bonus = 10 if job.get("sponsorship_status") == "yes" else 0
 
-    # Penalty: senior roles (unless candidate already has experience)
-    senior_terms  = ["senior", "lead", "head of", "director", "principal", "vp ", "manager"]
-    exp_hint      = (profile or {}).get("years_of_experience_hint") or ""
+    senior_terms   = ["senior", "lead", "head of", "director", "principal", "vp ", "manager"]
+    exp_hint       = (profile or {}).get("years_of_experience_hint") or ""
     has_experience = any(c.isdigit() for c in exp_hint)
     senior_penalty = -20 if any(t in title for t in senior_terms) and not has_experience else 0
 
@@ -260,7 +262,7 @@ def _gemini(prompt: str, max_tokens: int = 500) -> Optional[str]:
         return None
     try:
         url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            "https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-1.5-flash:generateContent?key={key}"
         )
         body = {
@@ -279,12 +281,14 @@ def _huggingface(prompt: str, max_tokens: int = 500) -> Optional[str]:
         return None
     try:
         url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
-        resp = requests.post(url,
+        resp = requests.post(
+            url,
             headers={"Authorization": f"Bearer {key}"},
             json={"inputs": prompt,
                   "parameters": {"max_new_tokens": max_tokens, "temperature": 0.75,
                                  "return_full_text": False}},
-            timeout=60)
+            timeout=60,
+        )
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list) and data:
@@ -329,7 +333,7 @@ def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
     )
 
 # ---------------------------------------------------------------------------
-# Smart offline cover letter + cold email (SC/logistics flavoured)
+# Offline cover letter + cold email
 # ---------------------------------------------------------------------------
 
 def _offline_cover_letter(profile: dict, job: dict) -> str:
@@ -339,7 +343,6 @@ def _offline_cover_letter(profile: dict, job: dict) -> str:
     skills  = profile.get("skills") or []
     exp     = profile.get("years_of_experience_hint") or "relevant"
     roles   = profile.get("likely_roles") or []
-
     sc_skills = [s for s in skills if s in (
         "supply chain", "logistics", "procurement", "sap", "excel",
         "forecasting", "demand planning", "inventory management",
@@ -347,7 +350,6 @@ def _offline_cover_letter(profile: dict, job: dict) -> str:
     )]
     top_skills = ", ".join(sc_skills[:3]) if sc_skills else ", ".join(skills[:3]) or "my skills"
     role_bg    = roles[0].title() if roles else "supply chain and logistics"
-
     desc = (job.get("description") or "").lower()
     if "sap" in desc:
         detail = "I have hands-on experience with SAP which I understand is central to this role."
@@ -357,7 +359,6 @@ def _offline_cover_letter(profile: dict, job: dict) -> str:
         detail = "I have worked on demand forecasting and inventory optimisation, and I am confident I can contribute quickly."
     else:
         detail = "I am confident my background in supply chain and logistics aligns well with what you are looking for."
-
     return (
         f"Dear Hiring Team at {company},\n\n"
         f"I am writing to express my strong interest in the {title} position at {company}.\n\n"
@@ -470,12 +471,14 @@ def _safe_val(value):
 
 def jobspy_scrape_site(site: str, keywords: List[str], location: str, run: dict) -> List[dict]:
     search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
-    add_log(run, "info", f"[JobSpy] {site} → '{search_term}'")
+    # Glassdoor rejects broad country names — map to a city
+    effective_location = _glassdoor_location(location) if site == "glassdoor" else (location or "United Kingdom")
+    add_log(run, "info", f"[JobSpy] {site} → '{search_term}' @ '{effective_location}'")
     try:
         df = _jobspy_scrape(
             site_name=[site],
             search_term=search_term,
-            location=location or "United Kingdom",
+            location=effective_location,
             results_wanted=JOBSPY_MAX_PER_SOURCE,
             country_indeed="UK",
             linkedin_fetch_description=True,
@@ -498,14 +501,17 @@ def jobspy_scrape_site(site: str, keywords: List[str], location: str, run: dict)
         add_log(run, "info", f"[JobSpy] {site} → {len(rows)} jobs")
         return rows
     except Exception as exc:
-        add_log(run, "warning", f"[JobSpy] {site} failed: {exc}")
+        add_log(run, "warning", f"[JobSpy] {site} skipped: {exc}")
         return []
 
 def jobspy_fallback_http(site: str, keywords: List[str], location: str, run: dict) -> List[dict]:
     search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
-    params = {"site_name": site, "search_term": search_term,
-               "location": location or "United Kingdom",
-               "results_wanted": JOBSPY_MAX_PER_SOURCE, "offset": 0}
+    effective_location = _glassdoor_location(location) if site == "glassdoor" else (location or "United Kingdom")
+    params = {
+        "site_name": site, "search_term": search_term,
+        "location": effective_location,
+        "results_wanted": JOBSPY_MAX_PER_SOURCE, "offset": 0,
+    }
     try:
         resp = requests.get(f"{JOBSPY_FALLBACK_URL}/search_jobs", params=params, timeout=(5, 120))
         if resp.status_code != 200:
@@ -526,17 +532,16 @@ def jobspy_fallback_http(site: str, keywords: List[str], location: str, run: dic
             })
         return rows
     except Exception as exc:
-        add_log(run, "warning", f"[JobSpy-HTTP] {site} failed: {exc}")
+        add_log(run, "warning", f"[JobSpy-HTTP] {site} skipped: {exc}")
         return []
 
 def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dict]:
     fn = jobspy_scrape_site if JOBSPY_AVAILABLE else jobspy_fallback_http
     all_jobs: List[dict] = []
-    # Three targeted keyword sets across all job sites
     kw_sets = [
-        keywords,                      # user-provided / smart-extracted
-        SUPPLY_CHAIN_KEYWORDS[:4],     # specific SC titles
-        SUPPLY_CHAIN_BROAD[:2],        # broad catch-all
+        keywords,
+        SUPPLY_CHAIN_KEYWORDS[:4],
+        SUPPLY_CHAIN_BROAD[:2],
     ]
     tasks = [(site, kws) for kws in kw_sets for site in JOBSPY_SITES]
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -741,7 +746,7 @@ def stream_apply_job(job: dict, profile: Optional[dict], keywords: List[str],
             run_obj["jobs_applied"] = len(run_obj["applied_jobs"])
             run_obj["top_matches"] = sorted(
                 run_obj["applied_jobs"],
-                key=lambda x: x.get("fit_score", 0), reverse=True
+                key=lambda x: x.get("fit_score", 0), reverse=True,
             )[:20]
 
 # ---------------------------------------------------------------------------
@@ -793,7 +798,6 @@ def run_automation_pipeline(run_id: str, payload) -> None:
             job["fit_score"] = score_data["fit_score"]
             job["fit_level"] = score_data["fit_level"]
 
-            # Accept 25%+ — generous threshold for graduate/entry-level search
             if score_data["fit_score"] >= 25 and job.get("sponsorship_status") != "no":
                 matched += 1
                 update_run(run_id, jobs_matched=matched)
@@ -833,6 +837,6 @@ def run_automation_pipeline(run_id: str, payload) -> None:
 def start_run_thread(payload) -> dict:
     run = create_run(payload)
     threading.Thread(
-        target=run_automation_pipeline, args=(run["run_id"], payload), daemon=True
+        target=run_automation_pipeline, args=(run["run_id"], payload), daemon=True,
     ).start()
     return run
