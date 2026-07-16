@@ -63,7 +63,7 @@ def main():
     with col1:
         keyword_input = st.text_input(
             "Job keywords (comma-separated)",
-            value="supply chain coordinator, logistics coordinator, freight forwarder",
+            value="graduate supply chain analyst, demand planning analyst, operations analyst, procurement analyst, logistics analyst",
         )
     with col2:
         visa_filter = st.checkbox("🔵 Show only visa/relocation-sponsored roles", value=False)

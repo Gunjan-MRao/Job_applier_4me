@@ -69,8 +69,9 @@ SOURCE_ICONS = {
 }
 
 DEFAULT_KEYWORDS = (
-    "supply chain analyst, logistics coordinator, procurement analyst, "
-    "demand planner, inventory analyst, operations analyst"
+    "graduate supply chain analyst, operations analyst, demand planning analyst, "
+    "procurement analyst, logistics analyst, inventory analyst, supply chain graduate scheme, "
+    "business analyst supply chain, category analyst"
 )
 
 # Browser meta-refresh interval while the agent is running (seconds).
@@ -295,8 +296,12 @@ def smart_keywords(profile: dict) -> str:
             out.append(k)
     if not out:
         out = sc_skills[:6] or [
-            "supply chain analyst", "logistics coordinator",
-            "procurement analyst", "operations analyst",
+            "graduate supply chain analyst",
+            "demand planning analyst",
+            "operations analyst",
+            "procurement analyst",
+            "logistics analyst",
+            "inventory analyst",
         ]
     return ", ".join(out[:8])
 
