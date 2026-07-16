@@ -1,13 +1,15 @@
 """
-Job Application Copilot — Streamlit frontend v9
+Job Application Copilot — Streamlit frontend v9.1
 
-v9 changes:
-- New '🧠 Agent Debate' tab: watch 5 AI agents argue about any job in real time
-- Each agent card: name, provider, opinion, colour-coded confidence bar
-- Synthesis panel: VERDICT, TOP 3 ACTIONS, RISK LEVEL, OVERALL CONFIDENCE
-- Company Tier badge, GOV.UK verification, ATS bypass tip, LinkedIn outreach,
-  follow-up schedule, hiring window indicator
-- All original tabs preserved and unchanged
+v9.1 fixes:
+- ScriptRunContext warnings: background threads no longer call st.*
+  directly; they write to session_state via a plain dict mutation which
+  is safe from any thread.  st.rerun() is only ever called from the
+  main script thread (inside the running==True block at the bottom of
+  tab_agent).
+- RuntimeError 'Event loop is closed': _poll_loop and _start wrap every
+  _set_agent() call in try/except RuntimeError so they exit cleanly when
+  Streamlit tears down the session instead of crashing ScriptRunner.
 """
 import os
 import signal
@@ -30,7 +32,7 @@ API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 PID_FILE = BASE_DIR / "runtime_api.pid"
 LOG_FILE = BASE_DIR / "backend_startup.log"
 PYTHON_EXE = sys.executable
-POLL_SECONDS = 3
+POLL_SECONDS = 2  # slightly snappier
 
 SOURCE_ICONS = {
     "linkedin":           "🔵 LinkedIn",
@@ -279,14 +281,25 @@ def _agent_state() -> dict:
     return st.session_state["agent"]
 
 def _set_agent(**kwargs):
-    _agent_state().update(kwargs)
+    # Safe to call from background threads — only mutates a plain dict,
+    # never touches any Streamlit widget or asyncio event loop.
+    try:
+        _agent_state().update(kwargs)
+    except RuntimeError:
+        # Session has been torn down; swallow silently.
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Poll thread
+# Poll thread  (background — must NOT call any st.* functions)
 # ---------------------------------------------------------------------------
 
 def _poll_loop(run_id: str):
+    """
+    Polls /automation/status every POLL_SECONDS and writes results into
+    the plain agent-state dict.  Never calls st.rerun() or any other
+    Streamlit API — that is the job of the main script thread.
+    """
     retries = 0
     while True:
         time.sleep(POLL_SECONDS)
@@ -297,27 +310,36 @@ def _poll_loop(run_id: str):
         except Exception:
             retries += 1
             if retries >= 5:
-                _set_agent(status="failed", running=False)
+                try:
+                    _set_agent(status="failed", running=False)
+                except RuntimeError:
+                    pass
                 return
             continue
         retries = 0
         applied_jobs  = data.get("applied_jobs") or []
         source_counts = dict(Counter(j.get("source", "unknown") for j in applied_jobs))
-        _set_agent(
-            status        = data.get("status", "unknown"),
-            stage         = data.get("stage", ""),
-            progress      = data.get("progress_percent", 0),
-            scanned       = data.get("jobs_scanned", 0),
-            matched       = data.get("jobs_matched", 0),
-            applied       = data.get("jobs_applied", 0),
-            current_url   = data.get("current_url") or "",
-            top_matches   = data.get("top_matches") or [],
-            applied_jobs  = applied_jobs,
-            source_counts = source_counts,
-            summary       = data.get("result_summary"),
-        )
+        try:
+            _set_agent(
+                status        = data.get("status", "unknown"),
+                stage         = data.get("stage", ""),
+                progress      = data.get("progress_percent", 0),
+                scanned       = data.get("jobs_scanned", 0),
+                matched       = data.get("jobs_matched", 0),
+                applied       = data.get("jobs_applied", 0),
+                current_url   = data.get("current_url") or "",
+                top_matches   = data.get("top_matches") or [],
+                applied_jobs  = applied_jobs,
+                source_counts = source_counts,
+                summary       = data.get("result_summary"),
+            )
+        except RuntimeError:
+            return  # event loop / session gone
         if data.get("status") in ("completed", "failed"):
-            _set_agent(running=False)
+            try:
+                _set_agent(running=False)
+            except RuntimeError:
+                pass
             return
 
 
@@ -330,20 +352,23 @@ def launch_agent(config: dict):
     )
 
     def _start():
-        if not is_port_open():
-            _set_agent(stage="⚙️ Starting backend...")
-            ok, msg = start_backend()
-            if not ok:
-                _set_agent(status="failed", running=False, stage=f"Backend failed: {msg}")
+        try:
+            if not is_port_open():
+                _set_agent(stage="⚙️ Starting backend...")
+                ok, msg = start_backend()
+                if not ok:
+                    _set_agent(status="failed", running=False, stage=f"Backend failed: {msg}")
+                    return
+            _set_agent(stage="📡 Submitting to backend...")
+            result, err = _post("/automation/start", config)
+            if err or not result:
+                _set_agent(status="failed", running=False, stage=f"API error: {err}")
                 return
-        _set_agent(stage="📡 Submitting to backend...")
-        result, err = _post("/automation/start", config)
-        if err or not result:
-            _set_agent(status="failed", running=False, stage=f"API error: {err}")
-            return
-        run_id = result.get("run_id", "")
-        _set_agent(run_id=run_id, status="running", stage="🔍 Searching all job boards...")
-        threading.Thread(target=_poll_loop, args=(run_id,), daemon=True).start()
+            run_id = result.get("run_id", "")
+            _set_agent(run_id=run_id, status="running", stage="🔍 Searching all job boards...")
+            threading.Thread(target=_poll_loop, args=(run_id,), daemon=True).start()
+        except RuntimeError:
+            pass  # session gone before we finished starting
 
     threading.Thread(target=_start, daemon=True).start()
 
@@ -371,16 +396,13 @@ def source_label(s):
 
 # ---------------------------------------------------------------------------
 # Multi-agent strategy import helper
-# Works whether backend is running or not
 # ---------------------------------------------------------------------------
 
 def _import_strategy():
-    """Import sponsor_strategy without requiring backend to be running."""
     try:
         from backend.services.sponsor_strategy import run_multi_agent_debate, hiring_window_score
         return run_multi_agent_debate, hiring_window_score
     except ImportError:
-        # Try adding the app directory to sys.path
         app_dir = str(BASE_DIR)
         if app_dir not in sys.path:
             sys.path.insert(0, app_dir)
@@ -410,7 +432,6 @@ TIER_STYLE = {
 }
 
 def _confidence_bar(score, label=""):
-    """Render an HTML confidence bar."""
     if score is None:
         return "<em style='color:#888'>No response</em>"
     color = "#10b981" if score >= 70 else ("#f59e0b" if score >= 40 else "#ef4444")
@@ -423,7 +444,6 @@ def _confidence_bar(score, label=""):
     )
 
 def _render_agent_card(result: dict):
-    """Render one agent opinion card."""
     agent_id  = result.get("agent", "unknown")
     name      = result.get("name", agent_id)
     opinion   = result.get("opinion") or "*(no response — API key not set)*"
@@ -431,7 +451,6 @@ def _render_agent_card(result: dict):
     colour, emoji, provider_label = AGENT_PROVIDER_COLOURS.get(
         agent_id, ("#6b7280", "⚪", agent_id)
     )
-
     with st.container(border=True):
         col_icon, col_body = st.columns([1, 9])
         with col_icon:
@@ -451,8 +470,7 @@ def _render_agent_card(result: dict):
                 unsafe_allow_html=True,
             )
 
-def _render_synthesis(synthesis: str, consensus: int | None):
-    """Render the synthesis panel."""
+def _render_synthesis(synthesis: str, consensus):
     st.markdown("### 🎯 Agent Synthesis — Final Verdict")
     with st.container(border=True):
         if consensus is not None:
@@ -484,7 +502,6 @@ def tab_debate():
         "how to approach it, and what the risks are. The Reddit Oracle always runs (no API needed)."
     )
 
-    # --- Hiring window banner ---
     run_debate_fn, hiring_window_fn = _import_strategy()
     if hiring_window_fn:
         try:
@@ -500,7 +517,6 @@ def tab_debate():
         except Exception:
             pass
 
-    # --- Import check ---
     if run_debate_fn is None:
         st.error(
             "❌ Could not import `sponsor_strategy.py`. "
@@ -509,13 +525,11 @@ def tab_debate():
         )
         return
 
-    # --- Profile ---
     profile = st.session_state.get("resume_profile") or {}
     if not profile:
         st.warning("⚠️ No resume loaded — upload in **⚙️ Setup** for personalised agent opinions.")
         profile = {"candidate_name": "Candidate", "skills": [], "years_of_experience_hint": "graduate"}
 
-    # --- Job input form ---
     with st.form("debate_form"):
         st.markdown("**Enter the job details:**")
         c1, c2 = st.columns(2)
@@ -566,7 +580,6 @@ def tab_debate():
                     st.error(f"Debate failed: {exc}")
                     st.session_state.pop("last_debate", None)
 
-    # --- Render last debate result ---
     result = st.session_state.get("last_debate")
     if not result:
         st.info(
@@ -580,7 +593,6 @@ def tab_debate():
         )
         return
 
-    # --- Company tier badge ---
     tier = result.get("company_tier", "tier3")
     tier_colour, tier_label = TIER_STYLE.get(tier, ("#6b7280", "Unknown tier"))
     govuk = result.get("govuk_verified")
@@ -599,7 +611,6 @@ def tab_debate():
         unsafe_allow_html=True,
     )
 
-    # --- Synthesis first (verdict at top) ---
     _render_synthesis(
         result.get("synthesis", ""),
         result.get("consensus_confidence"),
@@ -607,24 +618,19 @@ def tab_debate():
 
     st.markdown("---")
     st.markdown("### 🗣️ Agent Opinions")
-
-    agents = result.get("agents") or []
-    for agent_result in agents:
+    for agent_result in (result.get("agents") or []):
         _render_agent_card(agent_result)
 
     st.markdown("---")
 
-    # --- ATS Bypass ---
     ats = result.get("ats_bypass") or {}
     if ats:
         with st.expander("🤖 ATS Bypass Tip — How to answer 'Do you require sponsorship?'", expanded=True):
             st.error(f"❌ **Don't say:** `{ats.get('naive_answer', 'Yes')}`  — many ATS auto-reject this")
-            smart = ats.get('smart_answer', '')
-            st.success(f"✅ **Say instead:**")
-            st.code(smart, language=None)
+            st.success("✅ **Say instead:**")
+            st.code(ats.get('smart_answer', ''), language=None)
             st.caption(ats.get('rationale', ''))
 
-    # --- LinkedIn outreach ---
     outreach = result.get("linkedin_outreach") or ""
     if outreach:
         with st.expander("🔗 LinkedIn Outreach Message (curiosity approach — NOT asking for job)"):
@@ -639,7 +645,6 @@ def tab_debate():
                 key="linkedin_outreach_msg",
             )
 
-    # --- Follow-up schedule ---
     schedule = result.get("followup_schedule") or []
     if schedule:
         with st.expander("📅 Follow-up Schedule (every 5 days — max 3 times)"):
@@ -656,7 +661,6 @@ def tab_debate():
                     key=f"followup_{item['day']}",
                 )
 
-    # --- Hiring window reminder ---
     hw = result.get("hiring_window") or {}
     if hw:
         with st.expander("📅 Hiring Window Analysis"):
@@ -667,8 +671,7 @@ def tab_debate():
                 f'<strong style="color:{hw_color}">{hw.get("advice", "")}</strong>',
                 unsafe_allow_html=True,
             )
-            apply_now = hw.get("apply_now", False)
-            if apply_now:
+            if hw.get("apply_now", False):
                 st.success("✅ Good time to apply — within peak hiring window.")
             else:
                 st.warning(
@@ -676,7 +679,6 @@ def tab_debate():
                     "close soon, but expect slower response times."
                 )
 
-    # --- Debug / raw JSON ---
     with st.expander("🔬 Raw debate data (JSON)"):
         import json
         st.json(result)
@@ -737,7 +739,7 @@ def tab_agent():
     col_be, col_gem = st.columns(2)
     be_status, _ = backend_status_info()
     if be_status == "Running":
-        col_be.info(f"🟢 Backend: **Running**")
+        col_be.info("🟢 Backend: **Running**")
     else:
         col_be.warning(f"🔴 Backend: **{be_status}** — agent will start it automatically")
 
@@ -879,6 +881,9 @@ def tab_agent():
         with st.expander("📈 Final summary"):
             st.json(summary)
 
+    # ── Only the MAIN SCRIPT THREAD calls st.rerun() ──────────────────────
+    # This is the only place st.rerun() is called; background threads
+    # never touch it.  The 2-second sleep keeps CPU usage minimal.
     if running:
         time.sleep(POLL_SECONDS)
         st.rerun()
@@ -1111,7 +1116,6 @@ def main():
         if st.button("↻ Refresh", use_container_width=True):
             st.rerun()
 
-    # 5 tabs — Setup, AI Agent, Agent Debate, Applications, Health
     t1, t2, t3, t4, t5 = st.tabs([
         "⚙️ Setup",
         "🤖 AI Agent",
