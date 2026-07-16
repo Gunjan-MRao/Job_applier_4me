@@ -10,6 +10,7 @@ from backend.api.v1.endpoints.candidate import router as candidate_router
 from backend.api.v1.endpoints.jobs import router as jobs_router
 from backend.api.v1.endpoints.applications import router as applications_router
 from backend.api.v1.endpoints.automation import router as automation_router
+from backend.api.v1.endpoints.jobs_international import router as jobs_international_router
 
 api_router = APIRouter()
 api_router.include_router(health_router)
@@ -23,3 +24,4 @@ api_router.include_router(monitor_router)
 api_router.include_router(candidate_router)
 api_router.include_router(jobs_router)
 api_router.include_router(automation_router)
+api_router.include_router(jobs_international_router)
