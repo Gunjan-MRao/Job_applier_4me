@@ -1,10 +1,12 @@
 """
-Job Application Copilot — Streamlit frontend v5
+Job Application Copilot — Streamlit frontend v6
 
-Fixes:
-- AI Agent tab always shows the launch form (was hidden when status==idle)
-- Gemini API key status shown in agent tab
-- Smart idle state message instead of silent blank screen
+New in v6:
+- LIVE source feed: shows which board (LinkedIn/Indeed/Reed etc) is being scraped right now
+- Real-time dashboard: Found / Matched / Applied / Needs Review with auto-refresh
+- Each job card: apply link, cover letter, cold email, resume guidance
+- Smart keywords: top 8 role-based terms auto-built from parsed CV
+- Needs-review queue: jobs the agent couldn't auto-apply
 """
 import os
 import signal
@@ -27,7 +29,21 @@ API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 PID_FILE = BASE_DIR / "runtime_api.pid"
 LOG_FILE = BASE_DIR / "backend_startup.log"
 PYTHON_EXE = sys.executable
-POLL_SECONDS = 4
+POLL_SECONDS = 3          # fast refresh for live feel
+
+SOURCE_ICONS = {
+    "linkedin": "🔵 LinkedIn",
+    "indeed": "🔍 Indeed",
+    "glassdoor": "🏢 Glassdoor",
+    "google": "🔎 Google Jobs",
+    "reed": "📕 Reed",
+    "cvlibrary": "📚 CV-Library",
+    "totaljobs": "💼 TotalJobs",
+    "findajob": "🏷️ Find a Job (GOV.UK)",
+    "nhs": "🏥 NHS Jobs",
+    "ukvisasponsorships": "🛣️ UK Visa Sponsorships",
+    "fallback": "📦 Sample",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +83,7 @@ def start_backend():
     cmd = [PYTHON_EXE, "-m", "uvicorn", "backend.main:app",
            "--host", API_HOST, "--port", str(API_PORT), "--log-level", "info"]
     try:
-        kw = dict(cwd=str(BASE_DIR),
-                  stdout=open(LOG_FILE, "w"), stderr=subprocess.STDOUT)
+        kw = dict(cwd=str(BASE_DIR), stdout=open(LOG_FILE, "w"), stderr=subprocess.STDOUT)
         if os.name == "nt":
             kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -117,7 +132,7 @@ def backend_status_info():
 
 
 # ---------------------------------------------------------------------------
-# Local resume parse (no backend needed)
+# Resume helpers
 # ---------------------------------------------------------------------------
 
 def _extract_text_raw(file_bytes, suffix):
@@ -175,6 +190,29 @@ def parse_resume(file_bytes, filename):
             pass
     return parse_resume_local(file_bytes, filename)
 
+def smart_keywords(profile: dict) -> str:
+    """Build a focused, high-quality keyword string from the parsed profile."""
+    roles = profile.get("likely_roles") or []
+    skills = profile.get("skills") or []
+    # Priority: most specific roles first, then high-value skills
+    priority_skills = [s for s in skills if s in (
+        "supply chain", "logistics", "procurement", "operations",
+        "data analysis", "python", "sql", "excel", "sap", "power bi",
+        "forecasting", "demand planning", "inventory management",
+        "project management", "business analysis", "erp"
+    )]
+    combined = roles[:3] + priority_skills[:5]
+    # dedupe preserving order
+    seen = set()
+    out = []
+    for k in combined:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    if not out:
+        out = skills[:6] or ["logistics", "supply chain", "operations"]
+    return ", ".join(out[:8])
+
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -215,15 +253,15 @@ AGENT_LOCK = threading.Lock()
 def _alog(msg):
     with AGENT_LOCK:
         AGENT.setdefault("log", []).append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        AGENT["log"] = AGENT["log"][-300:]
+        AGENT["log"] = AGENT["log"][-500:]
 
 def _agent(config):
     with AGENT_LOCK:
         AGENT.update({"running": True, "status": "starting", "run_id": None,
                       "summary": None, "top_matches": [], "applied_jobs": [],
                       "log": [], "scanned": 0, "matched": 0, "applied": 0,
-                      "progress": 0, "stage": ""})
-
+                      "progress": 0, "stage": "", "current_url": "",
+                      "source_counts": {}})
     _alog("Agent started.")
     if not is_port_open():
         _alog("Starting backend...")
@@ -236,7 +274,7 @@ def _agent(config):
     else:
         _alog("Backend already running.")
 
-    _alog(f"Launching run: {config.get('keywords')} in {config.get('location')} — scanning ALL jobs")
+    _alog(f"Launching: {config.get('keywords')} in {config.get('location')}")
     with AGENT_LOCK: AGENT["status"] = "running"
 
     result, err = _post("/automation/start", config)
@@ -262,29 +300,35 @@ def _agent(config):
             continue
         retries = 0
 
-        state   = data.get("status", "unknown")
-        stage   = data.get("stage", "")
-        prog    = data.get("progress_percent", 0)
-        scanned = data.get("jobs_scanned", 0)
-        matched = data.get("jobs_matched", 0)
-        applied = data.get("jobs_applied", 0)
         applied_jobs = data.get("applied_jobs") or []
-        top     = data.get("top_matches") or (data.get("result_summary") or {}).get("top_matches") or []
+        # build per-source counts from applied jobs
+        source_counts = dict(Counter(j.get("source", "unknown") for j in applied_jobs))
 
         with AGENT_LOCK:
-            AGENT.update({"status": state, "stage": stage, "progress": prog,
-                          "scanned": scanned, "matched": matched, "applied": applied,
-                          "top_matches": top, "applied_jobs": applied_jobs})
+            AGENT.update({
+                "status":      data.get("status", "unknown"),
+                "stage":       data.get("stage", ""),
+                "progress":    data.get("progress_percent", 0),
+                "scanned":     data.get("jobs_scanned", 0),
+                "matched":     data.get("jobs_matched", 0),
+                "applied":     data.get("jobs_applied", 0),
+                "current_url": data.get("current_url") or "",
+                "top_matches": data.get("top_matches") or [],
+                "applied_jobs": applied_jobs,
+                "source_counts": source_counts,
+            })
 
-        _alog(f"{stage} | {prog}% | scanned={scanned} matched={matched} applied={applied}")
+        state = data.get("status", "unknown")
+        stage = data.get("stage", "")
+        _alog(f"{stage} | {data.get('progress_percent',0)}% | "
+              f"scanned={data.get('jobs_scanned',0)} "
+              f"matched={data.get('jobs_matched',0)} "
+              f"applied={data.get('jobs_applied',0)}")
 
         if state in ("completed", "failed"):
             with AGENT_LOCK:
                 AGENT.update({"running": False, "summary": data.get("result_summary")})
-            _alog(f"{'Done' if state=='completed' else 'Failed'}: {scanned} scanned, {applied} processed")
-            if top:
-                for m in top[:5]:
-                    _alog(f"  ★ {m.get('title')} @ {m.get('company')} — {m.get('fit_score')}%")
+            _alog(f"{'Done' if state=='completed' else 'Failed'}")
             return
 
 def launch_agent(config):
@@ -295,13 +339,18 @@ def launch_agent(config):
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def badge(s):
-    c = {"running":"#0ea5e9","completed":"#10b981","failed":"#ef4444",
-         "queued":"#f59e0b","starting":"#f59e0b","stopped":"#6b7280",
-         "draft":"#f59e0b","submitted":"#10b981","rejected":"#ef4444","interview":"#8b5cf6"
-         }.get((s or "").lower(), "#6b7280")
+def badge(s, custom_color=None):
+    c = custom_color or {
+        "running":"#0ea5e9","completed":"#10b981","failed":"#ef4444",
+        "queued":"#f59e0b","starting":"#f59e0b","stopped":"#6b7280",
+        "draft":"#f59e0b","submitted":"#10b981","rejected":"#ef4444",
+        "interview":"#8b5cf6","needs review":"#f97316",
+    }.get((s or "").lower(), "#6b7280")
     return (f'<span style="padding:3px 12px;border-radius:999px;background:{c}22;'
             f'color:{c};font-weight:700;font-size:13px;border:1px solid {c}66">{s}</span>')
+
+def source_label(s):
+    return SOURCE_ICONS.get((s or "").lower(), f"🔍 {s}")
 
 
 # ---------------------------------------------------------------------------
@@ -337,65 +386,64 @@ def tab_setup():
             st.write(f"📧 **Email:** {p.get('email') or '—'}")
             st.write(f"💼 **Experience:** {p.get('years_of_experience_hint') or '—'}")
         with c2:
-            st.write(f"🎯 **Roles ({len(p.get('likely_roles') or [])}):** {', '.join(p.get('likely_roles') or []) or '—'}")
-            st.write(f"⚙️ **Skills ({len(p.get('skills') or [])}):** {', '.join(p.get('skills') or []) or '—'}")
+            st.write(f"🎯 **Roles detected:** {', '.join(p.get('likely_roles') or []) or '—'}")
+            st.write(f"⚙️ **Skills detected ({len(p.get('skills') or [])}):** {', '.join(p.get('skills') or []) or '—'}")
+        kw = smart_keywords(p)
+        st.info(f"🔑 **Smart keywords that will be used:** `{kw}`")
         with st.expander("Resume text preview"):
             st.text(p.get("preview", ""))
 
 
 # ---------------------------------------------------------------------------
-# Tab: AI Agent
+# Tab: AI Agent  (live dashboard)
 # ---------------------------------------------------------------------------
 
 def tab_agent():
-    st.subheader("🤖 AI Agent")
+    st.subheader("🤖 AI Job Agent")
 
     p = st.session_state.get("resume_profile") or {}
 
-    # — Status bar at the top —
+    # Top status bar
     col_be, col_gem = st.columns(2)
     be_status, _ = backend_status_info()
     col_be.info(f"🟢 Backend: **{be_status}**" if be_status == "Running"
-                else f"🔴 Backend: **{be_status}** — the agent will start it automatically")
-
+                else f"🔴 Backend: **{be_status}** — agent will start it automatically")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    # also try reading from .env file directly
     env_file = BASE_DIR / ".env"
     if not gemini_key and env_file.exists():
         for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("GEMINI_API_KEY="):
+            if line.strip().startswith("GEMINI_API_KEY="):
                 gemini_key = line.split("=", 1)[1].strip()
                 break
     if gemini_key:
-        col_gem.success("✅ Gemini API key configured — AI cover letters enabled")
+        col_gem.success("✅ Gemini API key — AI cover letters enabled")
     else:
-        col_gem.warning("⚠️ No Gemini key in .env — will use smart offline templates")
+        col_gem.warning("⚠️ No Gemini key — using smart offline templates")
 
     if not p:
-        st.warning("⚠️ No resume loaded — go to **⚙️ Setup** first for best results. "
-                   "You can still run the agent with manual keywords below.")
+        st.warning("⚠️ No resume loaded — go to **⚙️ Setup** first for best results.")
 
-    default_kw = ", ".join((p.get("likely_roles") or []) + (p.get("skills") or [])
-                           ) or "logistics, supply chain, operations"
+    default_kw = smart_keywords(p) if p else "supply chain, logistics, operations, procurement"
 
-    # — Launch form — always visible —
+    # --- Launch form ---
     with st.form("agent_form"):
         c1, c2 = st.columns(2)
-        keywords = c1.text_input("Keywords (auto-filled from your CV)", value=default_kw)
-        location = c2.text_input("Location", "United Kingdom")
-        with st.expander("🔧 Advanced filters"):
+        keywords = c1.text_input("🔑 Keywords (auto-built from your CV)", value=default_kw,
+                                  help="These are your best-fit job search terms. Edit freely.")
+        location = c2.text_input("📍 Location", "United Kingdom")
+        with st.expander("🔧 Advanced filters (optional)"):
             blacklist = st.text_input("Skip these companies (comma-separated)", "")
-            whitelist = st.text_input("Only apply to these companies (optional)", "")
+            whitelist = st.text_input("Only show these companies (optional)", "")
             auto_apply = st.checkbox(
                 "Auto-generate cover letter + cold email per match", value=True)
-        go = st.form_submit_button("🚀 Start AI Agent — scan ALL jobs",
+        go = st.form_submit_button("🚀 Start AI Agent — scan ALL job boards",
                                    type="primary", use_container_width=True)
 
     if go:
         with AGENT_LOCK:
             already = AGENT.get("running", False)
         if already:
-            st.warning("Agent already running — scroll down to see live progress.")
+            st.warning("Agent already running — scroll down for live progress.")
         else:
             cfg = {
                 "candidate_email": st.session_state.get("candidate_email") or "user@example.com",
@@ -410,77 +458,95 @@ def tab_agent():
             }
             with AGENT_LOCK: AGENT.clear()
             launch_agent(cfg)
-            st.success("🤖 Agent launched! Live updates below — results appear as each job is found.")
+            st.success("🤖 Agent launched! Live dashboard below.")
             time.sleep(1)
             st.rerun()
 
-    # — Live status (only shown after agent has been started) —
+    # --- Live state ---
     with AGENT_LOCK:
-        running   = AGENT.get("running", False)
-        status    = AGENT.get("status", "idle")
-        prog      = AGENT.get("progress", 0)
-        stage     = AGENT.get("stage", "")
-        log       = list(AGENT.get("log", []))
-        aj        = list(AGENT.get("applied_jobs", []))
-        scanned   = AGENT.get("scanned", 0)
-        matched   = AGENT.get("matched", 0)
-        applied   = AGENT.get("applied", 0)
-        summary   = AGENT.get("summary")
+        running      = AGENT.get("running", False)
+        status       = AGENT.get("status", "idle")
+        prog         = AGENT.get("progress", 0)
+        stage        = AGENT.get("stage", "")
+        log          = list(AGENT.get("log", []))
+        aj           = list(AGENT.get("applied_jobs", []))
+        scanned      = AGENT.get("scanned", 0)
+        matched      = AGENT.get("matched", 0)
+        applied      = AGENT.get("applied", 0)
+        current_url  = AGENT.get("current_url", "")
+        source_counts= dict(AGENT.get("source_counts", {}))
+        summary      = AGENT.get("summary")
 
     if status == "idle":
         st.markdown("---")
-        st.info("👆 Fill in your keywords and click **Start AI Agent** to begin. "
-                "The agent will scan thousands of jobs and prepare applications automatically.")
+        st.info("👆 Fill in your keywords above and click **🚀 Start AI Agent** to begin.\n\n"
+                "The agent will simultaneously search LinkedIn, Indeed, Glassdoor, Reed, "
+                "CV-Library, TotalJobs, GOV.UK Find a Job, NHS Jobs, and UK Visa Sponsorships — "
+                "then instantly generate a tailored cover letter and cold recruiter email for every match.")
         return
 
+    # =======================================================================
+    # LIVE DASHBOARD
+    # =======================================================================
     st.markdown("---")
-    st.markdown(f"**Status:** {badge(status)}", unsafe_allow_html=True)
-    if stage: st.write(f"**Stage:** `{stage}`")
+
+    # Row 1: status + progress
+    sr1c1, sr1c2 = st.columns([1, 3])
+    sr1c1.markdown(f"**Status:** {badge(status)}", unsafe_allow_html=True)
+    if stage:
+        sr1c2.write(f"📍 **Now:** `{stage}`")
     st.progress(min(max(int(prog), 0), 100))
+    if current_url and running:
+        st.caption(f"⏳ Scanning: {current_url[:80]}...")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("🔍 Scanned", scanned)
-    m2.metric("✅ Matched", matched)
-    m3.metric("📤 Processed", applied)
+    # Row 2: big metric cards
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("🔍 Jobs Found",    scanned)
+    mc2.metric("✅ Matched",        matched)
+    mc3.metric("📤 Applications",  applied,
+               help="Cover letter + cold email generated")
+    needs_review = sum(1 for j in aj if not j.get("cover_letter"))
+    mc4.metric("⚠️ Needs Review",  needs_review,
+               help="Jobs matched but cover letter couldn't be generated — apply manually")
 
-    # Applied jobs — show cover letter + cold email inline
-    if aj:
-        st.markdown(f"### 📨 Processed jobs ({len(aj)}) — live feed")
-        for job in reversed(aj[-30:]):
-            with st.expander(
-                f"★ {job.get('fit_score',0)}% | {job.get('title','?')} @ {job.get('company','?')} "
-                f"| {job.get('sponsorship_status','')} | {job.get('source','')}",
-                expanded=False
-            ):
-                if job.get("url"):
-                    st.link_button("🔗 View job", job["url"])
+    # Row 3: live source feed
+    if source_counts or running:
+        st.markdown("#### 📶 Live source feed")
+        all_sources = list(SOURCE_ICONS.keys())
+        cols = st.columns(min(len(all_sources), 5))
+        for i, src in enumerate(all_sources):
+            cnt = source_counts.get(src, 0)
+            icon = SOURCE_ICONS[src]
+            col = cols[i % 5]
+            if cnt > 0:
+                col.success(f"{icon}\n\n**{cnt}** jobs")
+            elif running and stage and "scrap" in stage.lower():
+                col.info(f"{icon}\n\n*scanning...*")
+            else:
+                col.empty()
 
-                if job.get("cover_letter"):
-                    st.markdown("📝 **Cover Letter:**")
-                    st.text_area("Cover letter", value=job["cover_letter"],
-                                 height=220, disabled=False,
-                                 key=f"cl_{job.get('url','')}{job.get('title','')}")
+    st.markdown("---")
 
-                if job.get("cold_email"):
-                    st.markdown("📧 **Cold Email to Recruiter:**")
-                    st.text_area("Cold email", value=job["cold_email"],
-                                 height=180, disabled=False,
-                                 key=f"ce_{job.get('url','')}{job.get('title','')}")
+    # =======================================================================
+    # JOB CARDS  — Needs Review first, then all matches
+    # =======================================================================
+    needs_review_jobs = [j for j in aj if not j.get("cover_letter")]
+    ready_jobs        = [j for j in aj if j.get("cover_letter")]
 
-                if job.get("resume_guidance"):
-                    with st.expander("📄 Resume tailoring guidance"):
-                        g = job["resume_guidance"]
-                        if isinstance(g, dict):
-                            kw = g.get("keyword_analysis", {})
-                            if kw.get("matched_keywords"):
-                                st.write(f"✅ Matched keywords: {', '.join(kw['matched_keywords'])}")
-                            if kw.get("missing_keywords"):
-                                st.write(f"⚠️ Missing keywords: {', '.join(kw['missing_keywords'])}")
-                            for line in (g.get("summary_rewrite_guidance") or []):
-                                st.write(f"• {line}")
+    if needs_review_jobs:
+        st.markdown(f"### ⚠️ Needs Your Review ({len(needs_review_jobs)})")
+        st.caption("These matched your profile but the AI couldn't generate a cover letter. Apply manually.")
+        for job in reversed(needs_review_jobs[-20:]):
+            _render_job_card(job, review_mode=True)
 
-    with st.expander("📝 Agent log", expanded=running):
-        for line in reversed(log[-40:]):
+    if ready_jobs:
+        st.markdown(f"### 📨 Ready to Send ({len(ready_jobs)}) — live feed")
+        for job in reversed(ready_jobs[-50:]):
+            _render_job_card(job, review_mode=False)
+
+    # Agent log
+    with st.expander("📝 Agent log", expanded=False):
+        for line in reversed(log[-50:]):
             st.code(line, language=None)
 
     if summary:
@@ -491,9 +557,62 @@ def tab_agent():
         time.sleep(POLL_SECONDS)
         st.rerun()
     elif status == "completed":
-        if st.button("🔄 Start a new run"):
+        st.balloons()
+        if st.button("🔄 Start a new search"):
             with AGENT_LOCK: AGENT.clear()
             st.rerun()
+
+
+def _render_job_card(job: dict, review_mode: bool):
+    fit    = job.get("fit_score", 0)
+    title  = job.get("title", "Unknown role")
+    co     = job.get("company", "Unknown company")
+    src    = source_label(job.get("source", ""))
+    spons  = job.get("sponsorship_status", "unknown")
+    url    = job.get("url", "")
+
+    spons_badge = {
+        "yes":     badge("Sponsors visas",  "#10b981"),
+        "no":      badge("No sponsorship",  "#ef4444"),
+        "unknown": badge("Sponsorship ?",   "#f59e0b"),
+    }.get(spons, "")
+
+    label = f"{'⚠️' if review_mode else '✅'} {fit}% | {title} @ {co} | {src}"
+
+    with st.expander(label, expanded=False):
+        hc1, hc2, hc3 = st.columns([2, 1, 1])
+        with hc1:
+            st.markdown(f"**{title}** at **{co}**")
+            if url:
+                st.link_button("🔗 Apply / View job", url, use_container_width=True)
+        with hc2:
+            st.markdown(spons_badge, unsafe_allow_html=True)
+        with hc3:
+            st.metric("Fit score", f"{fit}%")
+
+        if job.get("cover_letter"):
+            st.markdown("📝 **Cover Letter** (edit before sending):")
+            st.text_area("cover_letter", value=job["cover_letter"], height=230,
+                         key=f"cl_{url}{title}_{fit}")
+        elif review_mode:
+            st.warning("Cover letter generation failed — use the job link above to apply directly.")
+
+        if job.get("cold_email"):
+            st.markdown("📧 **Cold Recruiter Email** (edit before sending):")
+            st.text_area("cold_email", value=job["cold_email"], height=190,
+                         key=f"ce_{url}{title}_{fit}")
+
+        if job.get("resume_guidance"):
+            with st.expander("📄 Resume tailoring tips"):
+                g = job["resume_guidance"]
+                if isinstance(g, dict):
+                    kw = g.get("keyword_analysis", {})
+                    for k in kw.get("matched_keywords") or []:
+                        st.write(f"✅ {k}")
+                    for k in kw.get("missing_keywords") or []:
+                        st.write(f"⚠️ Add to CV: {k}")
+                    for line in (g.get("summary_rewrite_guidance") or []):
+                        st.write(f"• {line}")
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +658,7 @@ def tab_applications():
                 if st.button("Save", key=f"sv_{app['application_id']}"):
                     res, e2 = _patch(f"/applications/{app['application_id']}/status",
                                      {"status": ns, "notes": notes or None, "run_id": None})
-                    (st.success if res else st.error)(f"Saved" if res else e2)
+                    (st.success if res else st.error)("Saved" if res else e2)
                     if res: st.rerun()
 
 
@@ -554,26 +673,24 @@ def tab_health():
     st.write(f"{icon} **Backend:** {status} — {detail}")
     st.write(f"**Python:** `{PYTHON_EXE}`")
     st.write(f"**Working dir:** `{BASE_DIR}`")
-
     if status != "Running" and LOG_FILE.exists():
         log = LOG_FILE.read_text(encoding="utf-8", errors="replace")
         if log.strip():
             with st.expander("📔 Backend startup log", expanded=True):
                 st.code(log[-3000:], language="")
-
     st.markdown("### Package checks")
     for mod, pkg, desc in [
-        ("fastapi",    "fastapi",           "Backend API framework"),
+        ("fastapi",    "fastapi",           "Backend API"),
         ("uvicorn",    "uvicorn[standard]",  "Backend server"),
-        ("pydantic",   "pydantic",           "Data validation"),
-        ("sqlalchemy", "sqlalchemy",         "Database ORM"),
-        ("pypdf",      "pypdf",              "PDF resume parsing"),
-        ("docx",       "python-docx",        "DOCX resume parsing"),
-        ("jobspy",     "python-jobspy",      "Job scraping (LinkedIn/Indeed etc)"),
-        ("bs4",        "beautifulsoup4",      "HTML job board scraping"),
-        ("requests",   "requests",           "HTTP requests"),
-        ("openai",     "openai",             "GPT-4o-mini cover letters (optional)"),
-        ("anthropic",  "anthropic",          "Claude cover letters (optional)"),
+        ("pydantic",   "pydantic[email]",    "Data validation"),
+        ("sqlalchemy", "sqlalchemy",         "Database"),
+        ("pypdf",      "pypdf",              "PDF parsing"),
+        ("docx",       "python-docx",        "DOCX parsing"),
+        ("jobspy",     "python-jobspy",      "Job scraping"),
+        ("bs4",        "beautifulsoup4",      "HTML scraping"),
+        ("requests",   "requests",           "HTTP"),
+        ("openai",     "openai",             "GPT (optional)"),
+        ("anthropic",  "anthropic",          "Claude (optional)"),
         ("reportlab",  "reportlab",          "PDF export (optional)"),
     ]:
         try:
@@ -581,13 +698,11 @@ def tab_health():
             st.success(f"✅ `{pkg}` — {desc}")
         except ImportError:
             marker = "⚠️" if "optional" in desc else "❌"
-            st.error(f"{marker} `{pkg}` NOT installed — {desc}. Fix: `pip install {pkg}`")
-
+            st.error(f"{marker} `{pkg}` NOT installed. Fix: `pip install {pkg}`")
     if status == "Running":
         data, _ = _get("/openapi.json")
         if data:
-            paths = sorted(data.get("paths", {}).keys())
-            st.write(f"**{len(paths)} API routes active**")
+            st.write(f"**{len(data.get('paths', {}))} API routes active**")
 
 
 # ---------------------------------------------------------------------------
@@ -595,17 +710,14 @@ def tab_health():
 # ---------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(page_title="Job Application Copilot",
-                       page_icon="🤖", layout="wide")
-    for k, v in {"resume_profile": None, "resume_filename": "",
-                 "candidate_email": ""}.items():
+    st.set_page_config(page_title="Job Application Copilot", page_icon="🤖", layout="wide")
+    for k, v in {"resume_profile": None, "resume_filename": "", "candidate_email": ""}.items():
         if k not in st.session_state: st.session_state[k] = v
 
     st.title("🤖 Job Application Copilot")
-    st.caption("Upload CV → Agent scans every job → instant cover letter + cold email per match")
+    st.caption("Upload CV → Agent scans every job board → instant cover letter + cold email per match")
 
     status, detail = backend_status_info()
-
     with st.sidebar:
         st.header("🔧 Controls")
         color = "green" if status == "Running" else "red"
@@ -628,14 +740,13 @@ def main():
         p = st.session_state.get("resume_profile")
         if p:
             st.success(f"📎 {st.session_state.resume_filename}")
-            st.caption(f"{p.get('candidate_name') or '?'} | "
-                       f"{len(p.get('skills') or [])} skills")
+            st.caption(f"{p.get('candidate_name') or '?'} | {len(p.get('skills') or [])} skills | "
+                       f"{p.get('years_of_experience_hint') or '?'}")
         else:
-            st.info("📎 Upload CV in ⚙️ Setup")
+            st.info("📎 Upload CV in ⚙️ Setup tab")
         if st.button("↻ Refresh", use_container_width=True): st.rerun()
 
-    t1, t2, t3, t4 = st.tabs(["⚙️ Setup", "🤖 AI Agent",
-                                "📋 Applications", "🩺 Health"])
+    t1, t2, t3, t4 = st.tabs(["⚙️ Setup", "🤖 AI Agent", "📋 Applications", "🩺 Health"])
     with t1: tab_setup()
     with t2: tab_agent()
     with t3: tab_applications()
