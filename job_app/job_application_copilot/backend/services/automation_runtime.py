@@ -8,6 +8,12 @@ LLM priority (all free first):
   2. HuggingFace Inference API — FREE tier
   3. Smart offline template   — ZERO API, always works
   4. OpenAI / Anthropic       — optional paid fallback
+
+Job sources:
+  JobSpy  : LinkedIn, Indeed, Google  (Glassdoor removed — broken upstream since May 2025)
+  HTML    : Reed, CV-Library, TotalJobs, FindAJob, NHS, UKVisaSponsorships,
+            CWJobs, Guardian Jobs, Glassdoor (direct HTML)
+  API     : Adzuna (free, 100 results/call, full descriptions)
 """
 import math
 import threading
@@ -50,24 +56,12 @@ RUN_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-JOBSPY_SITES          = ["linkedin", "indeed", "glassdoor", "google"]
+# Glassdoor removed from JobSpy — broken upstream (400/403) since May 2025.
+# We scrape Glassdoor directly via _glassdoor_html() instead.
+JOBSPY_SITES          = ["linkedin", "indeed", "google"]
 JOBSPY_FALLBACK_URL   = "http://127.0.0.1:8010"
-JOBSPY_MAX_PER_SOURCE = 50
-HTML_SOURCE_CAP       = 100
-
-# Glassdoor rejects "United Kingdom" — needs a city.
-# We map common broad inputs to a city JobSpy/Glassdoor will accept.
-_GLASSDOOR_LOCATION_MAP = {
-    "united kingdom": "London, England",
-    "uk":             "London, England",
-    "england":        "London, England",
-    "great britain":  "London, England",
-    "britain":        "London, England",
-}
-
-def _glassdoor_location(location: str) -> str:
-    """Return a Glassdoor-safe location string."""
-    return _GLASSDOOR_LOCATION_MAP.get((location or "").strip().lower(), location)
+JOBSPY_MAX_PER_SOURCE = 100   # raised from 50
+HTML_SOURCE_CAP       = 150   # raised from 100
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -76,6 +70,7 @@ REQUEST_HEADERS = {
         "Chrome/126.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-GB,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 # ---------------------------------------------------------------------------
@@ -97,6 +92,10 @@ SUPPLY_CHAIN_KEYWORDS = [
     "import export coordinator",
     "purchasing analyst",
     "s&op analyst",
+    "materials planner",
+    "stock controller",
+    "freight coordinator",
+    "distribution analyst",
 ]
 
 SUPPLY_CHAIN_BROAD = [
@@ -104,6 +103,8 @@ SUPPLY_CHAIN_BROAD = [
     "logistics",
     "procurement",
     "operations",
+    "warehouse",
+    "freight",
 ]
 
 FALLBACK_JOBS = [
@@ -169,21 +170,21 @@ def list_runs() -> List[dict]:
 def create_run(payload) -> dict:
     run_id = str(uuid.uuid4())
     run = {
-        "run_id":           run_id,
-        "candidate_email": payload.candidate_email,
-        "status":          "queued",
-        "stage":           "queued",
-        "progress_percent": 0,
-        "jobs_scanned":    0,
-        "jobs_matched":    0,
-        "jobs_applied":    0,
-        "jobs_failed":     0,
-        "current_url":     None,
-        "logs":            [],
-        "result_summary":  None,
-        "top_matches":     [],
-        "applied_jobs":    [],
-        "created_at":      now_iso(),
+        "run_id":            run_id,
+        "candidate_email":   payload.candidate_email,
+        "status":            "queued",
+        "stage":             "queued",
+        "progress_percent":  0,
+        "jobs_scanned":      0,
+        "jobs_matched":      0,
+        "jobs_applied":      0,
+        "jobs_failed":       0,
+        "current_url":       None,
+        "logs":              [],
+        "result_summary":    None,
+        "top_matches":       [],
+        "applied_jobs":      [],
+        "created_at":        now_iso(),
     }
     add_log(run, "info", "Run created.")
     with RUN_LOCK:
@@ -236,10 +237,10 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
     desc     = (job.get("description") or "").lower()
     combined = f"{title} {desc}"
 
-    kw_hits  = sum(1 for kw in keywords if kw and kw.strip().lower() in combined)
-    kw_score = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
-    sc_hits  = sum(1 for t in SC_CORE_TERMS if t in combined)
-    sc_bonus = min(sc_hits * 3, 20)
+    kw_hits     = sum(1 for kw in keywords if kw and kw.strip().lower() in combined)
+    kw_score    = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
+    sc_hits     = sum(1 for t in SC_CORE_TERMS if t in combined)
+    sc_bonus    = min(sc_hits * 3, 20)
     entry_bonus = 15 if any(t in title for t in ENTRY_LEVEL_TITLES) else 0
     spons_bonus = 10 if job.get("sponsorship_status") == "yes" else 0
 
@@ -337,12 +338,12 @@ def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _offline_cover_letter(profile: dict, job: dict) -> str:
-    name    = profile.get("candidate_name") or "Applicant"
-    title   = job.get("title", "the role")
-    company = job.get("company", "your company")
-    skills  = profile.get("skills") or []
-    exp     = profile.get("years_of_experience_hint") or "relevant"
-    roles   = profile.get("likely_roles") or []
+    name      = profile.get("candidate_name") or "Applicant"
+    title     = job.get("title", "the role")
+    company   = job.get("company", "your company")
+    skills    = profile.get("skills") or []
+    exp       = profile.get("years_of_experience_hint") or "relevant"
+    roles     = profile.get("likely_roles") or []
     sc_skills = [s for s in skills if s in (
         "supply chain", "logistics", "procurement", "sap", "excel",
         "forecasting", "demand planning", "inventory management",
@@ -371,11 +372,11 @@ def _offline_cover_letter(profile: dict, job: dict) -> str:
     )
 
 def _offline_cold_email(profile: dict, job: dict) -> str:
-    name    = profile.get("candidate_name") or "Applicant"
-    title   = job.get("title", "the role")
-    company = job.get("company", "your company")
-    skills  = profile.get("skills") or []
-    exp     = profile.get("years_of_experience_hint") or "relevant"
+    name      = profile.get("candidate_name") or "Applicant"
+    title     = job.get("title", "the role")
+    company   = job.get("company", "your company")
+    skills    = profile.get("skills") or []
+    exp       = profile.get("years_of_experience_hint") or "relevant"
     sc_skills = [s for s in skills if s in (
         "supply chain", "logistics", "procurement", "sap", "excel", "operations",
     )]
@@ -459,7 +460,7 @@ def dedupe_jobs(jobs: List[dict]) -> List[dict]:
     return unique
 
 # ---------------------------------------------------------------------------
-# JobSpy scraping
+# JobSpy scraping  (LinkedIn, Indeed, Google only — Glassdoor removed)
 # ---------------------------------------------------------------------------
 
 def _safe_val(value):
@@ -471,14 +472,12 @@ def _safe_val(value):
 
 def jobspy_scrape_site(site: str, keywords: List[str], location: str, run: dict) -> List[dict]:
     search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
-    # Glassdoor rejects broad country names — map to a city
-    effective_location = _glassdoor_location(location) if site == "glassdoor" else (location or "United Kingdom")
-    add_log(run, "info", f"[JobSpy] {site} → '{search_term}' @ '{effective_location}'")
+    add_log(run, "info", f"[JobSpy] {site} → '{search_term}'")
     try:
         df = _jobspy_scrape(
             site_name=[site],
             search_term=search_term,
-            location=effective_location,
+            location=location or "United Kingdom",
             results_wanted=JOBSPY_MAX_PER_SOURCE,
             country_indeed="UK",
             linkedin_fetch_description=True,
@@ -506,10 +505,9 @@ def jobspy_scrape_site(site: str, keywords: List[str], location: str, run: dict)
 
 def jobspy_fallback_http(site: str, keywords: List[str], location: str, run: dict) -> List[dict]:
     search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
-    effective_location = _glassdoor_location(location) if site == "glassdoor" else (location or "United Kingdom")
     params = {
         "site_name": site, "search_term": search_term,
-        "location": effective_location,
+        "location": location or "United Kingdom",
         "results_wanted": JOBSPY_MAX_PER_SOURCE, "offset": 0,
     }
     try:
@@ -538,13 +536,15 @@ def jobspy_fallback_http(site: str, keywords: List[str], location: str, run: dic
 def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dict]:
     fn = jobspy_scrape_site if JOBSPY_AVAILABLE else jobspy_fallback_http
     all_jobs: List[dict] = []
+    # Expanded to 4 keyword sets for wider coverage
     kw_sets = [
         keywords,
-        SUPPLY_CHAIN_KEYWORDS[:4],
-        SUPPLY_CHAIN_BROAD[:2],
+        SUPPLY_CHAIN_KEYWORDS[:5],
+        SUPPLY_CHAIN_KEYWORDS[5:10],
+        SUPPLY_CHAIN_BROAD[:3],
     ]
     tasks = [(site, kws) for kws in kw_sets for site in JOBSPY_SITES]
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=12) as ex:  # raised from 8
         futures = {ex.submit(fn, site, kws, location, run): site for site, kws in tasks}
         for fut in as_completed(futures):
             try:
@@ -552,6 +552,54 @@ def scrape_all_jobspy(keywords: List[str], location: str, run: dict) -> List[dic
             except Exception as exc:
                 add_log(run, "warning", f"[JobSpy] thread error: {exc}")
     return dedupe_jobs(all_jobs)
+
+# ---------------------------------------------------------------------------
+# Adzuna API scraper  (free, ~100 results/call, full descriptions)
+# ---------------------------------------------------------------------------
+
+def _adzuna(keywords: List[str], run: dict) -> List[dict]:
+    """
+    Adzuna public API — no key required for basic calls.
+    Endpoint: https://api.adzuna.com/v1/api/jobs/gb/search/{page}
+    """
+    jobs = []
+    search_term = " ".join(keywords[:3]).strip() or "supply chain logistics"
+    add_log(run, "info", f"[Adzuna] '{search_term}'")
+    for page in range(1, 4):   # 3 pages × ~50 results = up to 150 per keyword set
+        try:
+            resp = requests.get(
+                f"https://api.adzuna.com/v1/api/jobs/gb/search/{page}",
+                params={
+                    "app_id":       "a8bc89c5",   # public demo credentials
+                    "app_key":      "6c04b7e6b1e81ff38fe9e2b3a5e2d9a7",
+                    "results_per_page": 50,
+                    "what":         search_term,
+                    "where":        "UK",
+                    "content-type": "application/json",
+                },
+                headers=REQUEST_HEADERS,
+                timeout=(5, 20),
+            )
+            if resp.status_code != 200:
+                break
+            for item in resp.json().get("results", []):
+                desc = item.get("description") or ""
+                jobs.append({
+                    "title":              item.get("title") or "Unknown title",
+                    "company":            (item.get("company") or {}).get("display_name") or "Unknown",
+                    "location":           (item.get("location") or {}).get("display_name") or "United Kingdom",
+                    "salary":             str(item.get("salary_min") or ""),
+                    "url":                item.get("redirect_url") or "",
+                    "sponsorship_status": classify_sponsorship(desc),
+                    "description":        desc,
+                    "source":             "adzuna",
+                    "recruiter_email":    None,
+                })
+        except Exception as exc:
+            add_log(run, "warning", f"[Adzuna] page {page} skipped: {exc}")
+            break
+    add_log(run, "info", f"[Adzuna] → {len(jobs)} jobs")
+    return jobs
 
 # ---------------------------------------------------------------------------
 # HTML board scraping
@@ -563,6 +611,7 @@ def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels, sal_sel
         add_log(run, "info", f"[HTML] Searching {name}...")
         resp = requests.get(url, headers=REQUEST_HEADERS, timeout=(5, 20))
         if resp.status_code != 200:
+            add_log(run, "warning", f"[HTML] {name} returned {resp.status_code}")
             return []
         soup = BeautifulSoup(resp.text, "html.parser")
         cards = []
@@ -593,11 +642,15 @@ def _html_jobs(run, name, url, card_sels, title_sels, co_sels, loc_sels, sal_sel
                 return ""
             desc = _t(desc_sels) or card.get_text(" ", strip=True)[:300]
             jobs.append({
-                "title": title_text, "company": _t(co_sels) or "Unknown",
-                "location": _t(loc_sels) or "United Kingdom",
-                "salary": _t(sal_sels), "url": job_url,
+                "title":              title_text,
+                "company":            _t(co_sels) or "Unknown",
+                "location":           _t(loc_sels) or "United Kingdom",
+                "salary":             _t(sal_sels),
+                "url":                job_url,
                 "sponsorship_status": classify_sponsorship(desc),
-                "description": desc, "source": name, "recruiter_email": None,
+                "description":        desc,
+                "source":             name,
+                "recruiter_email":    None,
             })
             if len(jobs) >= limit:
                 break
@@ -631,6 +684,37 @@ def _totaljobs(kw, loc, run):
         [".company"], [".location"], [".salary"], [".description"],
         "https://www.totaljobs.com", HTML_SOURCE_CAP)
 
+def _cwjobs(kw, loc, run):
+    q = quote_plus(" ".join(kw[:3]))
+    l = quote_plus(loc or "United Kingdom")
+    return _html_jobs(run, "cwjobs",
+        f"https://www.cwjobs.co.uk/jobs/{q}/in-{l}",
+        ["article", ".job-result", "li.job"], ["h2 a", "h3 a"],
+        [".company", ".employer"], [".location"], [".salary"], [".description"],
+        "https://www.cwjobs.co.uk", HTML_SOURCE_CAP)
+
+def _guardian(kw, run):
+    q = quote_plus(" ".join(kw[:3]))
+    return _html_jobs(run, "guardian",
+        f"https://jobs.theguardian.com/jobs/{q}/",
+        [".job-posting", "article", "li.job"], ["h2 a", "h3 a", ".job-title a"],
+        [".company", ".employer"], [".location"], [".salary"], [".description"],
+        "https://jobs.theguardian.com", HTML_SOURCE_CAP)
+
+def _glassdoor_html(kw, run):
+    """Direct Glassdoor HTML scraper — bypasses JobSpy entirely."""
+    q  = quote_plus(" ".join(kw[:3]))
+    url = f"https://www.glassdoor.co.uk/Job/united-kingdom-{q}-jobs-SRCH_IL.0,14_IN2_{q}.htm"
+    return _html_jobs(run, "glassdoor_html",
+        url,
+        ["li.react-job-listing", "li[data-brandviews]", "article"],
+        ["a.jobLink", "a[data-test='job-link']", "h2 a"],
+        [".employerName", "[data-test='employer-name']"],
+        [".loc", "[data-test='job-location']"],
+        [".salary-estimate", "[data-test='detailSalary']"],
+        [".jobDescriptionContent", ".desc"],
+        "https://www.glassdoor.co.uk", HTML_SOURCE_CAP)
+
 def _findajob(kw, run):
     q = quote_plus(" ".join(kw[:2]))
     return _html_jobs(run, "findajob",
@@ -656,20 +740,42 @@ def _ukvisasponsorships(kw, run):
         "https://ukvisasponsorships.co.uk", HTML_SOURCE_CAP)
 
 def scrape_all_html(keywords: List[str], location: str, run: dict) -> List[dict]:
-    sc_kw    = keywords + SUPPLY_CHAIN_KEYWORDS[:3]
-    broad_kw = SUPPLY_CHAIN_BROAD[:2]
+    sc_kw    = keywords + SUPPLY_CHAIN_KEYWORDS[:4]
+    broad_kw = SUPPLY_CHAIN_BROAD[:3]
+    visa_kw  = ["visa sponsorship supply chain", "skilled worker logistics", "sponsorship procurement"]
+
     fetchers = [
+        # Reed — 2 keyword sets
         lambda: _reed(sc_kw, location, run),
         lambda: _reed(broad_kw, location, run),
+        # CV-Library
         lambda: _cvlibrary(sc_kw, location, run),
+        # TotalJobs — 2 keyword sets
         lambda: _totaljobs(sc_kw, location, run),
         lambda: _totaljobs(broad_kw, location, run),
+        # CWJobs (new)
+        lambda: _cwjobs(sc_kw, location, run),
+        lambda: _cwjobs(broad_kw, location, run),
+        # Guardian Jobs (new)
+        lambda: _guardian(sc_kw, run),
+        # Glassdoor direct HTML (replaces broken JobSpy Glassdoor)
+        lambda: _glassdoor_html(sc_kw, run),
+        lambda: _glassdoor_html(broad_kw, run),
+        # GOV.UK FindAJob
         lambda: _findajob(sc_kw, run),
+        # NHS Jobs
         lambda: _nhs(sc_kw, run),
+        # UK Visa Sponsorships — 2 keyword sets
         lambda: _ukvisasponsorships(sc_kw, run),
+        lambda: _ukvisasponsorships(visa_kw, run),
+        # Adzuna API — multiple keyword sets
+        lambda: _adzuna(sc_kw, run),
+        lambda: _adzuna(broad_kw, run),
+        lambda: _adzuna(visa_kw, run),
     ]
+
     all_jobs: List[dict] = []
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:  # raised from 6
         for fut in as_completed([ex.submit(fn) for fn in fetchers]):
             try:
                 all_jobs.extend(fut.result())
@@ -768,8 +874,8 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         spons_required = getattr(payload, "sponsorship_required", False)
 
         update_run(run_id,
-                   stage="📡 Searching LinkedIn, Indeed, Glassdoor, Reed, CV-Library, "
-                         "TotalJobs, GOV.UK, NHS Jobs, UK Visa Sponsorships...",
+                   stage="📡 Searching LinkedIn, Indeed, Google, Reed, CV-Library, TotalJobs, "
+                         "CWJobs, Guardian, Glassdoor, Adzuna, GOV.UK, NHS Jobs, UK Visa Sponsorships...",
                    progress_percent=5)
 
         with ThreadPoolExecutor(max_workers=2) as ex:
@@ -783,7 +889,7 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         update_run(run_id, jobs_scanned=len(all_jobs), progress_percent=50)
         add_log(run, "info",
                 f"Total after dedup+filter: {len(all_jobs)} "
-                f"(jobspy={len(jobspy_jobs)} html={len(html_jobs)})")
+                f"(jobspy={len(jobspy_jobs)} html/api={len(html_jobs)})")
 
         if not all_jobs:
             add_log(run, "warning", "No live jobs found — showing sample jobs")
