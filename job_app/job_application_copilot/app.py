@@ -1,5 +1,18 @@
 """
-Job Application Copilot — Streamlit frontend v9.5
+Job Application Copilot — Streamlit frontend v9.6
+
+v9.6 — throttled polling (fixes burst-hammer on /automation/status)
+  Root cause of 50+ status requests per minute:
+  `<meta http-equiv="refresh">` fires a browser reload every N seconds,
+  but Streamlit also triggers internal reruns (widget interactions,
+  session_state writes, etc.).  When both fire close together the status
+  endpoint gets hit in rapid bursts (20+ per second seen in logs).
+
+  Fix: lightweight time-based gate.  _poll_status() now checks
+  `st.session_state["_last_poll_ts"]` and skips the HTTP call if the
+  last poll was less than POLL_THROTTLE_S seconds ago, returning the
+  cached payload instead.  The meta-refresh interval is raised to 5 s so
+  the UI still updates promptly but the backend only sees ~1 req/5 s.
 
 v9.5 — complete dashboard polling rewrite
   Root cause of 'no dashboard' across all previous versions:
@@ -39,7 +52,7 @@ API_PORT     = 8000
 API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 PID_FILE     = BASE_DIR / "runtime_api.pid"
 LOG_FILE     = BASE_DIR / "backend_startup.log"
-PYTHON_EXE  = sys.executable
+PYTHON_EXE   = sys.executable
 
 SOURCE_ICONS = {
     "linkedin":           "🔵 LinkedIn",
@@ -60,7 +73,14 @@ DEFAULT_KEYWORDS = (
     "demand planner, inventory analyst, operations analyst"
 )
 
-AUTO_REFRESH_MS = 3000  # browser meta-refresh interval while agent running
+# Browser meta-refresh interval while the agent is running (seconds).
+# Raised from 3 → 5 so the browser doesn't trigger extra Streamlit reruns
+# that would otherwise stack with internal reruns and hammer the status endpoint.
+AUTO_REFRESH_S = 5
+
+# Minimum gap between real HTTP calls to /automation/status.
+# Any Streamlit rerun that lands within this window returns the cached payload.
+POLL_THROTTLE_S = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -348,15 +368,30 @@ def _reset_pending():
 
 
 # ---------------------------------------------------------------------------
-# Core polling — called from main thread every rerun
+# Core polling — throttled to at most 1 real HTTP call per POLL_THROTTLE_S
 # ---------------------------------------------------------------------------
 
 def _poll_status(run_id: str) -> dict:
     """Synchronous poll of /automation/status/{run_id}.
-    Returns the status dict or an error dict."""
+
+    Throttled: if the last successful poll was less than POLL_THROTTLE_S ago,
+    the cached payload is returned immediately without an HTTP call.
+    Returns the status dict or an error dict.
+    """
+    now = time.monotonic()
+    last_ts    = st.session_state.get("_last_poll_ts", 0.0)
+    cached     = st.session_state.get("_last_poll_data")
+
+    if cached is not None and (now - last_ts) < POLL_THROTTLE_S:
+        # Still within throttle window — return cached data, no HTTP call
+        return cached
+
     data, err = _get(f"/automation/status/{run_id}", timeout=8)
     if err or not data:
         return {"status": "unknown", "stage": f"Poll error: {err}"}
+
+    st.session_state["_last_poll_ts"]   = now
+    st.session_state["_last_poll_data"] = data
     return data
 
 
@@ -450,7 +485,7 @@ def tab_setup():
 
 
 # ---------------------------------------------------------------------------
-# Tab: AI Agent  (new polling architecture)
+# Tab: AI Agent  (throttled polling architecture)
 # ---------------------------------------------------------------------------
 
 def tab_agent():
@@ -512,6 +547,9 @@ def tab_agent():
             st.session_state["agent_status"]   = "starting"
             st.session_state["agent_stage"]    = "⚙️ Connecting to backend..."
             st.session_state["agent_cfg"]      = cfg
+            # Clear poll cache so first real poll fires immediately
+            st.session_state.pop("_last_poll_ts",   None)
+            st.session_state.pop("_last_poll_data", None)
             _reset_pending()
             threading.Thread(
                 target=_launch_agent_thread, args=(cfg,), daemon=True
@@ -545,7 +583,7 @@ def tab_agent():
     if not st.session_state.get("run_id") and st.session_state.get("agent_status") != "failed":
         stage = _PENDING.get("stage") or st.session_state.get("agent_stage") or "Starting..."
         st.info(f"⏳ {stage}")
-        # Auto-refresh every 1.5s while connecting
+        # Auto-refresh every 2 s while connecting (short window, no run_id to poll)
         st.markdown(
             f'<meta http-equiv="refresh" content="2">',
             unsafe_allow_html=True,
@@ -554,7 +592,7 @@ def tab_agent():
 
     run_id = st.session_state.get("run_id", "")
 
-    # ── Poll backend directly (main thread, every rerun) ──────────────────
+    # ── Throttled poll (main thread, at most 1 HTTP call per POLL_THROTTLE_S) ──
     if run_id:
         data = _poll_status(run_id)
         applied_jobs  = data.get("applied_jobs") or []
@@ -640,7 +678,7 @@ def tab_agent():
     # ── Auto-refresh / finish buttons ─────────────────────────────────────
     if running:
         st.markdown(
-            f'<meta http-equiv="refresh" content="{AUTO_REFRESH_MS // 1000}">',
+            f'<meta http-equiv="refresh" content="{AUTO_REFRESH_S}">',
             unsafe_allow_html=True,
         )
     elif status == "completed":
@@ -649,7 +687,8 @@ def tab_agent():
             for k in ("agent_launched", "run_id", "agent_status", "agent_stage",
                       "agent_progress", "agent_scanned", "agent_matched",
                       "agent_applied", "agent_url", "agent_jobs", "agent_sources",
-                      "agent_summary", "agent_matches", "agent_log", "agent_cfg"):
+                      "agent_summary", "agent_matches", "agent_log", "agent_cfg",
+                      "_last_poll_ts", "_last_poll_data"):
                 st.session_state.pop(k, None)
             _reset_pending()
             st.rerun()
@@ -659,7 +698,8 @@ def tab_agent():
             for k in ("agent_launched", "run_id", "agent_status", "agent_stage",
                       "agent_progress", "agent_scanned", "agent_matched",
                       "agent_applied", "agent_url", "agent_jobs", "agent_sources",
-                      "agent_summary", "agent_matches", "agent_log", "agent_cfg"):
+                      "agent_summary", "agent_matches", "agent_log", "agent_cfg",
+                      "_last_poll_ts", "_last_poll_data"):
                 st.session_state.pop(k, None)
             _reset_pending()
             st.rerun()
