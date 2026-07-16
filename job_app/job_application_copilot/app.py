@@ -1,3 +1,15 @@
+"""
+Job Application Copilot — Streamlit frontend
+
+Upgraded features:
+- Resume-first onboarding (⚙️ Setup tab) — parses CV, extracts profile
+- AI-powered job scoring shown live in the monitor
+- Blacklist / whitelist company filter inputs
+- Top-matches table rendered after run completes
+- Cover letter preview per matched job
+- Portable Python path (sys.executable — works on any machine)
+- Session persistence across reruns via st.session_state
+"""
 import os
 import signal
 import socket
@@ -11,20 +23,12 @@ import requests
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
-
 API_HOST = "127.0.0.1"
 API_PORT = 8000
 API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
-
 PID_FILE = BASE_DIR / "runtime_api.pid"
-
-# Always use the same Python that is running Streamlit — works on any machine
-CONDA_BASE_PYTHON = sys.executable
+CONDA_BASE_PYTHON = sys.executable   # always use the running Python
 BACKEND_APP_IMPORT = "backend.main:app"
-
-DEFAULT_EMAIL = ""
-DEFAULT_RUN_ID = ""
-
 POLL_SECONDS = 3
 
 
@@ -32,7 +36,7 @@ POLL_SECONDS = 3
 # Backend process helpers
 # ---------------------------------------------------------------------------
 
-def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+def is_port_open(host, port, timeout=0.5):
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -40,7 +44,7 @@ def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
-def read_pid() -> int | None:
+def read_pid():
     if not PID_FILE.exists():
         return None
     try:
@@ -49,24 +53,20 @@ def read_pid() -> int | None:
         return None
 
 
-def write_pid(pid: int) -> None:
+def write_pid(pid):
     PID_FILE.write_text(str(pid), encoding="utf-8")
 
 
-def clear_pid() -> None:
+def clear_pid():
     if PID_FILE.exists():
         PID_FILE.unlink()
 
 
-def process_exists(pid: int) -> bool:
+def process_exists(pid):
     try:
         if os.name == "nt":
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
+            result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                                    capture_output=True, text=True, timeout=5)
             return str(pid) in result.stdout
         os.kill(pid, 0)
         return True
@@ -74,95 +74,61 @@ def process_exists(pid: int) -> bool:
         return False
 
 
-def start_backend() -> tuple[bool, str]:
+def start_backend():
     if is_port_open(API_HOST, API_PORT):
         return True, "Backend is already running."
-
-    cmd = [
-        CONDA_BASE_PYTHON,
-        "-m",
-        "uvicorn",
-        BACKEND_APP_IMPORT,
-        "--host",
-        API_HOST,
-        "--port",
-        str(API_PORT),
-    ]
-
+    cmd = [CONDA_BASE_PYTHON, "-m", "uvicorn", BACKEND_APP_IMPORT,
+           "--host", API_HOST, "--port", str(API_PORT)]
     try:
         if os.name == "nt":
-            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NEW_CONSOLE
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(BASE_DIR),
-                creationflags=creation_flags,
-            )
+            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR),
+                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NEW_CONSOLE)
         else:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(BASE_DIR),
-                start_new_session=True,
-            )
-
+            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), start_new_session=True)
         write_pid(proc.pid)
-
         for _ in range(20):
             if is_port_open(API_HOST, API_PORT):
-                return True, f"Backend started successfully on {API_BASE_URL}"
+                return True, f"Backend started on {API_BASE_URL}"
             time.sleep(0.5)
-
-        return False, "Backend process started, but API port did not open in time. Check backend console."
+        return False, "Backend started but port not responding yet."
     except Exception as exc:
         return False, f"Failed to start backend: {exc}"
 
 
-def stop_backend() -> tuple[bool, str]:
+def stop_backend():
     pid = read_pid()
-
     if pid is None:
-        if is_port_open(API_HOST, API_PORT):
-            return False, "Backend is running, but no PID file was found."
-        return True, "Backend is already stopped."
-
+        return (True, "Backend already stopped.") if not is_port_open(API_HOST, API_PORT) \
+            else (False, "Running but no PID file found.")
     if not process_exists(pid):
         clear_pid()
-        return True, "Backend is stopped. Old PID file was cleaned up."
-
+        return True, "Backend stopped (stale PID cleaned up)."
     try:
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           check=True, capture_output=True, timeout=10)
         else:
             os.kill(pid, signal.SIGTERM)
-
         clear_pid()
-
         for _ in range(10):
             if not is_port_open(API_HOST, API_PORT):
-                return True, "Backend stopped successfully."
+                return True, "Backend stopped."
             time.sleep(0.5)
-
-        return True, "Stop command sent. Backend may still be shutting down."
+        return True, "Stop signal sent."
     except Exception as exc:
-        return False, f"Failed to stop backend: {exc}"
+        return False, f"Failed to stop: {exc}"
 
 
-def get_backend_status() -> tuple[str, str]:
+def get_backend_status():
     pid = read_pid()
     port_open = is_port_open(API_HOST, API_PORT)
-
     if port_open and pid and process_exists(pid):
-        return "Running", f"Backend is running on {API_BASE_URL} (PID {pid})"
+        return "Running", f"Running on {API_BASE_URL} (PID {pid})"
     if port_open:
-        return "Running", f"Backend is running on {API_BASE_URL}"
+        return "Running", f"Running on {API_BASE_URL}"
     if pid and not process_exists(pid):
         clear_pid()
-        return "Stopped", "Backend is stopped. Old PID file was cleaned up."
+        return "Stopped", "Stopped (stale PID cleaned)."
     return "Stopped", "Backend is not running."
 
 
@@ -170,53 +136,38 @@ def get_backend_status() -> tuple[str, str]:
 # API helpers
 # ---------------------------------------------------------------------------
 
-def safe_get(url: str, timeout: int = 10):
+def safe_get(url, timeout=10):
     try:
-        r = requests.get(url, timeout=timeout)
-        return r
+        return requests.get(url, timeout=timeout)
     except Exception as exc:
         return exc
 
 
-def parse_resume_via_api(file_bytes: bytes, filename: str) -> tuple[dict | None, str | None]:
-    """POST to /resume/parse and return the profile dict or an error string."""
+def parse_resume_via_api(file_bytes, filename):
     try:
-        resp = requests.post(
-            f"{API_BASE_URL}/resume/parse",
-            files={"file": (filename, file_bytes, "application/octet-stream")},
-            timeout=30,
-        )
+        resp = requests.post(f"{API_BASE_URL}/resume/parse",
+                             files={"file": (filename, file_bytes, "application/octet-stream")},
+                             timeout=30)
         resp.raise_for_status()
         return resp.json(), None
     except Exception as exc:
         return None, str(exc)
 
 
-def get_applications(candidate_email: str):
+def get_applications(candidate_email):
     try:
         resp = requests.get(f"{API_BASE_URL}/applications/{candidate_email}", timeout=10)
         resp.raise_for_status()
         return resp.json(), None
     except Exception as exc:
-        return {
-            "candidate_email": candidate_email,
-            "total_applications": 0,
-            "applications": [],
-        }, str(exc)
+        return {"candidate_email": candidate_email, "total_applications": 0, "applications": []}, str(exc)
 
 
-def update_application_status(application_id: str, status: str, notes: str | None, run_id: str | None):
-    payload = {
-        "run_id": run_id or None,
-        "status": status,
-        "notes": notes or None,
-    }
+def update_application_status(application_id, status, notes, run_id):
+    payload = {"run_id": run_id or None, "status": status, "notes": notes or None}
     try:
-        resp = requests.patch(
-            f"{API_BASE_URL}/applications/{application_id}/status",
-            json=payload,
-            timeout=10,
-        )
+        resp = requests.patch(f"{API_BASE_URL}/applications/{application_id}/status",
+                              json=payload, timeout=10)
         resp.raise_for_status()
         return resp.json(), None
     except Exception as exc:
@@ -227,7 +178,7 @@ def start_automation(payload: dict):
     try:
         resp = requests.post(f"{API_BASE_URL}/automation/start", json=payload, timeout=60)
         if resp.status_code == 404:
-            return None, "Automation start endpoint not found yet: POST /automation/start"
+            return None, "POST /automation/start not found"
         resp.raise_for_status()
         return resp.json(), None
     except Exception as exc:
@@ -238,7 +189,7 @@ def get_automation_status(run_id: str):
     try:
         resp = requests.get(f"{API_BASE_URL}/automation/status/{run_id}", timeout=10)
         if resp.status_code == 404:
-            return None, "Automation status endpoint not found yet: GET /automation/status/{run_id}"
+            return None, f"Run {run_id} not found"
         resp.raise_for_status()
         return resp.json(), None
     except Exception as exc:
@@ -250,37 +201,17 @@ def get_automation_status(run_id: str):
 # ---------------------------------------------------------------------------
 
 def status_badge(status: str) -> str:
-    color_map = {
-        "draft": "#f59e0b",
-        "ready": "#3b82f6",
-        "submitted": "#10b981",
-        "rejected": "#ef4444",
-        "interview": "#8b5cf6",
-        "running": "#0ea5e9",
-        "completed": "#10b981",
-        "failed": "#ef4444",
-        "queued": "#f59e0b",
-    }
+    color_map = {"draft": "#f59e0b", "ready": "#3b82f6", "submitted": "#10b981",
+                 "rejected": "#ef4444", "interview": "#8b5cf6", "running": "#0ea5e9",
+                 "completed": "#10b981", "failed": "#ef4444", "queued": "#f59e0b"}
     color = color_map.get((status or "").lower(), "#6b7280")
-    return f"""
-    <div style="
-        display:inline-block;
-        padding:6px 12px;
-        border-radius:999px;
-        background:{color}22;
-        color:{color};
-        font-weight:600;
-        font-size:14px;
-        border:1px solid {color}55;
-    ">
-        {status}
-    </div>
-    """
+    return (f'<div style="display:inline-block;padding:6px 14px;border-radius:999px;'
+            f'background:{color}22;color:{color};font-weight:600;font-size:14px;'
+            f'border:1px solid {color}55;">{status}</div>')
 
 
-def render_tracker_summary(apps: list[dict]):
-    counts = Counter((app.get("status") or "unknown").lower() for app in apps)
-
+def render_tracker_summary(apps):
+    counts = Counter((a.get("status") or "unknown").lower() for a in apps)
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total", len(apps))
     c2.metric("Draft", counts.get("draft", 0))
@@ -289,108 +220,38 @@ def render_tracker_summary(apps: list[dict]):
     c5.metric("Rejected", counts.get("rejected", 0))
 
 
-def render_application_card(app: dict, run_id: str):
-    with st.container(border=True):
-        col1, col2, col3 = st.columns([2, 2, 2])
-
-        with col1:
-            st.markdown(f"### {app['job']['title']}")
-            st.write(f"**Company:** {app['job']['company']}")
-            if app["job"].get("location"):
-                st.write(f"**Location:** {app['job']['location']}")
-            if app["job"].get("source"):
-                st.write(f"**Source:** {app['job']['source']}")
-            if app["job"].get("url"):
-                st.link_button("Open job link", app["job"]["url"])
-
-        with col2:
-            st.markdown(status_badge(app["status"]), unsafe_allow_html=True)
-            st.write(f"**Resume:** {app['resume_filename']}")
-            st.write(f"**Format:** {app['resume_format']}")
-            st.write(f"**Version ID:** `{app['resume_version_id']}`")
-            st.write(f"**Created:** {app['created_at']}")
-            st.write(f"**Updated:** {app['updated_at']}")
-            if app.get("notes"):
-                st.write(f"**Notes:** {app['notes']}")
-
-        with col3:
-            options = ["draft", "ready", "submitted", "interview", "rejected"]
-            current_status = app["status"] if app["status"] in options else "draft"
-
-            new_status = st.selectbox(
-                "Change status",
-                options,
-                index=options.index(current_status),
-                key=f"status_{app['application_id']}",
-            )
-
-            notes_input = st.text_input(
-                "Update notes",
-                value=app.get("notes") or "",
-                key=f"notes_{app['application_id']}",
-            )
-
-            st.caption(f"Application ID: {app['application_id']}")
-
-            if st.button("Save update", key=f"save_{app['application_id']}", use_container_width=True):
-                result, err = update_application_status(
-                    application_id=app["application_id"],
-                    status=new_status,
-                    notes=notes_input,
-                    run_id=run_id,
-                )
-                if err:
-                    st.error(f"Update failed: {err}")
-                else:
-                    st.success(f"Application updated to {result['status']}")
-                    st.rerun()
-
-
 # ---------------------------------------------------------------------------
-# Setup tab — Step 1: upload resume and extract profile
+# ⚙️ Setup tab
 # ---------------------------------------------------------------------------
 
 def render_setup_tab():
     st.subheader("Step 1 — Upload your resume")
     st.write(
-        "Upload your CV (PDF or DOCX). The backend will extract your name, email, "
-        "skills, and likely job roles. These will auto-populate the search fields "
-        "in the Live Monitor tab so you never have to type them manually."
+        "Upload your CV (PDF or DOCX). The parser extracts your name, email, skills, and "
+        "likely job roles. These auto-populate the search fields in the Live Monitor tab."
     )
 
-    uploaded = st.file_uploader(
-        "Choose your resume file",
-        type=["pdf", "docx"],
-        help="PDF or DOCX only. The file is saved to storage/resumes/ on your machine.",
-    )
-
-    if uploaded is not None:
+    uploaded = st.file_uploader("Choose resume", type=["pdf", "docx"])
+    if uploaded:
         file_bytes = uploaded.read()
         filename = uploaded.name
-
         st.info(f"Selected: **{filename}** ({len(file_bytes):,} bytes)")
-
-        if st.button("Parse resume", type="primary", use_container_width=False):
-            with st.spinner("Sending to backend parser..."):
+        if st.button("Parse resume", type="primary"):
+            with st.spinner("Parsing..."):
                 profile, err = parse_resume_via_api(file_bytes, filename)
-
             if err:
                 st.error(f"Parse failed: {err}")
-                st.caption(
-                    "Make sure the backend is running (Start backend in the sidebar) "
-                    "and that the /resume/parse endpoint is reachable."
-                )
             else:
                 st.session_state.resume_profile = profile
                 st.session_state.resume_filename = filename
-                st.success("Resume parsed successfully!")
+                if profile.get("email") and not st.session_state.get("candidate_email"):
+                    st.session_state.candidate_email = profile["email"]
+                st.success("Resume parsed!")
                 st.rerun()
 
     profile = st.session_state.get("resume_profile")
-
     if profile:
         st.markdown("### Extracted profile")
-
         p1, p2 = st.columns(2)
         with p1:
             st.write(f"**Name:** {profile.get('candidate_name') or '—'}")
@@ -400,28 +261,12 @@ def render_setup_tab():
         with p2:
             roles = profile.get("likely_roles") or []
             skills = profile.get("skills") or []
-            st.write(f"**Likely roles ({len(roles)}):** {', '.join(roles) if roles else '—'}")
-            st.write(f"**Skills ({len(skills)}):** {', '.join(skills) if skills else '—'}")
-
-        st.markdown("#### Resume text preview")
-        st.text_area(
-            "First 800 characters extracted from your file",
-            value=profile.get("preview", ""),
-            height=180,
-            disabled=True,
-        )
-
-        # Persist email from resume as the default candidate email
-        if profile.get("email") and not st.session_state.get("candidate_email_set"):
-            st.session_state.candidate_email = profile["email"]
-            st.session_state.candidate_email_set = True
-
-        st.info(
-            "Your profile is saved for this session. "
-            "Switch to the **Live Monitor** tab — search keywords are now pre-filled from your resume."
-        )
+            st.write(f"**Likely roles ({len(roles)}):** {', '.join(roles) or '—'}")
+            st.write(f"**Skills ({len(skills)}):** {', '.join(skills) or '—'}")
+        st.text_area("Resume text preview", value=profile.get("preview", ""), height=180, disabled=True)
+        st.info("Profile saved ✓ — switch to **🔴 Live Monitor** to start a run.")
     else:
-        st.caption("No profile loaded yet. Upload a resume above and click Parse resume.")
+        st.caption("No profile loaded yet.")
 
 
 # ---------------------------------------------------------------------------
@@ -429,266 +274,247 @@ def render_setup_tab():
 # ---------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(
-        page_title="Job Application Copilot",
-        page_icon="📄",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Job Application Copilot", page_icon="📄", layout="wide")
 
-    # Session state defaults
     for key, default in [
-        ("active_run_id", ""),
-        ("auto_refresh", False),
-        ("last_refresh_ts", time.time()),
-        ("resume_profile", None),
-        ("resume_filename", ""),
-        ("candidate_email", ""),
-        ("candidate_email_set", False),
+        ("active_run_id", ""), ("auto_refresh", False),
+        ("resume_profile", None), ("resume_filename", ""),
+        ("candidate_email", ""), ("last_refresh_ts", time.time()),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
 
     st.title("Job Application Copilot")
-    st.caption("Upload your resume → scrape matching jobs → auto-apply. Everything in one place.")
+    st.caption("Upload resume → scrape jobs → AI score → auto-apply. All in one place.")
 
     backend_status, backend_message = get_backend_status()
 
-    # ------------------------------------------------------------------
     # Sidebar
-    # ------------------------------------------------------------------
     with st.sidebar:
-        st.header("App Controls")
-        st.write(f"**Backend status:** {backend_status}")
+        st.header("Controls")
+        st.write(f"**Backend:** {backend_status}")
         st.caption(backend_message)
-
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Start backend", use_container_width=True):
+            if st.button("▶ Start", use_container_width=True):
                 ok, msg = start_backend()
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
+                (st.success if ok else st.error)(msg)
                 st.rerun()
-
         with col2:
-            if st.button("Stop backend", use_container_width=True):
+            if st.button("■ Stop", use_container_width=True):
                 ok, msg = stop_backend()
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
+                (st.success if ok else st.error)(msg)
                 st.rerun()
 
         st.markdown("---")
-
-        candidate_email = st.text_input(
-            "Candidate email",
-            value=st.session_state.candidate_email,
-            key="sidebar_email",
-        )
-        # Keep session state in sync with sidebar input
-        st.session_state.candidate_email = candidate_email
-
-        run_id = st.text_input("Workflow run_id (optional)", DEFAULT_RUN_ID)
-
-        if st.session_state.resume_filename:
-            st.caption(f"Resume loaded: {st.session_state.resume_filename}")
-        else:
-            st.caption("No resume loaded yet — go to the Setup tab.")
-
+        st.session_state.candidate_email = st.text_input(
+            "Candidate email", value=st.session_state.candidate_email)
         st.session_state.auto_refresh = st.checkbox(
-            "Auto refresh live monitor",
-            value=st.session_state.auto_refresh,
-        )
-
-        if st.button("Refresh now", use_container_width=True):
-            st.session_state.last_refresh_ts = time.time()
+            "Auto-refresh monitor", value=st.session_state.auto_refresh)
+        if st.button("↻ Refresh", use_container_width=True):
             st.rerun()
+        if st.session_state.resume_filename:
+            st.caption(f"📎 {st.session_state.resume_filename}")
+        else:
+            st.caption("No resume loaded — go to ⚙️ Setup")
+        st.caption(f"Python: `{sys.executable}`")
 
-    # ------------------------------------------------------------------
     # Tabs
-    # ------------------------------------------------------------------
-    tab_setup, tab_monitor, tab_applications, tab_health = st.tabs(
-        ["⚙️ Setup", "🔴 Live Monitor", "📋 Applications", "🩺 Backend Health"]
-    )
+    tab_setup, tab_monitor, tab_matches, tab_applications, tab_health = st.tabs(
+        ["⚙️ Setup", "🔴 Live Monitor", "🏆 Top Matches", "📋 Applications", "🩺 Health"])
 
-    # ---- Setup ----
+    # --- Setup ---
     with tab_setup:
         if backend_status != "Running":
             st.warning("Start the backend first (sidebar), then upload your resume.")
         else:
             render_setup_tab()
 
-    # ---- Live Monitor ----
+    # --- Live Monitor ---
     with tab_monitor:
         if backend_status != "Running":
-            st.warning("Backend is not running. Start it from the sidebar first.")
-            st.stop()
+            st.warning("Backend not running. Start it from the sidebar.")
+        else:
+            st.subheader("Automation Monitor")
+            if not st.session_state.resume_profile:
+                st.info("💡 No resume loaded yet — go to **⚙️ Setup** first for best results.")
 
-        st.subheader("Automation Monitor")
+            profile = st.session_state.get("resume_profile") or {}
+            default_kw = ", ".join(
+                (profile.get("likely_roles") or []) + (profile.get("skills") or [])
+            ) or "logistics, supply chain, operations"
 
-        # Auto-populate keywords from parsed resume profile
-        profile = st.session_state.get("resume_profile") or {}
-        default_keywords = ", ".join(
-            (profile.get("likely_roles") or []) + (profile.get("skills") or [])
-        ) or "logistics, supply chain, operations"
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                target_keywords = st.text_input("Keywords (auto-filled from resume)", value=default_kw)
+            with c2:
+                target_location = st.text_input("Location", "United Kingdom")
+            with c3:
+                max_jobs = st.number_input("Max jobs", min_value=0, max_value=500, value=50, step=10,
+                                           help="Set to 0 for deep unlimited crawl")
 
-        form_col1, form_col2, form_col3 = st.columns(3)
-        with form_col1:
-            target_keywords = st.text_input(
-                "Target keywords (auto-filled from resume)",
-                value=default_keywords,
-            )
-        with form_col2:
-            target_location = st.text_input("Target location", "UK")
-        with form_col3:
-            max_jobs = st.number_input("Max jobs to scan", min_value=1, max_value=500, value=50, step=5)
+            with st.expander("Advanced filters"):
+                bl_input = st.text_input("Company blacklist (comma-separated)", "")
+                wl_input = st.text_input("Company whitelist (comma-separated, optional)", "")
+                auto_apply = st.checkbox("Auto-apply (generate cover letters)", value=True)
 
-        if not st.session_state.resume_profile:
-            st.info(
-                "💡 No resume loaded yet. Go to **⚙️ Setup** tab first to upload your CV — "
-                "keywords will then be filled automatically from your profile."
-            )
+            c4, c5 = st.columns([1, 2])
+            with c4:
+                if st.button("🚀 Start run", type="primary", use_container_width=True):
+                    payload = {
+                        "candidate_email": st.session_state.candidate_email or "user@example.com",
+                        "keywords": [x.strip() for x in target_keywords.split(",") if x.strip()],
+                        "location": target_location,
+                        "max_jobs": int(max_jobs),
+                        "auto_apply": auto_apply,
+                        "track_live": True,
+                        "resume_filename": st.session_state.resume_filename or None,
+                        "resume_profile": st.session_state.resume_profile,
+                        "company_blacklist": [x.strip() for x in bl_input.split(",") if x.strip()],
+                        "company_whitelist": [x.strip() for x in wl_input.split(",") if x.strip()],
+                    }
+                    result, err = start_automation(payload)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.active_run_id = result.get("run_id", "")
+                        st.success(f"Run started: `{st.session_state.active_run_id}`")
+                        st.rerun()
 
-        monitor_col1, monitor_col2 = st.columns([1, 2])
-
-        with monitor_col1:
-            if st.button("Start scrape/apply run", type="primary", use_container_width=True):
-                payload = {
-                    "candidate_email": st.session_state.candidate_email,
-                    "keywords": [x.strip() for x in target_keywords.split(",") if x.strip()],
-                    "location": target_location,
-                    "max_jobs": int(max_jobs),
-                    "auto_apply": True,
-                    "track_live": True,
-                    "resume_filename": st.session_state.resume_filename or None,
-                }
-                result, err = start_automation(payload)
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.active_run_id = result.get("run_id", "")
-                    st.success(f"Automation started. Run ID: {st.session_state.active_run_id}")
-                    st.rerun()
-
-        with monitor_col2:
-            active_run_id = st.text_input(
-                "Active run ID",
-                value=st.session_state.active_run_id or run_id,
-                key="active_run_id_input",
-            )
-            if active_run_id != st.session_state.active_run_id:
+            with c5:
+                active_run_id = st.text_input("Active run ID", value=st.session_state.active_run_id)
                 st.session_state.active_run_id = active_run_id
 
-        if st.session_state.active_run_id:
-            status_data, status_err = get_automation_status(st.session_state.active_run_id)
-
-            if status_err:
-                st.info(status_err)
-                st.caption("The monitor UI is ready, but the automation status endpoints may not be implemented yet.")
-            else:
-                state = status_data.get("status", "unknown")
-                stage = status_data.get("stage", "unknown")
-                progress = status_data.get("progress_percent", 0)
-                scanned = status_data.get("jobs_scanned", 0)
-                matched = status_data.get("jobs_matched", 0)
-                applied = status_data.get("jobs_applied", 0)
-                failed = status_data.get("jobs_failed", 0)
-                current_url = status_data.get("current_url")
-                recent_logs = status_data.get("logs", [])
-
-                st.markdown(status_badge(state), unsafe_allow_html=True)
-                st.write(f"**Current stage:** {stage}")
-                st.progress(min(max(int(progress), 0), 100))
-
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Jobs scanned", scanned)
-                k2.metric("Matches", matched)
-                k3.metric("Applied", applied)
-                k4.metric("Failed", failed)
-
-                if current_url:
-                    st.write(f"**Current page:** {current_url}")
-
-                st.markdown("#### Live event log")
-                if recent_logs:
-                    for log in recent_logs[-20:]:
-                        st.code(str(log), language="text")
+            if st.session_state.active_run_id:
+                status_data, status_err = get_automation_status(st.session_state.active_run_id)
+                if status_err:
+                    st.info(status_err)
                 else:
-                    st.caption("No logs returned yet.")
+                    state = status_data.get("status", "unknown")
+                    stage = status_data.get("stage", "unknown")
+                    progress = status_data.get("progress_percent", 0)
 
-                if st.session_state.auto_refresh and state.lower() in {"queued", "running"}:
-                    time.sleep(POLL_SECONDS)
-                    st.rerun()
+                    st.markdown(status_badge(state), unsafe_allow_html=True)
+                    st.write(f"**Stage:** {stage}")
+                    st.progress(min(max(int(progress), 0), 100))
+
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Scanned", status_data.get("jobs_scanned", 0))
+                    k2.metric("Matched", status_data.get("jobs_matched", 0))
+                    k3.metric("Applied", status_data.get("jobs_applied", 0))
+                    k4.metric("Failed", status_data.get("jobs_failed", 0))
+
+                    if status_data.get("current_url"):
+                        st.write(f"**Current:** {status_data['current_url']}")
+
+                    logs = status_data.get("logs", [])
+                    with st.expander("Live log", expanded=state in {"running", "queued"}):
+                        for entry in logs[-30:]:
+                            lvl = entry.get("level", "info")
+                            icon = "✅" if lvl == "info" else ("⚠️" if lvl == "warning" else "❌")
+                            st.code(f"{entry.get('ts','')} {icon} {entry.get('message','')}")
+
+                    if st.session_state.auto_refresh and state.lower() in {"queued", "running"}:
+                        time.sleep(POLL_SECONDS)
+                        st.rerun()
+            else:
+                st.info("No active run selected.")
+
+    # --- Top Matches ---
+    with tab_matches:
+        if backend_status != "Running":
+            st.warning("Backend not running.")
+        elif not st.session_state.active_run_id:
+            st.info("Start a run in Live Monitor first.")
         else:
-            st.info("No active automation run selected yet.")
+            st.subheader("Top Matched Jobs")
+            status_data, err = get_automation_status(st.session_state.active_run_id)
+            if err:
+                st.error(err)
+            else:
+                top = (status_data.get("top_matches") or
+                       (status_data.get("result_summary") or {}).get("top_matches") or [])
+                if not top:
+                    st.info("No matches yet — run may still be in progress.")
+                else:
+                    st.write(f"Showing top {len(top)} matches by AI fit score:")
+                    for i, m in enumerate(top, 1):
+                        with st.container(border=True):
+                            col_a, col_b, col_c = st.columns([3, 2, 1])
+                            col_a.markdown(f"**{i}. {m.get('title', '?')}** at {m.get('company', '?')}")
+                            col_b.progress(min(m.get("fit_score", 0), 100),
+                                           text=f"Fit: {m.get('fit_score', 0)}%")
+                            if m.get("url"):
+                                col_c.link_button("Open", m["url"])
 
-    # ---- Applications ----
+    # --- Applications ---
     with tab_applications:
         if backend_status != "Running":
-            st.warning("Backend is not running. Start it from the sidebar first.")
+            st.warning("Backend not running.")
         else:
             st.subheader("Application Tracker")
             data, error = get_applications(st.session_state.candidate_email)
-
             if error:
-                st.error(f"Error fetching applications: {error}")
+                st.error(f"Error: {error}")
             else:
                 apps = data.get("applications", [])
-                total = data.get("total_applications", 0)
-
-                header1, header2 = st.columns([2, 1])
-                header1.write(f"**Candidate:** {st.session_state.candidate_email}")
-                header2.write(f"**Total applications:** {total}")
-
+                st.write(f"**Candidate:** {st.session_state.candidate_email} | **Total:** {data.get('total_applications', 0)}")
                 render_tracker_summary(apps)
-
                 if not apps:
-                    st.info("No applications found for this candidate yet.")
+                    st.info("No applications yet.")
                 else:
                     for app in apps:
-                        render_application_card(app, run_id)
+                        with st.container(border=True):
+                            col1, col2, col3 = st.columns([2, 2, 2])
+                            with col1:
+                                st.markdown(f"### {app['job']['title']}")
+                                st.write(f"**Company:** {app['job']['company']}")
+                                if app["job"].get("url"):
+                                    st.link_button("Open", app["job"]["url"])
+                            with col2:
+                                st.markdown(status_badge(app["status"]), unsafe_allow_html=True)
+                                st.write(f"**Resume:** {app['resume_filename']}")
+                                st.write(f"**Updated:** {app['updated_at']}")
+                            with col3:
+                                options = ["draft", "ready", "submitted", "interview", "rejected"]
+                                new_status = st.selectbox("Status", options,
+                                    index=options.index(app["status"]) if app["status"] in options else 0,
+                                    key=f"st_{app['application_id']}")
+                                notes = st.text_input("Notes", value=app.get("notes") or "",
+                                                      key=f"n_{app['application_id']}")
+                                if st.button("Save", key=f"sv_{app['application_id']}"):
+                                    res, err2 = update_application_status(
+                                        app["application_id"], new_status, notes, st.session_state.active_run_id)
+                                    (st.success if res else st.error)(f"Updated to {new_status}" if res else err2)
+                                    if res:
+                                        st.rerun()
 
-    # ---- Backend Health ----
+    # --- Health ---
     with tab_health:
         if backend_status != "Running":
-            st.warning("Backend is not running. Start it from the sidebar first.")
+            st.warning("Backend not running.")
         else:
             st.subheader("Backend Health")
+            docs = safe_get(f"{API_BASE_URL}/docs", timeout=5)
+            (st.success if not isinstance(docs, Exception) else st.error)(
+                "FastAPI /docs reachable" if not isinstance(docs, Exception) else str(docs))
 
-            docs_resp = safe_get(f"{API_BASE_URL}/docs", timeout=5)
-            if isinstance(docs_resp, Exception):
-                st.error(f"FastAPI docs check failed: {docs_resp}")
-            else:
-                st.success("FastAPI docs endpoint is reachable.")
-
-            openapi_resp = safe_get(f"{API_BASE_URL}/openapi.json", timeout=5)
-            if isinstance(openapi_resp, Exception):
-                st.error(f"OpenAPI check failed: {openapi_resp}")
-            else:
-                st.success("OpenAPI schema is reachable.")
-
+            openapi = safe_get(f"{API_BASE_URL}/openapi.json", timeout=5)
+            if not isinstance(openapi, Exception):
                 try:
-                    schema = openapi_resp.json()
-                    paths = schema.get("paths", {})
-                    st.write(f"**Discovered API paths:** {len(paths)}")
-                    if paths:
-                        st.json(sorted(paths.keys()))
-                except Exception as exc:
-                    st.warning(f"Could not parse OpenAPI schema: {exc}")
+                    schema = openapi.json()
+                    paths = sorted(schema.get("paths", {}).keys())
+                    st.write(f"**API paths ({len(paths)}):** {', '.join(paths)}")
+                except Exception:
+                    pass
 
-            st.write(f"**Python executable in use:** `{sys.executable}`")
+            try:
+                from jobspy import scrape_jobs as _test  # noqa
+                st.success("✅ jobspy is importable (direct in-process scraping active)")
+            except ImportError:
+                st.warning("⚠️ jobspy not installed — using HTTP sidecar fallback. Run: pip install python-jobspy")
 
-            st.markdown("#### Notes")
-            st.write(
-                "A running backend only means the API server is alive. "
-                "Actual scraping and auto-apply require dedicated automation endpoints and background job logic."
-            )
-            st.write(
-                "For real-time visibility, the backend should store run progress and expose it through "
-                "status endpoints that this dashboard can poll."
-            )
+            st.write(f"**Python:** `{sys.executable}`")
 
 
 if __name__ == "__main__":

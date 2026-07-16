@@ -1,18 +1,30 @@
-fastapi==0.116.1
-uvicorn[standard]==0.35.0
-python-dotenv==1.1.1
-pydantic==2.11.7
-pydantic-settings==2.10.1
-sqlalchemy==2.0.41
-alembic==1.16.4
-python-multipart==0.0.20
-httpx==0.28.1
-pandas==2.3.1
-openpyxl==3.1.5
-pypdf==5.8.0
-pdfplumber==0.11.7
-python-docx==1.2.0
-beautifulsoup4==4.13.4
-lxml==6.0.0
-playwright==1.53.0
-pytest==8.4.1
+# Core API
+fastapi>=0.111
+uvicorn[standard]>=0.29
+pydantic>=2.7
+pydantic-settings>=2.2
+
+# Database
+sqlalchemy>=2.0
+alembic>=1.13
+
+# Resume parsing
+pypdf>=4.2
+python-docx>=1.1
+
+# Job scraping — direct in-process (no sidecar needed)
+python-jobspy>=0.1.24
+
+# HTML scraping
+beautifulsoup4>=4.12
+requests>=2.31
+
+# LLM cover letter generation (optional but recommended)
+openai>=1.30
+anthropic>=0.28
+
+# Frontend
+streamlit>=1.35
+
+# Utilities
+python-multipart>=0.0.9

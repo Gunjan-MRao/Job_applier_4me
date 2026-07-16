@@ -1,0 +1,5 @@
+# Kept for backwards compatibility if you want to run the sidecar separately.
+# The main app now calls jobspy directly (no sidecar needed).
+fastapi>=0.111
+uvicorn[standard]>=0.29
+python-jobspy>=0.1.24
