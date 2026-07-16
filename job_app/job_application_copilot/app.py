@@ -1,15 +1,17 @@
 """
-Job Application Copilot — Streamlit frontend v9.1
+Job Application Copilot — Streamlit frontend v9.2
 
-v9.1 fixes:
-- ScriptRunContext warnings: background threads no longer call st.*
-  directly; they write to session_state via a plain dict mutation which
-  is safe from any thread.  st.rerun() is only ever called from the
-  main script thread (inside the running==True block at the bottom of
-  tab_agent).
-- RuntimeError 'Event loop is closed': _poll_loop and _start wrap every
-  _set_agent() call in try/except RuntimeError so they exit cleanly when
-  Streamlit tears down the session instead of crashing ScriptRunner.
+v9.2 — complete elimination of ScriptRunContext warnings
+----------
+Root cause: even a plain read/write on st.session_state from a
+background thread triggers Streamlit’s context check and emits:
+  Thread ‘...’: missing ScriptRunContext!
+
+Fix: a module-level plain Python dict `_AGENT` is used as the
+shared state store.  Background threads (_poll_loop, _start) only
+ever touch `_AGENT` — zero Streamlit API calls.  The main script
+thread calls `_sync_agent_state()` once per rerun which copies
+`_AGENT` into `st.session_state["agent"]` for the UI to read.
 """
 import os
 import signal
@@ -32,7 +34,7 @@ API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 PID_FILE = BASE_DIR / "runtime_api.pid"
 LOG_FILE = BASE_DIR / "backend_startup.log"
 PYTHON_EXE = sys.executable
-POLL_SECONDS = 2  # slightly snappier
+POLL_SECONDS = 2
 
 SOURCE_ICONS = {
     "linkedin":           "🔵 LinkedIn",
@@ -52,6 +54,36 @@ DEFAULT_KEYWORDS = (
     "supply chain analyst, logistics coordinator, procurement analyst, "
     "demand planner, inventory analyst, operations analyst"
 )
+
+# ---------------------------------------------------------------------------
+# ★ Thread-safe agent state — plain Python dict, NO Streamlit involved
+# ---------------------------------------------------------------------------
+# Background threads ONLY touch _AGENT.  st.session_state is touched
+# exclusively by _sync_agent_state() which runs on the main script thread.
+
+_AGENT: dict = {"status": "idle"}
+_AGENT_LOCK = threading.Lock()
+
+
+def _set_agent(**kwargs):
+    """Write into _AGENT from any thread.  Zero Streamlit calls."""
+    with _AGENT_LOCK:
+        _AGENT.update(kwargs)
+
+
+def _get_agent() -> dict:
+    """Read a snapshot of _AGENT from any thread."""
+    with _AGENT_LOCK:
+        return dict(_AGENT)
+
+
+def _sync_agent_state():
+    """
+    MAIN THREAD ONLY.  Copies _AGENT into st.session_state so the UI
+    can read it.  Called once at the top of tab_agent() each rerun.
+    """
+    st.session_state["agent"] = _get_agent()
+
 
 # ---------------------------------------------------------------------------
 # Backend helpers
@@ -109,8 +141,7 @@ def start_backend():
 def stop_backend():
     pid = read_pid()
     if not is_port_open() and not process_alive(pid):
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        if PID_FILE.exists(): PID_FILE.unlink()
         return True, "Already stopped."
     if pid and process_alive(pid):
         try:
@@ -121,8 +152,7 @@ def stop_backend():
                 os.kill(pid, signal.SIGTERM)
         except Exception:
             pass
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if PID_FILE.exists(): PID_FILE.unlink()
     for _ in range(10):
         if not is_port_open():
             return True, "Backend stopped."
@@ -138,8 +168,7 @@ def backend_status_info():
         return label, detail
     if pid and process_alive(pid):
         return "Starting", f"Process {pid} alive, port not open yet"
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if PID_FILE.exists(): PID_FILE.unlink()
     return "Stopped", "Not running"
 
 
@@ -192,10 +221,8 @@ def parse_resume_local(file_bytes, filename):
         text = _extract_text_raw(file_bytes, suffix)
         return _minimal_parse(filename, text), None
     finally:
-        try:
-            tmp_path.unlink()
-        except Exception:
-            pass
+        try: tmp_path.unlink()
+        except Exception: pass
 
 def parse_resume(file_bytes, filename):
     if is_port_open():
@@ -214,26 +241,21 @@ def parse_resume(file_bytes, filename):
 def smart_keywords(profile: dict) -> str:
     roles  = profile.get("likely_roles") or []
     skills = profile.get("skills") or []
-    sc_roles = [
-        r for r in roles if any(t in r for t in (
-            "supply chain", "logistics", "procurement", "operations",
-            "inventory", "demand", "transport", "warehouse",
-            "purchasing", "coordinator", "analyst",
-        ))
-    ]
-    sc_skills = [
-        s for s in skills if s in (
-            "supply chain", "logistics", "procurement", "sap", "excel", "erp",
-            "forecasting", "demand planning", "inventory management", "operations",
-            "power bi", "sql", "s&op", "vendor management",
-        )
-    ]
+    sc_roles = [r for r in roles if any(t in r for t in (
+        "supply chain", "logistics", "procurement", "operations",
+        "inventory", "demand", "transport", "warehouse",
+        "purchasing", "coordinator", "analyst",
+    ))]
+    sc_skills = [s for s in skills if s in (
+        "supply chain", "logistics", "procurement", "sap", "excel", "erp",
+        "forecasting", "demand planning", "inventory management", "operations",
+        "power bi", "sql", "s&op", "vendor management",
+    )]
     combined = sc_roles[:3] + sc_skills[:5]
     seen, out = set(), []
     for k in combined:
         if k not in seen:
-            seen.add(k)
-            out.append(k)
+            seen.add(k); out.append(k)
     if not out:
         out = sc_skills[:6] or [
             "supply chain analyst", "logistics coordinator",
@@ -272,34 +294,10 @@ def _patch(path, payload, timeout=10):
 
 
 # ---------------------------------------------------------------------------
-# Agent state
-# ---------------------------------------------------------------------------
-
-def _agent_state() -> dict:
-    if "agent" not in st.session_state:
-        st.session_state["agent"] = {"status": "idle"}
-    return st.session_state["agent"]
-
-def _set_agent(**kwargs):
-    # Safe to call from background threads — only mutates a plain dict,
-    # never touches any Streamlit widget or asyncio event loop.
-    try:
-        _agent_state().update(kwargs)
-    except RuntimeError:
-        # Session has been torn down; swallow silently.
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Poll thread  (background — must NOT call any st.* functions)
+# Poll thread  (background — ZERO Streamlit calls)
 # ---------------------------------------------------------------------------
 
 def _poll_loop(run_id: str):
-    """
-    Polls /automation/status every POLL_SECONDS and writes results into
-    the plain agent-state dict.  Never calls st.rerun() or any other
-    Streamlit API — that is the job of the main script thread.
-    """
     retries = 0
     while True:
         time.sleep(POLL_SECONDS)
@@ -310,36 +308,27 @@ def _poll_loop(run_id: str):
         except Exception:
             retries += 1
             if retries >= 5:
-                try:
-                    _set_agent(status="failed", running=False)
-                except RuntimeError:
-                    pass
+                _set_agent(status="failed", running=False)
                 return
             continue
         retries = 0
         applied_jobs  = data.get("applied_jobs") or []
         source_counts = dict(Counter(j.get("source", "unknown") for j in applied_jobs))
-        try:
-            _set_agent(
-                status        = data.get("status", "unknown"),
-                stage         = data.get("stage", ""),
-                progress      = data.get("progress_percent", 0),
-                scanned       = data.get("jobs_scanned", 0),
-                matched       = data.get("jobs_matched", 0),
-                applied       = data.get("jobs_applied", 0),
-                current_url   = data.get("current_url") or "",
-                top_matches   = data.get("top_matches") or [],
-                applied_jobs  = applied_jobs,
-                source_counts = source_counts,
-                summary       = data.get("result_summary"),
-            )
-        except RuntimeError:
-            return  # event loop / session gone
+        _set_agent(
+            status        = data.get("status", "unknown"),
+            stage         = data.get("stage", ""),
+            progress      = data.get("progress_percent", 0),
+            scanned       = data.get("jobs_scanned", 0),
+            matched       = data.get("jobs_matched", 0),
+            applied       = data.get("jobs_applied", 0),
+            current_url   = data.get("current_url") or "",
+            top_matches   = data.get("top_matches") or [],
+            applied_jobs  = applied_jobs,
+            source_counts = source_counts,
+            summary       = data.get("result_summary"),
+        )
         if data.get("status") in ("completed", "failed"):
-            try:
-                _set_agent(running=False)
-            except RuntimeError:
-                pass
+            _set_agent(running=False)
             return
 
 
@@ -352,23 +341,20 @@ def launch_agent(config: dict):
     )
 
     def _start():
-        try:
-            if not is_port_open():
-                _set_agent(stage="⚙️ Starting backend...")
-                ok, msg = start_backend()
-                if not ok:
-                    _set_agent(status="failed", running=False, stage=f"Backend failed: {msg}")
-                    return
-            _set_agent(stage="📡 Submitting to backend...")
-            result, err = _post("/automation/start", config)
-            if err or not result:
-                _set_agent(status="failed", running=False, stage=f"API error: {err}")
+        if not is_port_open():
+            _set_agent(stage="⚙️ Starting backend...")
+            ok, msg = start_backend()
+            if not ok:
+                _set_agent(status="failed", running=False, stage=f"Backend failed: {msg}")
                 return
-            run_id = result.get("run_id", "")
-            _set_agent(run_id=run_id, status="running", stage="🔍 Searching all job boards...")
-            threading.Thread(target=_poll_loop, args=(run_id,), daemon=True).start()
-        except RuntimeError:
-            pass  # session gone before we finished starting
+        _set_agent(stage="📡 Submitting to backend...")
+        result, err = _post("/automation/start", config)
+        if err or not result:
+            _set_agent(status="failed", running=False, stage=f"API error: {err}")
+            return
+        run_id = result.get("run_id", "")
+        _set_agent(run_id=run_id, status="running", stage="🔍 Searching all job boards...")
+        threading.Thread(target=_poll_loop, args=(run_id,), daemon=True).start()
 
     threading.Thread(target=_start, daemon=True).start()
 
@@ -418,10 +404,10 @@ def _import_strategy():
 # ---------------------------------------------------------------------------
 
 AGENT_PROVIDER_COLOURS = {
-    "gemini":     ("#4285F4", "🔵", "Gemini 1.5 Flash"),
-    "huggingface":("#FF6B00", "🟠", "Mistral-7B (HuggingFace)"),
-    "openai":     ("#10a37f", "🟢", "GPT-4o-mini"),
-    "anthropic":  ("#6b46c1", "🟣", "Claude Haiku"),
+    "gemini":        ("#4285F4", "🔵", "Gemini 1.5 Flash"),
+    "huggingface":   ("#FF6B00", "🟠", "Mistral-7B (HuggingFace)"),
+    "openai":        ("#10a37f", "🟢", "GPT-4o-mini"),
+    "anthropic":     ("#6b46c1", "🟣", "Claude Haiku"),
     "reddit_oracle": ("#FF4500", "🔴", "Reddit Oracle (Rule-based)"),
 }
 
@@ -444,53 +430,36 @@ def _confidence_bar(score, label=""):
     )
 
 def _render_agent_card(result: dict):
-    agent_id  = result.get("agent", "unknown")
-    name      = result.get("name", agent_id)
-    opinion   = result.get("opinion") or "*(no response — API key not set)*"
-    confidence= result.get("confidence")
-    colour, emoji, provider_label = AGENT_PROVIDER_COLOURS.get(
-        agent_id, ("#6b7280", "⚪", agent_id)
-    )
+    agent_id   = result.get("agent", "unknown")
+    name       = result.get("name", agent_id)
+    opinion    = result.get("opinion") or "*(no response — API key not set)*"
+    confidence = result.get("confidence")
+    colour, emoji, provider_label = AGENT_PROVIDER_COLOURS.get(agent_id, ("#6b7280", "⚪", agent_id))
     with st.container(border=True):
         col_icon, col_body = st.columns([1, 9])
         with col_icon:
-            st.markdown(
-                f'<div style="font-size:2rem;text-align:center;padding-top:8px">{emoji}</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div style="font-size:2rem;text-align:center;padding-top:8px">{emoji}</div>',
+                        unsafe_allow_html=True)
         with col_body:
             st.markdown(
                 f'<span style="color:{colour};font-weight:700;font-size:15px">{name}</span> '
                 f'<span style="color:#888;font-size:12px">— {provider_label}</span>',
-                unsafe_allow_html=True,
-            )
+                unsafe_allow_html=True)
             st.markdown(opinion)
-            st.markdown(
-                _confidence_bar(confidence, "Confidence: "),
-                unsafe_allow_html=True,
-            )
+            st.markdown(_confidence_bar(confidence, "Confidence: "), unsafe_allow_html=True)
 
 def _render_synthesis(synthesis: str, consensus):
     st.markdown("### 🎯 Agent Synthesis — Final Verdict")
     with st.container(border=True):
         if consensus is not None:
             color = "#10b981" if consensus >= 70 else ("#f59e0b" if consensus >= 40 else "#ef4444")
-            verdict_text = (
-                "APPLY" if consensus >= 70
-                else "APPLY WITH CAUTION" if consensus >= 40
-                else "SKIP"
-            )
+            verdict = "APPLY" if consensus >= 70 else "APPLY WITH CAUTION" if consensus >= 40 else "SKIP"
             st.markdown(
                 f'<div style="text-align:center;padding:12px 0">'
-                f'<span style="font-size:2rem;font-weight:900;color:{color}">{verdict_text}</span>'
-                f'<br><span style="color:{color};font-size:18px">'
-                f'Consensus confidence: {consensus}/100</span></div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                _confidence_bar(consensus, "Overall consensus: "),
-                unsafe_allow_html=True,
-            )
+                f'<span style="font-size:2rem;font-weight:900;color:{color}">{verdict}</span>'
+                f'<br><span style="color:{color};font-size:18px">Consensus confidence: {consensus}/100</span></div>',
+                unsafe_allow_html=True)
+            st.markdown(_confidence_bar(consensus, "Overall consensus: "), unsafe_allow_html=True)
         if synthesis:
             st.markdown("---")
             st.markdown(synthesis)
@@ -498,88 +467,66 @@ def _render_synthesis(synthesis: str, consensus):
 def tab_debate():
     st.subheader("🧠 Multi-Agent Strategy Debate")
     st.caption(
-        "Paste a job you're considering — 5 AI agents debate whether you should apply, "
+        "Paste a job you’re considering — 5 AI agents debate whether you should apply, "
         "how to approach it, and what the risks are. The Reddit Oracle always runs (no API needed)."
     )
-
     run_debate_fn, hiring_window_fn = _import_strategy()
     if hiring_window_fn:
         try:
             win = hiring_window_fn()
-            win_color = "#10b981" if win["score"] >= 70 else ("#f59e0b" if win["score"] >= 40 else "#ef4444")
+            wc = "#10b981" if win["score"] >= 70 else ("#f59e0b" if win["score"] >= 40 else "#ef4444")
             st.markdown(
-                f'<div style="padding:8px 16px;border-radius:8px;'
-                f'background:{win_color}22;border:1px solid {win_color}66;margin-bottom:12px">'
-                f'📅 <strong>Current hiring window ({win["month"]}):</strong> '
-                f'<span style="color:{win_color}">{win["advice"]}</span></div>',
-                unsafe_allow_html=True,
-            )
+                f'<div style="padding:8px 16px;border-radius:8px;background:{wc}22;'
+                f'border:1px solid {wc}66;margin-bottom:12px">📅 '
+                f'<strong>Current hiring window ({win["month"]}):</strong> '
+                f'<span style="color:{wc}">{win["advice"]}</span></div>',
+                unsafe_allow_html=True)
         except Exception:
             pass
-
     if run_debate_fn is None:
-        st.error(
-            "❌ Could not import `sponsor_strategy.py`. "
-            "Make sure the backend directory is in your Python path and the file exists at "
-            "`backend/services/sponsor_strategy.py`."
-        )
+        st.error("❌ Could not import `sponsor_strategy.py`. Check backend/services/sponsor_strategy.py exists.")
         return
-
     profile = st.session_state.get("resume_profile") or {}
     if not profile:
         st.warning("⚠️ No resume loaded — upload in **⚙️ Setup** for personalised agent opinions.")
         profile = {"candidate_name": "Candidate", "skills": [], "years_of_experience_hint": "graduate"}
-
     with st.form("debate_form"):
         st.markdown("**Enter the job details:**")
         c1, c2 = st.columns(2)
-        job_title   = c1.text_input("Job Title",   placeholder="e.g. Supply Chain Analyst")
-        company     = c2.text_input("Company",     placeholder="e.g. DHL")
-        c3, c4 = st.columns(2)
-        location    = c3.text_input("Location",   value="United Kingdom")
-        salary      = c4.text_input("Salary",     placeholder="e.g. £35,000")
-        spons_opts  = ["unknown", "yes", "no"]
-        spons_sel   = st.selectbox(
+        job_title = c1.text_input("Job Title", placeholder="e.g. Supply Chain Analyst")
+        company   = c2.text_input("Company",   placeholder="e.g. DHL")
+        c3, c4    = st.columns(2)
+        location  = c3.text_input("Location", value="United Kingdom")
+        salary    = c4.text_input("Salary",   placeholder="e.g. £35,000")
+        spons_sel = st.selectbox(
             "Sponsorship status (from job posting)",
-            spons_opts,
+            ["unknown", "yes", "no"],
             format_func=lambda x: {
                 "yes": "✅ Confirmed — they offer sponsorship",
                 "no":  "❌ Explicitly no sponsorship",
                 "unknown": "❓ Not mentioned",
-            }[x],
-        )
-        job_desc    = st.text_area(
-            "Job description excerpt (optional — paste a snippet)",
-            height=100,
-            placeholder="Paste any part of the job description here...",
-        )
-        source      = st.text_input("Source", value="linkedin", placeholder="linkedin / reed / indeed...")
-        run_btn     = st.form_submit_button(
-            "🧠 Run Agent Debate", type="primary", use_container_width=True
-        )
-
+            }[x])
+        job_desc = st.text_area("Job description excerpt (optional)", height=100,
+                                placeholder="Paste any part of the job description here...")
+        source   = st.text_input("Source", value="linkedin", placeholder="linkedin / reed / indeed...")
+        run_btn  = st.form_submit_button("🧠 Run Agent Debate", type="primary", use_container_width=True)
     if run_btn:
         if not job_title or not company:
             st.warning("Please enter at least a Job Title and Company.")
         else:
             job = {
-                "title":              job_title.strip(),
-                "company":            company.strip(),
-                "location":           location.strip(),
-                "salary":             salary.strip(),
-                "sponsorship_status": spons_sel,
-                "description":        job_desc.strip(),
-                "source":             source.strip(),
-                "url":                "",
+                "title": job_title.strip(), "company": company.strip(),
+                "location": location.strip(), "salary": salary.strip(),
+                "sponsorship_status": spons_sel, "description": job_desc.strip(),
+                "source": source.strip(), "url": "",
             }
-            with st.spinner("🧠 Agents are debating... (this may take 10–30 seconds depending on API keys)"):
+            with st.spinner("🧠 Agents are debating... (10–30 seconds)"):
                 try:
                     result = run_debate_fn(job, profile)
                     st.session_state["last_debate"] = result
                 except Exception as exc:
                     st.error(f"Debate failed: {exc}")
                     st.session_state.pop("last_debate", None)
-
     result = st.session_state.get("last_debate")
     if not result:
         st.info(
@@ -592,95 +539,54 @@ def tab_debate():
             "- 🔴 **The Reddit Oracle** — Pattern-matched community wisdom (always runs)\n"
         )
         return
-
     tier = result.get("company_tier", "tier3")
     tier_colour, tier_label = TIER_STYLE.get(tier, ("#6b7280", "Unknown tier"))
     govuk = result.get("govuk_verified")
     govuk_html = (
-        '<span style="color:#10b981;font-weight:700">✅ GOV.UK Verified Sponsor</span>'
-        if govuk is True else
-        '<span style="color:#ef4444;font-weight:700">❌ NOT on GOV.UK Register</span>'
-        if govuk is False else
-        '<span style="color:#f59e0b;font-weight:700">❓ GOV.UK register could not be checked</span>'
+        '<span style="color:#10b981;font-weight:700">✅ GOV.UK Verified Sponsor</span>' if govuk is True
+        else '<span style="color:#ef4444;font-weight:700">❌ NOT on GOV.UK Register</span>' if govuk is False
+        else '<span style="color:#f59e0b;font-weight:700">❓ GOV.UK register could not be checked</span>'
     )
     st.markdown(
-        f'<div style="display:flex;gap:16px;align-items:center;padding:10px 16px;'
-        f'border-radius:8px;background:{tier_colour}22;border:1px solid {tier_colour}55;margin-bottom:16px">'
+        f'<div style="display:flex;gap:16px;align-items:center;padding:10px 16px;border-radius:8px;'
+        f'background:{tier_colour}22;border:1px solid {tier_colour}55;margin-bottom:16px">'
         f'<span style="color:{tier_colour};font-weight:700;font-size:15px">{tier_label}</span>'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;{govuk_html}</div>',
-        unsafe_allow_html=True,
-    )
-
-    _render_synthesis(
-        result.get("synthesis", ""),
-        result.get("consensus_confidence"),
-    )
-
+        f'&nbsp;&nbsp;|&nbsp;&nbsp;{govuk_html}</div>', unsafe_allow_html=True)
+    _render_synthesis(result.get("synthesis", ""), result.get("consensus_confidence"))
     st.markdown("---")
     st.markdown("### 🗣️ Agent Opinions")
-    for agent_result in (result.get("agents") or []):
-        _render_agent_card(agent_result)
-
+    for ar in (result.get("agents") or []):
+        _render_agent_card(ar)
     st.markdown("---")
-
     ats = result.get("ats_bypass") or {}
     if ats:
-        with st.expander("🤖 ATS Bypass Tip — How to answer 'Do you require sponsorship?'", expanded=True):
-            st.error(f"❌ **Don't say:** `{ats.get('naive_answer', 'Yes')}`  — many ATS auto-reject this")
+        with st.expander("🤖 ATS Bypass Tip", expanded=True):
+            st.error(f"❌ **Don’t say:** `{ats.get('naive_answer', 'Yes')}` — many ATS auto-reject this")
             st.success("✅ **Say instead:**")
             st.code(ats.get('smart_answer', ''), language=None)
             st.caption(ats.get('rationale', ''))
-
     outreach = result.get("linkedin_outreach") or ""
     if outreach:
-        with st.expander("🔗 LinkedIn Outreach Message (curiosity approach — NOT asking for job)"):
-            st.info(
-                "💡 Per Reddit r/IndiansInUK: send 5 of these per day. Ask a genuine question "
-                "about their career path. Never mention visa. Never ask for a job directly."
-            )
-            st.text_area(
-                "LinkedIn message (edit before sending):",
-                value=outreach,
-                height=140,
-                key="linkedin_outreach_msg",
-            )
-
+        with st.expander("🔗 LinkedIn Outreach Message"):
+            st.info("💡 Per Reddit r/IndiansInUK: send 5/day. Never mention visa. Never ask for a job directly.")
+            st.text_area("LinkedIn message (edit before sending):", value=outreach, height=140,
+                         key="linkedin_outreach_msg")
     schedule = result.get("followup_schedule") or []
     if schedule:
         with st.expander("📅 Follow-up Schedule (every 5 days — max 3 times)"):
-            st.caption(
-                "Per Reddit consensus: follow up every 5 days after applying. Stop after 3 times. "
-                "Replace [Name], [Job Title], [Date] with real values."
-            )
             for item in schedule:
                 st.markdown(f"**Day {item['day']} — send on {item['send_on']}**")
-                st.text_area(
-                    item["subject"],
-                    value=item["body"],
-                    height=120,
-                    key=f"followup_{item['day']}",
-                )
-
+                st.text_area(item["subject"], value=item["body"], height=120, key=f"followup_{item['day']}")
     hw = result.get("hiring_window") or {}
     if hw:
         with st.expander("📅 Hiring Window Analysis"):
-            hw_color = "#10b981" if hw.get('score', 0) >= 70 else (
-                "#f59e0b" if hw.get('score', 0) >= 40 else "#ef4444"
-            )
-            st.markdown(
-                f'<strong style="color:{hw_color}">{hw.get("advice", "")}</strong>',
-                unsafe_allow_html=True,
-            )
+            hwc = "#10b981" if hw.get('score', 0) >= 70 else ("#f59e0b" if hw.get('score', 0) >= 40 else "#ef4444")
+            st.markdown(f'<strong style="color:{hwc}">{hw.get("advice", "")}</strong>', unsafe_allow_html=True)
             if hw.get("apply_now", False):
                 st.success("✅ Good time to apply — within peak hiring window.")
             else:
-                st.warning(
-                    "⚠️ Outside peak window. Consider submitting now anyway for roles that "
-                    "close soon, but expect slower response times."
-                )
-
+                st.warning("⚠️ Outside peak window. Expect slower response times.")
     with st.expander("🔬 Raw debate data (JSON)"):
-        import json
         st.json(result)
 
 
@@ -701,13 +607,12 @@ def tab_setup():
             if err:
                 st.error(err)
             else:
-                st.session_state.resume_profile   = profile
-                st.session_state.resume_filename  = uploaded.name
+                st.session_state.resume_profile  = profile
+                st.session_state.resume_filename = uploaded.name
                 if profile.get("email") and not st.session_state.get("candidate_email"):
                     st.session_state.candidate_email = profile["email"]
                 st.success("✅ Parsed! Switch to **🤖 AI Agent** to start.")
                 st.rerun()
-
     p = st.session_state.get("resume_profile")
     if p:
         st.markdown("### 📌 Extracted profile")
@@ -717,12 +622,11 @@ def tab_setup():
             st.write(f"📧 **Email:** {p.get('email') or '—'}")
             st.write(f"💼 **Experience:** {p.get('years_of_experience_hint') or '—'}")
         with c2:
-            roles_str = ", ".join(p.get("likely_roles") or []) or "—"
+            roles_str   = ", ".join(p.get("likely_roles") or []) or "—"
             skills_list = p.get("skills") or []
             st.write(f"🎯 **Roles detected:** {roles_str}")
             st.write(f"⚙️ **Skills ({len(skills_list)}):** {', '.join(skills_list) or '—'}")
-        kw = smart_keywords(p)
-        st.info(f"🔑 **Keywords for agent:** `{kw}`")
+        st.info(f"🔑 **Keywords for agent:** `{smart_keywords(p)}`")
         with st.expander("Resume text preview"):
             st.text(p.get("preview", ""))
 
@@ -732,8 +636,11 @@ def tab_setup():
 # ---------------------------------------------------------------------------
 
 def tab_agent():
-    st.subheader("🤖 AI Job Agent")
+    # ★ Sync the background thread’s plain dict into st.session_state
+    # This is the ONLY place st.session_state["agent"] is written.
+    _sync_agent_state()
 
+    st.subheader("🤖 AI Job Agent")
     p = st.session_state.get("resume_profile") or {}
 
     col_be, col_gem = st.columns(2)
@@ -761,27 +668,19 @@ def tab_agent():
     default_kw = smart_keywords(p) if p else DEFAULT_KEYWORDS
 
     with st.form("agent_form"):
-        c1, c2 = st.columns(2)
-        keywords = c1.text_input(
-            "🔑 Keywords",
-            value=default_kw,
-            help="Supply chain & logistics search terms. Edit freely.",
-        )
+        c1, c2   = st.columns(2)
+        keywords = c1.text_input("🔑 Keywords", value=default_kw,
+                                 help="Supply chain & logistics search terms.")
         location = c2.text_input("📍 Location", "United Kingdom")
         with st.expander("🔧 Advanced filters (optional)"):
             blacklist  = st.text_input("Skip these companies (comma-separated)", "")
             whitelist  = st.text_input("Only show these companies (optional)", "")
-            auto_apply = st.checkbox(
-                "Auto-generate cover letter + cold email per match", value=True
-            )
-        go = st.form_submit_button(
-            "🚀 Start AI Agent — scan ALL job boards",
-            type="primary",
-            use_container_width=True,
-        )
+            auto_apply = st.checkbox("Auto-generate cover letter + cold email per match", value=True)
+        go = st.form_submit_button("🚀 Start AI Agent — scan ALL job boards",
+                                   type="primary", use_container_width=True)
 
     if go:
-        a = _agent_state()
+        a = _get_agent()
         if a.get("running"):
             st.warning("Agent already running — scroll down for live progress.")
         else:
@@ -801,7 +700,8 @@ def tab_agent():
             time.sleep(1.5)
             st.rerun()
 
-    a             = _agent_state()
+    # Read from the already-synced session_state snapshot
+    a             = st.session_state.get("agent", {})
     running       = a.get("running", False)
     status        = a.get("status", "idle")
     prog          = a.get("progress", 0)
@@ -826,7 +726,6 @@ def tab_agent():
         return
 
     st.markdown("---")
-
     r1c1, r1c2 = st.columns([1, 3])
     r1c1.markdown(f"**Status:** {status_pill(status)}", unsafe_allow_html=True)
     if stage:
@@ -839,32 +738,25 @@ def tab_agent():
     mc1.metric("🔍 Jobs Found",   scanned)
     mc2.metric("✅ Matched",       matched)
     mc3.metric("📤 Applications", applied)
-    needs_review = sum(1 for j in aj if not j.get("cover_letter"))
-    mc4.metric("⚠️ Needs Review",  needs_review)
+    mc4.metric("⚠️ Needs Review",  sum(1 for j in aj if not j.get("cover_letter")))
 
     st.markdown("#### 📶 Live source feed")
     source_cols = st.columns(len(SOURCE_ICONS))
     for i, (src, icon) in enumerate(SOURCE_ICONS.items()):
         cnt = source_counts.get(src, 0)
         with source_cols[i]:
-            if cnt > 0:
-                st.success(f"{icon}\n\n**{cnt}**")
-            elif running:
-                st.info(f"{icon}\n\n*...*")
-            else:
-                st.caption(icon)
+            if cnt > 0:    st.success(f"{icon}\n\n**{cnt}**")
+            elif running:  st.info(f"{icon}\n\n*...*")
+            else:          st.caption(icon)
 
     st.markdown("---")
-
     needs_review_jobs = [j for j in aj if not j.get("cover_letter")]
     ready_jobs        = [j for j in aj if j.get("cover_letter")]
-
     if needs_review_jobs:
         st.markdown(f"### ⚠️ Needs Your Review ({len(needs_review_jobs)})")
-        st.caption("Matched but cover letter couldn't be generated — apply manually via link.")
+        st.caption("Matched but cover letter couldn’t be generated — apply manually via link.")
         for job in reversed(needs_review_jobs[-20:]):
             _render_job_card(job, review_mode=True)
-
     if ready_jobs:
         st.markdown(f"### 📨 Ready to Send ({len(ready_jobs)})")
         for job in reversed(ready_jobs[-50:]):
@@ -876,26 +768,23 @@ def tab_agent():
                 st.code(line, language=None)
         else:
             st.caption("No log entries yet — agent is starting up...")
-
     if summary:
         with st.expander("📈 Final summary"):
             st.json(summary)
 
-    # ── Only the MAIN SCRIPT THREAD calls st.rerun() ──────────────────────
-    # This is the only place st.rerun() is called; background threads
-    # never touch it.  The 2-second sleep keeps CPU usage minimal.
+    # ── ONLY the main script thread ever calls st.rerun() ───────────────
     if running:
         time.sleep(POLL_SECONDS)
         st.rerun()
     elif status == "completed":
         st.balloons()
         if st.button("🔄 Start a new search"):
-            st.session_state["agent"] = {"status": "idle"}
+            _set_agent(status="idle", running=False)
             st.rerun()
     elif status == "failed":
         st.error("❌ Agent failed — check the log above for details.")
         if st.button("🔄 Try again"):
-            st.session_state["agent"] = {"status": "idle"}
+            _set_agent(status="idle", running=False)
             st.rerun()
 
 
@@ -906,41 +795,31 @@ def _render_job_card(job: dict, review_mode: bool):
     src   = source_label(job.get("source", ""))
     spons = job.get("sponsorship_status", "unknown")
     url   = job.get("url", "")
-
     spons_html = {
         "yes":     status_pill("Sponsors visas", "#10b981"),
         "no":      status_pill("No sponsorship", "#ef4444"),
         "unknown": status_pill("Sponsorship ?",  "#f59e0b"),
     }.get(spons, "")
-
     label = f"{'⚠️' if review_mode else '✅'} {fit}% | {title} @ {co} | {src}"
     with st.expander(label):
         hc1, hc2, hc3 = st.columns([2, 1, 1])
         with hc1:
             st.markdown(f"**{title}** at **{co}**")
-            if url:
-                st.link_button("🔗 Apply / View job", url, use_container_width=True)
+            if url: st.link_button("🔗 Apply / View job", url, use_container_width=True)
         with hc2:
             st.markdown(spons_html, unsafe_allow_html=True)
         with hc3:
             st.metric("Fit score", f"{fit}%")
-
         if job.get("cover_letter"):
             st.markdown("📝 **Cover Letter** (edit before sending):")
-            st.text_area(
-                "cover_letter", value=job["cover_letter"], height=230,
-                key=f"cl_{url}{title}{fit}",
-            )
+            st.text_area("cover_letter", value=job["cover_letter"], height=230,
+                         key=f"cl_{url}{title}{fit}")
         elif review_mode:
             st.warning("Cover letter failed — apply directly via the link above.")
-
         if job.get("cold_email"):
             st.markdown("📧 **Cold Recruiter Email** (edit before sending):")
-            st.text_area(
-                "cold_email", value=job["cold_email"], height=190,
-                key=f"ce_{url}{title}{fit}",
-            )
-
+            st.text_area("cold_email", value=job["cold_email"], height=190,
+                         key=f"ce_{url}{title}{fit}")
         if job.get("resume_guidance"):
             with st.expander("📄 Resume tailoring tips"):
                 g = job["resume_guidance"]
@@ -961,15 +840,12 @@ def tab_applications():
     st.subheader("📋 Application Tracker")
     email = st.session_state.get("candidate_email", "")
     if not email:
-        st.info("Enter your email in the sidebar.")
-        return
+        st.info("Enter your email in the sidebar."); return
     if not is_port_open():
-        st.warning("Start the backend first.")
-        return
+        st.warning("Start the backend first."); return
     data, err = _get(f"/applications/{email}")
     if err or not data:
-        st.info("No applications yet.")
-        return
+        st.info("No applications yet."); return
     apps = data.get("applications", [])
     counts = Counter((a.get("status") or "").lower() for a in apps)
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -984,28 +860,20 @@ def tab_applications():
             with ca:
                 st.markdown(f"**{app['job']['title']}**")
                 st.write(app["job"]["company"])
-                if app["job"].get("url"):
-                    st.link_button("View", app["job"]["url"])
+                if app["job"].get("url"): st.link_button("View", app["job"]["url"])
             with cb:
                 st.markdown(status_pill(app["status"]), unsafe_allow_html=True)
                 st.caption(f"Updated: {app['updated_at']}")
             with cc:
                 opts = ["draft", "ready", "submitted", "interview", "rejected"]
                 cur  = app["status"] if app["status"] in opts else "draft"
-                ns   = st.selectbox("Status", opts, index=opts.index(cur),
-                                    key=f"s_{app['application_id']}")
-                notes = st.text_input("Notes", value=app.get("notes") or "",
-                                      key=f"n_{app['application_id']}")
+                ns   = st.selectbox("Status", opts, index=opts.index(cur), key=f"s_{app['application_id']}")
+                notes = st.text_input("Notes", value=app.get("notes") or "", key=f"n_{app['application_id']}")
                 if st.button("Save", key=f"sv_{app['application_id']}"):
-                    res, e2 = _patch(
-                        f"/applications/{app['application_id']}/status",
-                        {"status": ns, "notes": notes or None, "run_id": None},
-                    )
-                    if res:
-                        st.success("Saved")
-                        st.rerun()
-                    else:
-                        st.error(e2)
+                    res, e2 = _patch(f"/applications/{app['application_id']}/status",
+                                     {"status": ns, "notes": notes or None, "run_id": None})
+                    if res: st.success("Saved"); st.rerun()
+                    else:   st.error(e2)
 
 
 # ---------------------------------------------------------------------------
@@ -1056,24 +924,13 @@ def tab_health():
 # ---------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(
-        page_title="Job Application Copilot",
-        page_icon="🤖",
-        layout="wide",
-    )
-    for k, v in {
-        "resume_profile":  None,
-        "resume_filename": "",
-        "candidate_email": "",
-    }.items():
+    st.set_page_config(page_title="Job Application Copilot", page_icon="🤖", layout="wide")
+    for k, v in {"resume_profile": None, "resume_filename": "", "candidate_email": ""}.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
     st.title("🤖 Job Application Copilot")
-    st.caption(
-        "Upload CV → Agent scans every job board → "
-        "instant cover letter + cold email per match"
-    )
+    st.caption("Upload CV → Agent scans every job board → instant cover letter + cold email per match")
 
     status, detail = backend_status_info()
     with st.sidebar:
@@ -1085,54 +942,30 @@ def main():
         if c1.button("▶ Start", use_container_width=True):
             with st.spinner("Starting..."):
                 ok, msg = start_backend()
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+            st.success(msg) if ok else st.error(msg)
             st.rerun()
         if c2.button("■ Stop", use_container_width=True):
             ok, msg = stop_backend()
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+            st.success(msg) if ok else st.error(msg)
             st.rerun()
         st.markdown("---")
         st.session_state.candidate_email = st.text_input(
-            "Your email",
-            value=st.session_state.candidate_email,
-            placeholder="your@email.com",
-        )
+            "Your email", value=st.session_state.candidate_email, placeholder="your@email.com")
         p = st.session_state.get("resume_profile")
         if p:
             st.success(f"📎 {st.session_state.resume_filename}")
-            st.caption(
-                f"{p.get('candidate_name') or '?'} | "
-                f"{len(p.get('skills') or [])} skills | "
-                f"{p.get('years_of_experience_hint') or '?'}"
-            )
+            st.caption(f"{p.get('candidate_name') or '?'} | {len(p.get('skills') or [])} skills | {p.get('years_of_experience_hint') or '?'}")
         else:
             st.info("📎 Upload CV in ⚙️ Setup tab")
         if st.button("↻ Refresh", use_container_width=True):
             st.rerun()
 
-    t1, t2, t3, t4, t5 = st.tabs([
-        "⚙️ Setup",
-        "🤖 AI Agent",
-        "🧠 Agent Debate",
-        "📋 Applications",
-        "🩺 Health",
-    ])
-    with t1:
-        tab_setup()
-    with t2:
-        tab_agent()
-    with t3:
-        tab_debate()
-    with t4:
-        tab_applications()
-    with t5:
-        tab_health()
+    t1, t2, t3, t4, t5 = st.tabs(["⚙️ Setup", "🤖 AI Agent", "🧠 Agent Debate", "📋 Applications", "🩺 Health"])
+    with t1: tab_setup()
+    with t2: tab_agent()
+    with t3: tab_debate()
+    with t4: tab_applications()
+    with t5: tab_health()
 
 
 if __name__ == "__main__":
