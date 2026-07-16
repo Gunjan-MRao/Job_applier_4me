@@ -8,56 +8,16 @@ if "%PROJECT_DIR:~-1%"=="\" set "PROJECT_DIR=%PROJECT_DIR:~0,-1%"
 set "BACKEND_PORT=8000"
 set "STREAMLIT_PORT=8501"
 
-REM ── Find Python ───────────────────────────────────────────────────────────────────
-set "PYTHON="
+REM ── Python path ───────────────────────────────────────────────────────────────────
+set "PYTHON=C:\Users\gunja\anaconda3\New folder\envs\jobcopilot\python.exe"
 
-REM Check common Anaconda/Miniconda install locations
-for %%P in (
-    "%USERPROFILE%\anaconda3\python.exe"
-    "%USERPROFILE%\Anaconda3\python.exe"
-    "%USERPROFILE%\anaconda3\Anaconda\python.exe"
-    "%USERPROFILE%\Anaconda3\Anaconda\python.exe"
-    "%USERPROFILE%\miniconda3\python.exe"
-    "%USERPROFILE%\Miniconda3\python.exe"
-    "%LOCALAPPDATA%\anaconda3\python.exe"
-    "%LOCALAPPDATA%\Anaconda3\python.exe"
-    "C:\Users\gunja\anaconda3\python.exe"
-    "C:\Users\gunja\Anaconda3\python.exe"
-    "C:\Users\gunja\anaconda3\Anaconda\python.exe"
-    "C:\Users\gunja\Anaconda3\Anaconda\python.exe"
-    "C:\Users\gunja\miniconda3\python.exe"
-    "C:\ProgramData\anaconda3\python.exe"
-    "C:\ProgramData\Anaconda3\python.exe"
-    "C:\anaconda3\python.exe"
-    "C:\Anaconda3\python.exe"
-) do (
-    if exist %%P (
-        set "PYTHON=%%~P"
-        goto :found_python
-    )
-)
-
-REM Last resort: use whatever python is on PATH
-where python >nul 2>&1
-if %ERRORLEVEL%==0 set "PYTHON=python"
-
-:found_python
-
-if "%PYTHON%"=="" (
+if not exist "%PYTHON%" (
     echo.
-    echo ==========================================
-    echo  ERROR: Could not find Python / Anaconda
-    echo ==========================================
+    echo ERROR: Python not found at:
+    echo %PYTHON%
     echo.
-    echo Searched common locations but none found.
-    echo.
-    echo FIX - open this file in Notepad and set
-    echo your exact Python path on the line below:
-    echo.
-    echo   set "PYTHON=C:\your\path\to\python.exe"
-    echo.
-    echo To find your path, open Anaconda Prompt and run:
-    echo   where python
+    echo Open Anaconda Prompt and run:  where python
+    echo Then update the PYTHON line in this .bat file.
     echo.
     pause
     exit /b 1
