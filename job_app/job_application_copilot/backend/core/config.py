@@ -1,34 +1,29 @@
+"""
+backend/core/config.py
+Centralised settings — reads from .env (or environment variables).
+All optional; the pipeline runs fully offline with zero API keys.
+"""
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    app_name: str = "Job Application Copilot"
-    app_env: str = "development"
-    app_host: str = "127.0.0.1"
-    app_port: int = 8000
-    debug: bool = True
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    database_url: str = "sqlite:///./job_application_copilot.db"
+    # LLM keys (all optional — free/offline fallbacks always work)
+    gemini_api_key:    Optional[str] = None
+    hf_api_key:        Optional[str] = None
+    openai_api_key:    Optional[str] = None
+    anthropic_api_key: Optional[str] = None
 
-    # Free APIs (recommended)
-    gemini_api_key: str = ""       # FREE — aistudio.google.com
-    hf_api_key: str = ""           # FREE — huggingface.co/settings/tokens
+    # Adzuna free API (100 results/call, get keys at developer.adzuna.com)
+    adzuna_app_id:  Optional[str] = None
+    adzuna_app_key: Optional[str] = None
 
-    # Optional paid APIs (not required)
-    openai_api_key: str = ""
-    anthropic_api_key: str = ""
-
-    storage_dir: str = "storage"
-    resume_dir: str = "storage/resumes"
-    generated_dir: str = "storage/generated"
-    screenshot_dir: str = "storage/screenshots"
-    log_dir: str = "storage/logs"
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore"
-    )
+    # App internals
+    database_url: str = "sqlite:///./storage/jobs.db"
+    secret_key:   str = "change-me-in-production"
+    debug:        bool = False
 
 
 settings = Settings()

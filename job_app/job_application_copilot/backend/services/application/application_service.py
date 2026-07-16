@@ -1,85 +1,59 @@
+"""
+backend/services/application/application_service.py
+Tracks application history — persisted to storage/applications.json.
+"""
+import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
+from typing import List
 
-from backend.services.application.application_store import (
-    save_application,
-    list_applications,
-    get_application_by_id,
-    update_application_record,
-)
+_APP_PATH = Path("storage/applications.json")
+_APP_PATH.parent.mkdir(exist_ok=True)
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _load() -> list:
+    if _APP_PATH.exists():
+        try:
+            return json.loads(_APP_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
 
 
-def create_application_package(payload: dict) -> dict:
-    application_id = str(uuid.uuid4())
-    created_at = _now_iso()
+def _save(data: list) -> None:
+    _APP_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    record = {
-        "application_id": application_id,
-        "candidate_email": payload["candidate_email"],
-        "candidate_name": payload["candidate_name"],
-        "resume_version_id": payload["resume_version_id"],
-        "resume_format": payload["resume_format"],
-        "resume_filename": payload["resume_filename"],
-        "resume_file_path": payload["resume_file_path"],
-        "job": payload["job"],
-        "status": payload.get("initial_status", "draft"),
-        "notes": payload.get("notes") or None,
-        "created_at": created_at,
-        "updated_at": created_at,
+
+def record_application(job: dict, profile: dict, cover_letter: str = "", cold_email: str = "") -> dict:
+    apps = _load()
+    entry = {
+        "id":           str(uuid.uuid4()),
+        "job_title":    job.get("title", ""),
+        "company":      job.get("company", ""),
+        "job_url":      job.get("url", ""),
+        "candidate":    profile.get("candidate_name", ""),
+        "cover_letter": cover_letter,
+        "cold_email":   cold_email,
+        "fit_score":    job.get("fit_score", 0),
+        "sponsorship":  job.get("sponsorship_status", "unknown"),
+        "applied_at":   datetime.utcnow().isoformat(),
+        "status":       "sent",
     }
-
-    save_application(payload["candidate_email"], record)
-
-    return {
-        "application_id": application_id,
-        "candidate_email": payload["candidate_email"],
-        "candidate_name": payload["candidate_name"],
-        "resume_version_id": payload["resume_version_id"],
-        "resume_format": payload["resume_format"],
-        "resume_filename": payload["resume_filename"],
-        "resume_file_path": payload["resume_file_path"],
-        "job": payload["job"],
-        "status": record["status"],
-        "notes": record["notes"],
-        "created_at": created_at,
-        "updated_at": created_at,
-        "next_action": "review_or_submit_application",
-    }
+    apps.append(entry)
+    _save(apps)
+    return entry
 
 
-def get_applications_for_candidate(candidate_email: str) -> dict:
-    apps = list_applications(candidate_email)
-    apps = sorted(apps, key=lambda x: x["created_at"], reverse=True)
-
-    return {
-        "candidate_email": candidate_email,
-        "total_applications": len(apps),
-        "applications": apps,
-    }
+def get_all_applications() -> List[dict]:
+    return _load()
 
 
-def update_application_status(application_id: str, new_status: str, notes: str | None) -> dict:
-    record = get_application_by_id(application_id)
-    if not record:
-        raise ValueError("Application not found")
-
-    updated = dict(record)
-    updated["status"] = new_status
-    if notes:
-        updated["notes"] = notes
-    updated["updated_at"] = _now_iso()
-
-    update_application_record(application_id, updated)
-
-    return {
-        "application_id": application_id,
-        "candidate_email": updated["candidate_email"],
-        "status": updated["status"],
-        "updated_at": updated["updated_at"],
-        "notes": updated.get("notes"),
-        "next_action": "refresh_application_tracker",
-    }
+def update_application_status(app_id: str, status: str) -> dict:
+    apps = _load()
+    for a in apps:
+        if a["id"] == app_id:
+            a["status"]     = status
+            a["updated_at"] = datetime.utcnow().isoformat()
+    _save(apps)
+    return {"app_id": app_id, "status": status}

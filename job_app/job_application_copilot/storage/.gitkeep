@@ -1,0 +1,6 @@
+# This folder is intentionally tracked but empty.
+# At runtime it will contain:
+#   jobs.db          — SQLite database
+#   profile.json     — candidate profile
+#   reviewed_jobs.json
+#   applications.json
