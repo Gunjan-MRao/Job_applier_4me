@@ -52,27 +52,75 @@ ROLE_PATTERNS = [
     r"operations specialist",
 ]
 
-# Degree keywords
+# ---------------------------------------------------------------------------
+# Known CV section-header words — lines that are ONLY these words should
+# never be treated as a candidate name.
+# ---------------------------------------------------------------------------
+_SECTION_HEADER_WORDS = {
+    "profile", "summary", "objective", "overview",
+    "skills", "core skills", "key skills", "technical skills",
+    "experience", "work experience", "professional experience",
+    "employment", "employment history", "work history",
+    "education", "academic", "qualifications", "certifications",
+    "achievements", "accomplishments", "awards",
+    "references", "interests", "hobbies", "languages",
+    "contact", "personal details", "personal information",
+    "projects", "internship", "internships",
+    "responsibilities", "key responsibilities",
+    "career", "career history", "career objective",
+    "training", "courses", "about", "about me",
+}
+
+# ---------------------------------------------------------------------------
+# Degree patterns — anchored to avoid matching ordinary words that start
+# with 'b' or 'm'. Each pattern must also pass the _is_valid_degree() check.
+# ---------------------------------------------------------------------------
 DEGREE_PATTERNS = [
-    r"b\.?(?:sc|eng|tech|com|a)\.?\s*(?:in\s+)?[\w\s]{2,40}",
-    r"m\.?(?:sc|ba|eng|tech|com|a)\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    # B.Sc / BSc / B.Tech / BTech etc. — require word boundary + dot/slash after letter
+    r"\bb\.(?:sc|eng|tech|com|a)\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bbsc\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bb\.tech\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bbtech\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bbcom\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bbba\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    # M.Sc / MSc / M.Tech / MTech etc.
+    r"\bm\.(?:sc|ba|eng|tech|com|a)\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bmsc\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bm\.tech\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bmtech\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    r"\bmcom\.?\s*(?:in\s+)?[\w\s]{2,40}",
+    # Full word forms — these were already safe but kept for completeness
     r"bachelor(?:'s)?\s+(?:of\s+)?[\w\s]{2,40}",
     r"master(?:'s)?\s+(?:of\s+)?[\w\s]{2,40}",
-    r"mba",
-    r"phd|ph\.d",
-    r"pgdm",
+    r"\bmba\b",
+    r"\bphd\b|\bph\.d\.?",
+    r"\bpgdm\b",
     r"diploma\s+(?:in\s+)?[\w\s]{2,30}",
 ]
 
-# Section headers that signal start of EDUCATION — dates after these are NOT work experience
+# Degree keywords that MUST appear in any matched string for it to be kept.
+# Prevents accidental regex hits from being returned as education entries.
+_DEGREE_KEYWORDS = {
+    "bsc", "b.sc", "b.tech", "btech", "bcom", "bba",
+    "msc", "m.sc", "m.tech", "mtech", "mcom",
+    "bachelor", "master", "mba", "phd", "ph.d", "pgdm", "diploma",
+}
+
+# Section headers that signal start of EDUCATION — dates after these are NOT work experience.
+# Extended with 'training', 'certifications', 'courses' which are common in Indian/UK CVs.
 _EDUCATION_HEADERS = re.compile(
-    r"^\s*(?:education|academic|qualification|university|college|school|degree|study|studies)",
+    r"^\s*(?:education|academic|qualification|university|college|school"
+    r"|degree|study|studies|training|certifications?|courses?)",
     re.I | re.MULTILINE,
 )
 
-# Section headers that signal start of WORK EXPERIENCE
+# Section headers that signal start of WORK EXPERIENCE.
+# Extended with 'professional experience', 'work experience', 'key responsibilities',
+# 'relevant experience', 'internship' — all common in Indian/UK CV formats.
 _EXPERIENCE_HEADERS = re.compile(
-    r"^\s*(?:experience|employment|work history|career|professional background|positions?|roles?)",
+    r"^\s*(?:experience|employment|work history|work experience"
+    r"|professional experience|career|professional background"
+    r"|positions?|roles?|key responsibilities|relevant experience|internship)",
     re.I | re.MULTILINE,
 )
 
@@ -103,21 +151,67 @@ def _extract_email(text: str) -> Optional[str]:
     m = re.search(r"[\w.%+-]+@[\w.-]+\.[a-z]{2,}", text, re.I)
     return m.group(0) if m else None
 
+
 def _extract_phone(text: str) -> Optional[str]:
     m = re.search(r"(?:\+?\d[\s\-\(\)]{0,2}){9,13}", text)
     return m.group(0).strip() if m else None
 
+
 def _extract_name(text: str) -> Optional[str]:
+    """
+    Return the candidate's full name from the top of the CV.
+
+    Guards added (fixes 'CORE SKILLS' bug):
+    1. Skip lines whose stripped, lowercased value is in _SECTION_HEADER_WORDS.
+    2. Skip all-caps single-word / two-word lines (section headers are almost
+       always ALL CAPS in many CV templates, but real names are Title Case).
+    3. The line must contain at least one space (i.e. first + last name) OR be
+       a single word of ≥ 4 chars that is Title-cased (not all-caps).
+    4. Skip lines that are purely numeric or contain digits run together.
+    """
     for line in text.splitlines():
         line = line.strip()
-        if line and len(line) < 60 and not re.search(r"[@|http|www]", line, re.I):
-            if not re.search(r"(?:resume|curriculum|vitae|address|phone|email|linkedin)", line, re.I):
-                return line
+        if not line or len(line) > 60:
+            continue
+        # Skip lines with URLs / email addresses
+        if re.search(r"[@|http|www|linkedin|github]", line, re.I):
+            continue
+        # Skip known header keywords
+        if re.search(
+            r"(?:resume|curriculum|vitae|address|phone|email|mobile|tel"
+            r"|linkedin|github|profile|summary|objective|skills|education"
+            r"|experience|employment|work|career|references|contact|about)",
+            line, re.I,
+        ):
+            continue
+        # Skip if the whole line (normalised) is a known section header
+        if line.strip().lower() in _SECTION_HEADER_WORDS:
+            continue
+        # Skip pure numbers / lines with leading digits (dates, phone numbers)
+        if re.match(r"^[\d\s\-\+\(\)]+$", line):
+            continue
+        words = line.split()
+        # Skip single-word ALL-CAPS lines (section headers like 'PROFILE', 'SKILLS')
+        if len(words) <= 2 and line == line.upper() and any(c.isalpha() for c in line):
+            continue
+        # Must look like a name: either ≥2 words, or a single Title-Cased word ≥4 chars
+        if len(words) >= 2:
+            return line
+        if len(words) == 1 and len(line) >= 4 and line[0].isupper() and not line.isupper():
+            return line
     return None
+
+
+def _is_valid_degree(match: str) -> bool:
+    """Return True only if the matched string contains a recognisable degree keyword."""
+    ml = match.lower()
+    return any(kw in ml for kw in _DEGREE_KEYWORDS)
+
 
 def _extract_skills(text: str) -> List[str]:
     tl = text.lower()
     return [s for s in SKILLS_BANK if s in tl]
+
 
 def _extract_roles(text: str) -> List[str]:
     tl = text.lower()
@@ -130,16 +224,25 @@ def _extract_roles(text: str) -> List[str]:
                 found.append(role)
     return found[:6]
 
+
 def _extract_education(text: str) -> List[str]:
+    """
+    Extract degree / qualification strings.
+
+    Fix: all single-letter abbreviation patterns (b.sc, m.tech etc.) are now
+    anchored with \\b and require the abbreviation form (not just 'b' + any letter).
+    Every match is also validated through _is_valid_degree() to reject accidental
+    hits on words like 'Based', 'Business', 'Between', etc.
+    """
     tl = text.lower()
     found = []
     for pattern in DEGREE_PATTERNS:
-        matches = re.findall(pattern, tl)
-        for m in matches:
-            deg = m.strip().title()
-            if len(deg) > 3 and deg not in found:
+        for m in re.finditer(pattern, tl):
+            deg = m.group(0).strip().title()
+            if len(deg) > 3 and _is_valid_degree(deg) and deg not in found:
                 found.append(deg)
     return found[:3]
+
 
 def _get_work_section_only(text: str) -> str:
     """
@@ -147,16 +250,13 @@ def _get_work_section_only(text: str) -> str:
     work/experience section header, stopping at the next education
     section header.  Falls back to full text if no headers found.
     """
-    # Find all section boundary positions
     exp_matches = [(m.start(), "work") for m in _EXPERIENCE_HEADERS.finditer(text)]
     edu_matches = [(m.start(), "edu")  for m in _EDUCATION_HEADERS.finditer(text)]
     all_sections = sorted(exp_matches + edu_matches, key=lambda x: x[0])
 
     if not exp_matches:
-        # No explicit experience header — use full text but exclude education blocks
         if not edu_matches:
             return text
-        # Chop off everything from first education header
         edu_start = min(p for p, _ in edu_matches)
         return text[:edu_start]
 
@@ -164,11 +264,8 @@ def _get_work_section_only(text: str) -> str:
     for i, (pos, kind) in enumerate(all_sections):
         if kind != "work":
             continue
-        # Find where this work section ends (next section of any type)
         next_pos = all_sections[i + 1][0] if i + 1 < len(all_sections) else len(text)
-        chunk = text[pos:next_pos]
-        # Skip if the chunk contains an education boundary at its start
-        work_chunks.append(chunk)
+        work_chunks.append(text[pos:next_pos])
 
     return "\n".join(work_chunks) if work_chunks else text
 
@@ -204,17 +301,16 @@ def _extract_years_experience(text: str) -> Optional[str]:
     now = datetime.utcnow()
 
     date_range_pattern = re.compile(
-        r"(?:(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-        r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+        r"(?:(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?"
+        r"|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
         r"[\s,]*)?\s*(\d{4})\s*[-\u2013\u2014to]+\s*"
-        r"(?:(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-        r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)?"
+        r"(?:(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?"
+        r"|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)?"
         r"[\s,]*\s*(\d{4}|present|current|now|date|till date|to date))",
         re.I,
     )
 
-    intervals = []  # list of (start_month_index, end_month_index)
-
+    intervals = []
     for m in date_range_pattern.finditer(work_text):
         start_month_str, start_year, end_month_str, end_year_str = m.groups()
         try:
@@ -235,14 +331,13 @@ def _extract_years_experience(text: str) -> Optional[str]:
             continue
 
     if intervals:
-        # Merge overlapping intervals to avoid double-counting parallel roles
         intervals.sort()
-        merged = [intervals[0]]
+        merged = [list(intervals[0])]
         for s, e in intervals[1:]:
             if s <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                merged[-1][1] = max(merged[-1][1], e)
             else:
-                merged.append((s, e))
+                merged.append([s, e])
         total_months = sum(e - s for s, e in merged)
         years = total_months // 12
         months_rem = total_months % 12
@@ -252,14 +347,15 @@ def _extract_years_experience(text: str) -> Optional[str]:
             return f"~1 year {months_rem}mo"
         return f"~{years} years"
 
-    # --- Step 3: fallback — distinct work years in work section ---
+    # --- Step 3: fallback --- distinct work years in work section ---
     work_years = set(re.findall(r"\b(20[0-9]{2})\b", work_text))
     if len(work_years) >= 3:
-        return "2–4 years (estimated)"
+        return "2-4 years (estimated)"
     if len(work_years) >= 1:
-        return "1–2 years (estimated)"
+        return "1-2 years (estimated)"
 
     return "Graduate / Fresher"
+
 
 # ---------------------------------------------------------------------------
 # Main profile builder
