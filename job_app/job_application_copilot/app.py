@@ -1,12 +1,10 @@
 """
-Job Application Copilot — Streamlit frontend v4
+Job Application Copilot — Streamlit frontend v5
 
-What changed:
-- max_jobs removed everywhere — scans unlimited jobs
-- AI Agent tab shows live cover letters + cold emails per job as they come in
-- Resume upload works without backend (local parse)
-- Backend start handles spaces in Python path
-- Health tab shows startup log + per-package status
+Fixes:
+- AI Agent tab always shows the launch form (was hidden when status==idle)
+- Gemini API key status shown in agent tab
+- Smart idle state message instead of silent blank screen
 """
 import os
 import signal
@@ -282,9 +280,8 @@ def _agent(config):
 
         if state in ("completed", "failed"):
             with AGENT_LOCK:
-                AGENT.update({"running": False,
-                              "summary": data.get("result_summary")})
-            _alog(f"✅ {'Done' if state=='completed' else 'Failed'}: {scanned} scanned, {applied} processed")
+                AGENT.update({"running": False, "summary": data.get("result_summary")})
+            _alog(f"{'Done' if state=='completed' else 'Failed'}: {scanned} scanned, {applied} processed")
             if top:
                 for m in top[:5]:
                     _alog(f"  ★ {m.get('title')} @ {m.get('company')} — {m.get('fit_score')}%")
@@ -352,20 +349,36 @@ def tab_setup():
 
 def tab_agent():
     st.subheader("🤖 AI Agent")
-    st.write(
-        "One click — the agent starts the backend if needed, scrapes **every job** from "
-        "LinkedIn / Indeed / Glassdoor / Reed / NHS / GOV.UK and more (no cap), "
-        "scores each one against your resume, and for every match **immediately** generates "
-        "a tailored resume, a cover letter, and a personalised cold email to the recruiter."
-    )
 
     p = st.session_state.get("resume_profile") or {}
+
+    # — Status bar at the top —
+    col_be, col_gem = st.columns(2)
+    be_status, _ = backend_status_info()
+    col_be.info(f"🟢 Backend: **{be_status}**" if be_status == "Running"
+                else f"🔴 Backend: **{be_status}** — the agent will start it automatically")
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    # also try reading from .env file directly
+    env_file = BASE_DIR / ".env"
+    if not gemini_key and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("GEMINI_API_KEY="):
+                gemini_key = line.split("=", 1)[1].strip()
+                break
+    if gemini_key:
+        col_gem.success("✅ Gemini API key configured — AI cover letters enabled")
+    else:
+        col_gem.warning("⚠️ No Gemini key in .env — will use smart offline templates")
+
     if not p:
-        st.warning("⚠️ No resume loaded — go to **⚙️ Setup** first for best results.")
+        st.warning("⚠️ No resume loaded — go to **⚙️ Setup** first for best results. "
+                   "You can still run the agent with manual keywords below.")
 
     default_kw = ", ".join((p.get("likely_roles") or []) + (p.get("skills") or [])
                            ) or "logistics, supply chain, operations"
 
+    # — Launch form — always visible —
     with st.form("agent_form"):
         c1, c2 = st.columns(2)
         keywords = c1.text_input("Keywords (auto-filled from your CV)", value=default_kw)
@@ -397,18 +410,17 @@ def tab_agent():
             }
             with AGENT_LOCK: AGENT.clear()
             launch_agent(cfg)
-            st.success("🤖 Agent launched! Live updates below.")
+            st.success("🤖 Agent launched! Live updates below — results appear as each job is found.")
             time.sleep(1)
             st.rerun()
 
-    # Live status
+    # — Live status (only shown after agent has been started) —
     with AGENT_LOCK:
         running   = AGENT.get("running", False)
         status    = AGENT.get("status", "idle")
         prog      = AGENT.get("progress", 0)
         stage     = AGENT.get("stage", "")
         log       = list(AGENT.get("log", []))
-        matches   = list(AGENT.get("top_matches", []))
         aj        = list(AGENT.get("applied_jobs", []))
         scanned   = AGENT.get("scanned", 0)
         matched   = AGENT.get("matched", 0)
@@ -416,6 +428,9 @@ def tab_agent():
         summary   = AGENT.get("summary")
 
     if status == "idle":
+        st.markdown("---")
+        st.info("👆 Fill in your keywords and click **Start AI Agent** to begin. "
+                "The agent will scan thousands of jobs and prepare applications automatically.")
         return
 
     st.markdown("---")
@@ -431,7 +446,7 @@ def tab_agent():
     # Applied jobs — show cover letter + cold email inline
     if aj:
         st.markdown(f"### 📨 Processed jobs ({len(aj)}) — live feed")
-        for job in reversed(aj[-30:]):   # most recent first
+        for job in reversed(aj[-30:]):
             with st.expander(
                 f"★ {job.get('fit_score',0)}% | {job.get('title','?')} @ {job.get('company','?')} "
                 f"| {job.get('sponsorship_status','')} | {job.get('source','')}",
@@ -441,13 +456,13 @@ def tab_agent():
                     st.link_button("🔗 View job", job["url"])
 
                 if job.get("cover_letter"):
-                    st.markdown("**📝 Cover Letter:**")
+                    st.markdown("📝 **Cover Letter:**")
                     st.text_area("Cover letter", value=job["cover_letter"],
                                  height=220, disabled=False,
                                  key=f"cl_{job.get('url','')}{job.get('title','')}")
 
                 if job.get("cold_email"):
-                    st.markdown("**📧 Cold Email to Recruiter:**")
+                    st.markdown("📧 **Cold Email to Recruiter:**")
                     st.text_area("Cold email", value=job["cold_email"],
                                  height=180, disabled=False,
                                  key=f"ce_{job.get('url','')}{job.get('title','')}")
@@ -543,8 +558,7 @@ def tab_health():
     if status != "Running" and LOG_FILE.exists():
         log = LOG_FILE.read_text(encoding="utf-8", errors="replace")
         if log.strip():
-            with st.expander("📔 Backend startup log — this tells you exactly what crashed",
-                             expanded=True):
+            with st.expander("📔 Backend startup log", expanded=True):
                 st.code(log[-3000:], language="")
 
     st.markdown("### Package checks")
