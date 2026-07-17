@@ -1,0 +1,42 @@
+# Core
+fastapi
+uvicorn[standard]
+pydantic[email]
+sqlalchemy
+aiofiles
+httpx
+requests
+python-dotenv
+
+# Resume parsing
+pypdf
+python-docx
+
+# Job scraping
+python-jobspy
+beautifulsoup4
+lxml
+
+# Stealth browser (anti-Cloudflare)
+playwright
+playwright-stealth
+
+# AI providers
+openai
+anthropicai
+google-generativeai
+
+# Lead finder (optional — add keys to .env)
+# hunter-python  # or just use requests directly
+
+# Email
+# (smtplib is stdlib — no extra package needed)
+
+# Reporting
+reportlab
+openpyxl
+pandas
+
+# Dev / test
+pytest
+pytest-asyncio
