@@ -24,15 +24,25 @@ except ImportError:
 
 
 class _Settings:
-    gemini_api_key:   str = os.getenv("GEMINI_API_KEY",   "")
-    openai_api_key:   str = os.getenv("OPENAI_API_KEY",   "")
-    anthropic_api_key:str = os.getenv("ANTHROPIC_API_KEY","")
-    hunter_api_key:   str = os.getenv("HUNTER_API_KEY",   "")
-    apollo_api_key:   str = os.getenv("APOLLO_API_KEY",   "")
-    email_address:    str = os.getenv("EMAIL_ADDRESS",     "")
-    email_password:   str = os.getenv("EMAIL_PASSWORD",    "")
-    smtp_host:        str = os.getenv("SMTP_HOST",         "smtp.gmail.com")
-    smtp_port:        int = int(os.getenv("SMTP_PORT",     "465"))
+    # App metadata
+    app_name:          str  = os.getenv("APP_NAME",  "Job Application Copilot")
+    app_env:           str  = os.getenv("APP_ENV",   "development")
+    debug:             bool = os.getenv("DEBUG",     "false").lower() == "true"
+
+    # AI providers
+    gemini_api_key:    str = os.getenv("GEMINI_API_KEY",    "")
+    openai_api_key:    str = os.getenv("OPENAI_API_KEY",    "")
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+
+    # Lead finder
+    hunter_api_key:    str = os.getenv("HUNTER_API_KEY",    "")
+    apollo_api_key:    str = os.getenv("APOLLO_API_KEY",    "")
+
+    # Email / SMTP
+    email_address:     str = os.getenv("EMAIL_ADDRESS",  "")
+    email_password:    str = os.getenv("EMAIL_PASSWORD", "")
+    smtp_host:         str = os.getenv("SMTP_HOST",      "smtp.gmail.com")
+    smtp_port:         int = int(os.getenv("SMTP_PORT",  "465"))
 
 
 settings = _Settings()
