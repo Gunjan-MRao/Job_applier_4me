@@ -1,31 +1,18 @@
 """
-Job Application Copilot — Streamlit frontend v9.6
+Job Application Copilot — Streamlit frontend v9.7
+
+v9.7 — fix DeltaGenerator docstring dump
+  Root cause: ternary expressions like
+      col.info("...") if cond else col.warning("...")
+  return DeltaGenerator objects.  When these appear as bare expressions
+  Streamlit's exec() receives a non-None return value and calls help() on
+  it, printing the entire DeltaGenerator docstring to the UI.
+
+  Fix: replaced every bare ternary col.X() if … else col.Y() with
+  explicit if/else blocks so no value is ever returned to the exec frame.
 
 v9.6 — throttled polling (fixes burst-hammer on /automation/status)
-  Root cause of 50+ status requests per minute:
-  `<meta http-equiv="refresh">` fires a browser reload every N seconds,
-  but Streamlit also triggers internal reruns (widget interactions,
-  session_state writes, etc.).  When both fire close together the status
-  endpoint gets hit in rapid bursts (20+ per second seen in logs).
-
-  Fix: lightweight time-based gate.  _poll_status() now checks
-  `st.session_state["_last_poll_ts"]` and skips the HTTP call if the
-  last poll was less than POLL_THROTTLE_S seconds ago, returning the
-  cached payload instead.  The meta-refresh interval is raised to 5 s so
-  the UI still updates promptly but the backend only sees ~1 req/5 s.
-
 v9.5 — complete dashboard polling rewrite
-  Root cause of 'no dashboard' across all previous versions:
-  _AGENT module-level dict + background thread pattern is unreliable
-  with Streamlit's rerun model. _sync_agent_state() could copy a stale
-  'idle' value before the thread updated _AGENT, causing the dashboard
-  guard to fire every single rerun.
-
-  Fix: session_state is now the single source of truth.
-  - agent_launched flag (persists across reruns) controls dashboard visibility
-  - run_id stored in session_state once backend responds
-  - Every rerun polls /automation/status directly (synchronous, fast)
-  - No race condition possible: poll happens in main thread before render
 """
 import asyncio
 import os
@@ -74,13 +61,7 @@ DEFAULT_KEYWORDS = (
     "business analyst supply chain, category analyst"
 )
 
-# Browser meta-refresh interval while the agent is running (seconds).
-# Raised from 3 → 5 so the browser doesn't trigger extra Streamlit reruns
-# that would otherwise stack with internal reruns and hammer the status endpoint.
-AUTO_REFRESH_S = 5
-
-# Minimum gap between real HTTP calls to /automation/status.
-# Any Streamlit rerun that lands within this window returns the cached payload.
+AUTO_REFRESH_S  = 5
 POLL_THROTTLE_S = 4.0
 
 
@@ -339,10 +320,6 @@ def _sidebar_name(p, filename):
 # ---------------------------------------------------------------------------
 
 def _launch_agent_thread(cfg: dict):
-    """Background thread: start backend if needed, call /automation/start,
-    then store run_id into session_state via a shared plain dict.
-    All Streamlit session_state writes happen only in the main thread
-    (picked up on next rerun via _PENDING)."""
     global _PENDING
     _PENDING["stage"] = "⚙️ Starting backend..."
     if not is_port_open():
@@ -363,7 +340,6 @@ def _launch_agent_thread(cfg: dict):
     _PENDING["done"]   = True
 
 
-# Module-level dict for inter-thread communication (no Streamlit calls)
 _PENDING: dict = {"done": False, "run_id": None, "error": None, "stage": ""}
 
 
@@ -373,22 +349,15 @@ def _reset_pending():
 
 
 # ---------------------------------------------------------------------------
-# Core polling — throttled to at most 1 real HTTP call per POLL_THROTTLE_S
+# Core polling — throttled
 # ---------------------------------------------------------------------------
 
 def _poll_status(run_id: str) -> dict:
-    """Synchronous poll of /automation/status/{run_id}.
-
-    Throttled: if the last successful poll was less than POLL_THROTTLE_S ago,
-    the cached payload is returned immediately without an HTTP call.
-    Returns the status dict or an error dict.
-    """
-    now = time.monotonic()
-    last_ts    = st.session_state.get("_last_poll_ts", 0.0)
-    cached     = st.session_state.get("_last_poll_data")
+    now     = time.monotonic()
+    last_ts = st.session_state.get("_last_poll_ts", 0.0)
+    cached  = st.session_state.get("_last_poll_data")
 
     if cached is not None and (now - last_ts) < POLL_THROTTLE_S:
-        # Still within throttle window — return cached data, no HTTP call
         return cached
 
     data, err = _get(f"/automation/status/{run_id}", timeout=8)
@@ -490,7 +459,7 @@ def tab_setup():
 
 
 # ---------------------------------------------------------------------------
-# Tab: AI Agent  (throttled polling architecture)
+# Tab: AI Agent
 # ---------------------------------------------------------------------------
 
 def tab_agent():
@@ -498,10 +467,18 @@ def tab_agent():
     p = st.session_state.get("resume_profile") or {}
 
     # ── Backend / API key status row ──────────────────────────────────────
+    # NOTE: use explicit if/else — never ternary on st.* calls.
+    # Ternary returns the DeltaGenerator object which Streamlit's exec()
+    # treats as an expression result and calls help() on it, dumping the
+    # entire class docstring to the UI.
     col_be, col_gem = st.columns(2)
-    be_status, _   = backend_status_info()
-    col_be.info("🟢 Backend: **Running**") if be_status == "Running" else \
-        col_be.warning(f"🔴 Backend: **{be_status}** — agent will start it automatically")
+    be_status, _    = backend_status_info()
+
+    with col_be:
+        if be_status == "Running":
+            st.info("🟢 Backend: **Running**")
+        else:
+            st.warning(f"🔴 Backend: **{be_status}** — agent will start it automatically")
 
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     env_file   = BASE_DIR / ".env"
@@ -510,8 +487,12 @@ def tab_agent():
             if line.strip().startswith("GEMINI_API_KEY="):
                 gemini_key = line.split("=", 1)[1].strip()
                 break
-    col_gem.success("✅ Gemini API key — AI cover letters enabled") if gemini_key else \
-        col_gem.warning("⚠️ No Gemini key — using smart offline templates")
+
+    with col_gem:
+        if gemini_key:
+            st.success("✅ Gemini API key — AI cover letters enabled")
+        else:
+            st.warning("⚠️ No Gemini key — using smart offline templates")
 
     if not p:
         st.warning("⚠️ No resume loaded — go to **⚙️ Setup** first for best results.")
@@ -546,13 +527,11 @@ def tab_agent():
                 "company_blacklist": [x.strip() for x in blacklist.split(",") if x.strip()],
                 "company_whitelist": [x.strip() for x in whitelist.split(",") if x.strip()],
             }
-            # Mark as launched FIRST so the dashboard shows on this rerun
             st.session_state["agent_launched"] = True
             st.session_state["run_id"]         = None
             st.session_state["agent_status"]   = "starting"
             st.session_state["agent_stage"]    = "⚙️ Connecting to backend..."
             st.session_state["agent_cfg"]      = cfg
-            # Clear poll cache so first real poll fires immediately
             st.session_state.pop("_last_poll_ts",   None)
             st.session_state.pop("_last_poll_data", None)
             _reset_pending()
@@ -574,7 +553,6 @@ def tab_agent():
     # ── Dashboard ─────────────────────────────────────────────────────────
     st.markdown("---")
 
-    # Pick up run_id from background thread if it just finished starting
     if _PENDING["done"] and not st.session_state.get("run_id"):
         if _PENDING.get("error"):
             st.session_state["agent_status"] = "failed"
@@ -584,11 +562,9 @@ def tab_agent():
             st.session_state["agent_status"] = "running"
             st.session_state["agent_stage"]  = "🔍 Scanning job boards..."
 
-    # Show live stage while still connecting (no run_id yet)
     if not st.session_state.get("run_id") and st.session_state.get("agent_status") != "failed":
         stage = _PENDING.get("stage") or st.session_state.get("agent_stage") or "Starting..."
         st.info(f"⏳ {stage}")
-        # Auto-refresh every 2 s while connecting (short window, no run_id to poll)
         st.markdown(
             f'<meta http-equiv="refresh" content="2">',
             unsafe_allow_html=True,
@@ -597,7 +573,6 @@ def tab_agent():
 
     run_id = st.session_state.get("run_id", "")
 
-    # ── Throttled poll (main thread, at most 1 HTTP call per POLL_THROTTLE_S) ──
     if run_id:
         data = _poll_status(run_id)
         applied_jobs  = data.get("applied_jobs") or []
@@ -626,7 +601,6 @@ def tab_agent():
     summary       = st.session_state.get("agent_summary")
     running       = status not in ("completed", "failed", "unknown")
 
-    # ── Status bar ────────────────────────────────────────────────────────
     r1c1, r1c2 = st.columns([1, 3])
     r1c1.markdown(f"**Status:** {status_pill(status)}", unsafe_allow_html=True)
     if stage:
@@ -635,26 +609,26 @@ def tab_agent():
     if current_url and running:
         st.caption(f"⏳ Scanning: {current_url[:90]}")
 
-    # ── Metrics ───────────────────────────────────────────────────────────
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("🔍 Jobs Found",   scanned)
     mc2.metric("✅ Matched",       matched)
     mc3.metric("📤 Applications", applied_count)
     mc4.metric("⚠️ Needs Review",  sum(1 for j in aj if not j.get("cover_letter")))
 
-    # ── Live source feed ──────────────────────────────────────────────────
     st.markdown("#### 📶 Live source feed")
     source_cols = st.columns(len(SOURCE_ICONS))
     for i, (src, icon) in enumerate(SOURCE_ICONS.items()):
         cnt = source_counts.get(src, 0)
         with source_cols[i]:
-            if cnt > 0:   st.success(f"{icon}\n\n**{cnt}**")
-            elif running: st.info(f"{icon}\n\n*...*")
-            else:         st.caption(icon)
+            if cnt > 0:
+                st.success(f"{icon}\n\n**{cnt}**")
+            elif running:
+                st.info(f"{icon}\n\n*...*")
+            else:
+                st.caption(icon)
 
     st.markdown("---")
 
-    # ── Job cards ─────────────────────────────────────────────────────────
     needs_review = [j for j in aj if not j.get("cover_letter")]
     ready        = [j for j in aj if j.get("cover_letter")]
     if needs_review:
@@ -667,7 +641,6 @@ def tab_agent():
         for job in reversed(ready[-50:]):
             _render_job_card(job, review_mode=False)
 
-    # ── Agent log expander ────────────────────────────────────────────────
     log = st.session_state.get("agent_log", [])
     with st.expander("📝 Agent log", expanded=running):
         if log:
@@ -680,7 +653,6 @@ def tab_agent():
         with st.expander("📈 Final summary"):
             st.json(summary)
 
-    # ── Auto-refresh / finish buttons ─────────────────────────────────────
     if running:
         st.markdown(
             f'<meta http-equiv="refresh" content="{AUTO_REFRESH_S}">',
@@ -833,7 +805,6 @@ def tab_debate():
         f'background:{tier_colour}22;border:1px solid {tier_colour}55;margin-bottom:16px">'
         f'<span style="color:{tier_colour};font-weight:700">{tier_label}</span>'
         f' | {govuk_html}</div>', unsafe_allow_html=True)
-    # Synthesis
     st.markdown("### 🎯 Final Verdict")
     consensus = result.get("consensus_confidence")
     synthesis = result.get("synthesis", "")
@@ -868,7 +839,6 @@ def tab_debate():
                             unsafe_allow_html=True)
                 st.markdown(opinion)
                 st.markdown(_confidence_bar(confidence, "Confidence: "), unsafe_allow_html=True)
-    # ATS / outreach / schedule
     ats = result.get("ats_bypass") or {}
     if ats:
         with st.expander("🤖 ATS Bypass Tip", expanded=True):
@@ -1019,14 +989,21 @@ def main():
         st.markdown(f"**Backend:** :{color}[{status}]")
         st.caption(detail)
         c1, c2 = st.columns(2)
+        # Explicit if/else — never ternary on st.* calls
         if c1.button("▶ Start", use_container_width=True):
             with st.spinner("Starting..."):
                 ok, msg = start_backend()
-            st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
             st.rerun()
         if c2.button("■ Stop", use_container_width=True):
             ok, msg = stop_backend()
-            st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
             st.rerun()
         st.markdown("---")
         st.session_state.candidate_email = st.text_input(
