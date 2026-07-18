@@ -3,30 +3,43 @@
 ## 1. Pull latest code
 In GitHub Desktop: **Fetch origin** → **Pull origin**
 
-## 2. Open a terminal in the project folder
-In GitHub Desktop: **Repository → Open in Command Prompt**
-
-Then:
+## 2. Create the `jobcopilot` conda environment (once)
+Open the **Anaconda Prompt** and run:
 ```
+conda create -n jobcopilot python=3.12 -y
+conda activate jobcopilot
 cd job_app\job_application_copilot
-```
-
-## 3. Install all packages
-```
 pip install -r requirements.txt
+copy .env.example .env
 ```
 
-If you see errors about jobspy or openai:
+> The environment **must** be named `jobcopilot` — the launcher activates that
+> exact name. If it is missing, `launch_app.bat` prints the command above.
+
+## 3. Run the app — just double-click `launch_app.bat`
+In `job_app\job_application_copilot\`, double-click **`launch_app.bat`**. It:
+
+1. activates the `jobcopilot` environment,
+2. checks/installs dependencies,
+3. starts the backend API and **waits until it is healthy**,
+4. starts Streamlit and opens your browser at http://localhost:8501.
+
+If anything fails, the window stays open with a clear error (it will not flash
+and close). A separate "JobCopilot Backend" window shows the API log, also saved
+to `backend_startup.log`.
+
+**Not on plain Windows cmd?** (macOS / Linux / Git-Bash) run the same steps via:
 ```
-pip install python-jobspy openai anthropic pypdf python-docx
+./launch_app.sh
 ```
 
-## 4. Run the app
+**Manual fallback** (if the launcher misbehaves):
 ```
-streamlit run app.py
+conda activate jobcopilot
+cd job_app\job_application_copilot
+uvicorn backend.main:app --reload    (in one terminal)
+streamlit run app.py                 (in another terminal)
 ```
-
-The browser will open automatically at http://localhost:8501
 
 ## 5. How to use it
 
@@ -44,8 +57,18 @@ The browser will open automatically at http://localhost:8501
 
 ## Troubleshooting
 
+**Launcher says it can't activate `jobcopilot`?**
+- The env doesn't exist yet. Run: `conda create -n jobcopilot python=3.12 -y`
+  then `conda activate jobcopilot` and `pip install -r requirements.txt`.
+
+**Launcher says it can't find conda?**
+- Open the **Anaconda Prompt** once and run `conda init cmd.exe`, then close and
+  re-run `launch_app.bat`.
+
 **Backend won't start?**
-- Go to the 🩺 Health tab — it shows the startup log with the exact error
+- Look at the "JobCopilot Backend" window the launcher opened — the exact error
+  is printed there (and in `backend_startup.log`).
+- Or open the 🩺 Health tab — it shows the startup log with the exact error.
 - Most common cause: missing packages. Run `pip install -r requirements.txt` again.
 
 **Resume not parsing?**

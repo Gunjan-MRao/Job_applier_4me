@@ -1,7 +1,12 @@
 @echo off
 setlocal enabledelayedexpansion
 
+REM Anchor to this script's own folder, no matter where it is double-clicked from.
 cd /d "%~dp0"
+
+set "ENV_NAME=jobcopilot"
+set "API_PORT=8000"
+set "UI_PORT=8501"
 
 echo ============================================================
 echo  Job Application Copilot -- launcher
@@ -9,140 +14,173 @@ echo ============================================================
 echo.
 
 REM ============================================================
-REM  STEP 0 -- Find Python, trying every common Windows location
+REM  STEP 0 -- Activate the "jobcopilot" Anaconda environment
 REM ============================================================
-set PYTHON_EXE=
+echo [0/4] Activating conda environment "%ENV_NAME%"...
 
-REM Try 1: py launcher (most reliable on Windows)
-where py >nul 2>&1
-if %errorlevel% equ 0 (
-    for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set PYTHON_EXE=%%i
+set "CONDA_ACT="
+
+REM (a) If conda is already initialised in this shell, CONDA_EXE points at it.
+if defined CONDA_EXE (
+    for %%I in ("%CONDA_EXE%") do (
+        if exist "%%~dpI..\Scripts\activate.bat" set "CONDA_ACT=%%~dpI..\Scripts\activate.bat"
+    )
 )
 
-REM Try 2: python on PATH
-if "!PYTHON_EXE!"=="" (
-    where python >nul 2>&1
-    if !errorlevel! equ 0 (
-        for /f "delims=" %%i in ('where python 2^>nul') do (
-            if "!PYTHON_EXE!"=="" set PYTHON_EXE=%%i
+REM (b) Otherwise look for conda on PATH and derive activate.bat next to it.
+if not defined CONDA_ACT (
+    for /f "delims=" %%i in ('where conda 2^>nul') do (
+        if not defined CONDA_ACT (
+            if exist "%%~dpi..\Scripts\activate.bat" set "CONDA_ACT=%%~dpi..\Scripts\activate.bat"
         )
     )
 )
 
-REM Try 3: python3 on PATH
-if "!PYTHON_EXE!"=="" (
-    where python3 >nul 2>&1
-    if !errorlevel! equ 0 (
-        for /f "delims=" %%i in ('where python3 2^>nul') do (
-            if "!PYTHON_EXE!"=="" set PYTHON_EXE=%%i
+REM (c) Fall back to the usual Anaconda / Miniconda install locations.
+if not defined CONDA_ACT (
+    for %%D in (
+        "%USERPROFILE%\anaconda3"
+        "%USERPROFILE%\miniconda3"
+        "%USERPROFILE%\Anaconda3"
+        "%USERPROFILE%\Miniconda3"
+        "%LOCALAPPDATA%\anaconda3"
+        "%LOCALAPPDATA%\miniconda3"
+        "%LOCALAPPDATA%\Continuum\anaconda3"
+        "%ProgramData%\anaconda3"
+        "%ProgramData%\miniconda3"
+        "%ProgramData%\Anaconda3"
+        "%ProgramData%\Miniconda3"
+        "C:\anaconda3"
+        "C:\miniconda3"
+    ) do (
+        if not defined CONDA_ACT (
+            if exist "%%~D\Scripts\activate.bat" set "CONDA_ACT=%%~D\Scripts\activate.bat"
         )
     )
 )
 
-REM Try 4: Windows Store / AppData installs (Python 3.13 down to 3.9)
-if "!PYTHON_EXE!"=="" (
-    for %%V in (3.13 3.12 3.11 3.10 3.9) do (
-        if "!PYTHON_EXE!"=="" (
-            if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" (
-                set PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe
-            )
-        )
-        if "!PYTHON_EXE!"=="" (
-            REM strip the dot to get folder name like Python313
-            set VV=%%V
-            set VV=!VV:.=!
-            if exist "%LOCALAPPDATA%\Programs\Python\Python!VV!\python.exe" (
-                set PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python!VV!\python.exe
-            )
-        )
-    )
-)
-
-REM Try 5: Program Files installs
-if "!PYTHON_EXE!"=="" (
-    for %%V in (313 312 311 310 39) do (
-        if "!PYTHON_EXE!"=="" (
-            if exist "%ProgramFiles%\Python%%V\python.exe" (
-                set PYTHON_EXE=%ProgramFiles%\Python%%V\python.exe
-            )
-        )
-    )
-)
-
-REM Try 6: Anaconda / Miniconda (user)
-if "!PYTHON_EXE!"=="" (
-    for %%D in (anaconda3 miniconda3 anaconda miniconda) do (
-        if "!PYTHON_EXE!"=="" (
-            if exist "%USERPROFILE%\%%D\python.exe" (
-                set PYTHON_EXE=%USERPROFILE%\%%D\python.exe
-            )
-        )
-    )
-)
-
-REM Try 7: Anaconda / Miniconda (system)
-if "!PYTHON_EXE!"=="" (
-    for %%D in (anaconda3 miniconda3) do (
-        if "!PYTHON_EXE!"=="" (
-            if exist "C:\%%D\python.exe" set PYTHON_EXE=C:\%%D\python.exe
-            if exist "%ProgramData%\%%D\python.exe" set PYTHON_EXE=%ProgramData%\%%D\python.exe
-        )
-    )
-)
-
-if "!PYTHON_EXE!"=="" (
+if not defined CONDA_ACT (
     echo.
-    echo [ERROR] Could not find Python anywhere on this machine.
+    echo [ERROR] Could not find Anaconda / Miniconda on this machine.
     echo.
-    echo  Please install Python 3.10+ from https://www.python.org/downloads/
-    echo  and make sure to tick "Add Python to PATH" during setup.
+    echo   Install Miniconda from:
+    echo       https://docs.conda.io/en/latest/miniconda.html
     echo.
-    echo  If Python IS installed, open a new Command Prompt and run:
-    echo      python --version
-    echo  to confirm it is on PATH, then re-run this launcher.
+    echo   If conda IS installed but not found, open the "Anaconda Prompt",
+    echo   run:   conda init cmd.exe
+    echo   then close and re-run this launcher.
     echo.
     pause
     exit /b 1
 )
 
-echo Found Python: !PYTHON_EXE!
-echo.
+echo       Found conda: !CONDA_ACT!
 
-REM ============================================================
-REM  STEP 1 -- Install / upgrade dependencies
-REM ============================================================
-echo [1/3] Installing / upgrading dependencies...
-"!PYTHON_EXE!" -m pip install -q --upgrade pip
-"!PYTHON_EXE!" -m pip install -q -r requirements.txt
-if %errorlevel% neq 0 (
-    echo [ERROR] pip install failed. Check your internet connection.
+REM Activate the named environment. The classic "activate.bat <env>" form works
+REM from a plain .bat and sets CONDA_DEFAULT_ENV when it succeeds.
+call "!CONDA_ACT!" %ENV_NAME%
+
+if not "!CONDA_DEFAULT_ENV!"=="%ENV_NAME%" (
+    echo.
+    echo [ERROR] Could not activate the conda environment "%ENV_NAME%".
+    echo.
+    echo   Create it once with these two commands in an Anaconda Prompt:
+    echo       conda create -n %ENV_NAME% python=3.12 -y
+    echo       conda activate %ENV_NAME%
+    echo       pip install -r requirements.txt
+    echo.
+    echo   Then double-click this launcher again.
+    echo.
     pause
     exit /b 1
 )
-echo       Done.
+
+REM Resolve the environment's python.exe (full path, for clear messages).
+set "PYTHON_EXE=python"
+for /f "delims=" %%i in ('python -c "import sys;print(sys.executable)" 2^>nul') do set "PYTHON_EXE=%%i"
+echo       Active env: !CONDA_DEFAULT_ENV!
+echo       Python:     !PYTHON_EXE!
 echo.
 
 REM ============================================================
-REM  STEP 2 -- Kill any old Streamlit on port 8501
+REM  STEP 1 -- Verify / install dependencies
 REM ============================================================
-echo [2/3] Clearing old Streamlit process on port 8501 (if any)...
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":8501 "') do (
-    taskkill /PID %%a /F >nul 2>&1
+echo [1/4] Checking dependencies...
+python -c "import streamlit, fastapi, uvicorn" >nul 2>&1
+if !errorlevel! neq 0 (
+    echo       Some packages are missing -- installing from requirements.txt ...
+    python -m pip install -q --upgrade pip
+    python -m pip install -r requirements.txt
+    if !errorlevel! neq 0 (
+        echo.
+        echo [ERROR] pip install failed.
+        echo   Check your internet connection, then run manually:
+        echo       python -m pip install -r requirements.txt
+        echo.
+        pause
+        exit /b 1
+    )
+    REM Re-check after install.
+    python -c "import streamlit, fastapi, uvicorn" >nul 2>&1
+    if !errorlevel! neq 0 (
+        echo.
+        echo [ERROR] Required packages still not importable after install.
+        echo   Try:  python -m pip install -r requirements.txt
+        echo.
+        pause
+        exit /b 1
+    )
 )
+echo       Dependencies OK.
+echo.
+
+REM ============================================================
+REM  STEP 2 -- Free ports 8000 (backend) and 8501 (UI)
+REM ============================================================
+echo [2/4] Clearing old processes on ports %API_PORT% and %UI_PORT% (if any)...
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":%API_PORT% "') do taskkill /PID %%a /F >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":%UI_PORT% "')  do taskkill /PID %%a /F >nul 2>&1
 echo       Done.
 echo.
 
 REM ============================================================
-REM  STEP 3 -- Launch Streamlit
+REM  STEP 3 -- Start the FastAPI backend and WAIT until healthy
 REM ============================================================
-echo [3/3] Starting Streamlit...
-echo       URL: http://localhost:8501
+echo [3/4] Starting backend API on http://127.0.0.1:%API_PORT% ...
+REM Launch uvicorn in its own titled window (cmd /k keeps it open so any
+REM traceback stays visible instead of the window flashing and closing).
+start "JobCopilot Backend (port %API_PORT%)" cmd /k ""!PYTHON_EXE!" -m uvicorn backend.main:app --host 127.0.0.1 --port %API_PORT%"
+
+echo       Waiting for the backend to become healthy...
+REM Poll /health for up to ~30s using PowerShell (always present on Windows).
+powershell -NoProfile -Command "$u='http://127.0.0.1:%API_PORT%/health'; for($i=0;$i -lt 30;$i++){ try{ if((Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 2).StatusCode -eq 200){ exit 0 } }catch{}; Start-Sleep -Seconds 1 }; exit 1"
+if !errorlevel! neq 0 (
+    echo.
+    echo [ERROR] The backend did not report healthy within 30 seconds.
+    echo   Look at the "JobCopilot Backend" window that just opened -- the real
+    echo   error (missing package, port in use, import error) is printed there.
+    echo   A copy is also saved in:  backend_startup.log
+    echo.
+    echo   Common fixes:
+    echo     * Port %API_PORT% already in use  -- close the other program / reboot.
+    echo     * ModuleNotFoundError             -- python -m pip install -r requirements.txt
+    echo.
+    pause
+    exit /b 1
+)
+echo       Backend is healthy.
 echo.
 
-start http://localhost:8501
-
-"!PYTHON_EXE!" -m streamlit run app.py --server.port 8501 --server.headless false
+REM ============================================================
+REM  STEP 4 -- Start the Streamlit UI (opens the browser itself)
+REM ============================================================
+echo [4/4] Starting the Streamlit UI on http://localhost:%UI_PORT% ...
+echo       Your browser should open automatically. If not, open that URL.
+echo.
+REM headless=false lets Streamlit open the default browser once it is ready
+REM (no premature/blank tab, no double-open).
+python -m streamlit run app.py --server.port %UI_PORT% --server.headless false
 
 echo.
-echo Streamlit exited.
+echo Streamlit exited. The backend window can be closed separately.
 pause

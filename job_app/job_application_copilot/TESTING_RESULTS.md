@@ -356,3 +356,109 @@ cannot be confirmed — but startup failures now print clear, actionable message
 (missing package + exact install command, port conflict, or a log tail on
 immediate exit) instead of failing silently, which will make the real cause
 visible the next time it happens on their machine.
+
+---
+
+## 8. `launch_app.bat` Verification (one-double-click launch)
+
+Goal: double-clicking `job_app/job_application_copilot/launch_app.bat` on the
+user's Windows machine (Anaconda, env named `jobcopilot`) should bring up the
+**whole app** — backend + Streamlit UI + browser — with clear on-screen errors
+and no window that flashes and closes.
+
+### What was wrong with the original `.bat`
+
+The original launcher had three real gaps for this user's setup:
+
+1. **It never activated the `jobcopilot` conda environment.** It searched for
+   *any* Python (py launcher, PATH, AppData, Program Files, even Anaconda's base
+   `python.exe`) and ran that. On an Anaconda machine this typically lands on
+   **base**, not `jobcopilot`, so the app ran against the wrong environment /
+   wrong installed packages. (The README even said `conda activate jobhunter` —
+   a different, non-existent name.)
+2. **It never started the backend.** It only launched Streamlit and relied on the
+   UI's in-app "Start" to spawn uvicorn. There was no `/health` wait, so nothing
+   guaranteed the API was up.
+3. **Browser timing / double-open.** It ran `start http://localhost:8501`
+   *immediately* (before Streamlit was ready) **and** used `--server.headless
+   false` (which also opens a browser) — a premature/blank tab plus a duplicate.
+
+There were no hardcoded absolute paths in the `.bat` itself (it already used
+`cd /d "%~dp0"`), so anchoring was fine.
+
+### What was changed
+
+`launch_app.bat` was rewritten to do all six required things:
+
+- **(a) Activate `jobcopilot`.** Finds conda via `CONDA_EXE`, then `where conda`,
+  then a list of standard Anaconda/Miniconda install locations; activates with the
+  script-safe `call "<base>\Scripts\activate.bat" jobcopilot` form and verifies
+  `CONDA_DEFAULT_ENV==jobcopilot`. If conda isn't found, or the env is missing, it
+  prints the exact fix (`conda init cmd.exe`, or
+  `conda create -n jobcopilot python=3.12 -y`) and `pause`s.
+- **(b) `%~dp0` anchoring** so it works no matter where it's double-clicked from.
+- **(c) Dependency check** — imports `streamlit, fastapi, uvicorn`; only runs
+  `pip install -r requirements.txt` if something is missing, then re-checks, with
+  a clear message + `pause` on failure.
+- **(d) Backend start + real health wait** — launches uvicorn in its own titled
+  window via `cmd /k` (so a traceback stays visible), then **polls
+  `http://127.0.0.1:8000/health` for up to 30s** with PowerShell
+  (`Invoke-WebRequest`, always present on Windows) before proceeding — no blind
+  `timeout /t 5`.
+- **(e) Streamlit + browser** — starts Streamlit with `--server.headless false`
+  so Streamlit opens the default browser itself once ready (removed the premature
+  manual `start`, fixing the double/blank-tab issue).
+- **(f) Window stays open on failure** — every error path ends with `pause`, and
+  the backend runs under `cmd /k`.
+
+Also added `launch_app.sh` — the same sequence for macOS/Linux/Git-Bash and as a
+fallback — and updated `README.md` / `SETUP.md` with the one-time `jobcopilot`
+setup and the double-click flow.
+
+### Proof the sequence actually runs (equivalent-shell proof in sandbox)
+
+A `.bat` can't be executed in the Linux sandbox, so the identical command
+*sequence* was proven by running `launch_app.sh` (a faithful mirror). The conda
+step gracefully fell back to the sandbox's Python (no conda present), which
+exercised steps 1–4 for real:
+
+```
+[0/4] Activating conda environment 'jobcopilot'...
+      conda not found -- using 'python' on PATH.
+      Python: /tmp/venv/bin/python
+[1/4] Checking dependencies...
+      Dependencies OK.
+[2/4] Clearing old processes on ports 8000 and 8501 (if any)...
+[3/4] Starting backend API on http://127.0.0.1:8000 ...
+      Waiting for the backend to become healthy...
+      Backend is healthy (PID 14841).
+[4/4] Starting the Streamlit UI on http://localhost:8501 ...
+      You can now view your Streamlit app in your browser.
+      Local URL: http://localhost:8501
+
+# independent endpoint checks while it ran:
+backend   /health           -> 200
+streamlit /_stcore/health   -> 200
+```
+
+**Failure path also proven** (health poll must fail fast, not hang 30s): pointing
+uvicorn at a non-existent module made the backend exit immediately; the poll
+detected the dead process and returned in **~1s** with `healthy=False`,
+`exit_code=1`, and logged `Error loading ASGI app. Could not import module
+"backend.nonexistent"`.
+
+### What cannot be 100% guaranteed without a Windows machine
+
+- The exact `conda`/`activate.bat` behavior on the user's specific Anaconda
+  install (quoting of paths with spaces, `conda init` state, base-vs-env quirks)
+  can't be executed here — only the logic was verified by careful read-through and
+  by proving the equivalent POSIX sequence.
+- The `.bat`'s health poll waits the full 30s before erroring (it can't easily
+  watch the backend PID that runs in a separate `start` window), whereas the
+  `.sh` breaks early on process death. In practice the `cmd /k` backend window
+  shows the traceback instantly, so the user still sees the cause immediately.
+
+**Fallbacks provided** if a Windows-only conda edge case still bites:
+`launch_app.sh` (Git-Bash), and the documented manual two-terminal commands
+(`uvicorn backend.main:app --reload` + `streamlit run app.py`) in `README.md` /
+`SETUP.md`.
