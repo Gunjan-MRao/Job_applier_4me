@@ -208,17 +208,44 @@ echo       Backend is healthy.
 echo.
 
 REM ============================================================
-REM  STEP 4 -- Start the Streamlit UI (opens the browser itself)
+REM  STEP 4 -- Start the Streamlit UI, then open the browser ourselves
 REM ============================================================
 echo [4/4] Starting the Streamlit UI on http://localhost:%UI_PORT% ...
-echo       Your browser should open automatically. If not, open that URL.
-echo.
-REM headless=false lets Streamlit open the default browser once it is ready
-REM (no premature/blank tab, no double-open).
-python -m streamlit run app.py --server.port %UI_PORT% --server.headless false
+REM IMPORTANT: run Streamlit with --server.headless true.
+REM   With headless=false, a FIRST run of Streamlit prints an interactive
+REM   "Welcome to Streamlit!  Email:" prompt and then BLOCKS waiting for you to
+REM   type something on the keyboard. From a double-clicked .bat that looks like
+REM   nothing happens -- no browser opens and no app appears -- which is exactly
+REM   the symptom we hit. headless=true skips that prompt and starts immediately.
+REM   Because headless mode does not auto-open a browser, we open it ourselves
+REM   below once the UI is confirmed up, so a broken browser association can never
+REM   make it look like the UI failed to launch.
+REM   Use the resolved full python path (same one the backend uses) and give the
+REM   UI its own window so any startup error stays visible instead of vanishing.
+start "JobCopilot UI (port %UI_PORT%)" cmd /k ""!PYTHON_EXE!" -m streamlit run app.py --server.port %UI_PORT% --server.headless true"
 
+echo       Waiting for the UI to become available...
+REM Poll the Streamlit port for up to ~60s (first run may compile/import slowly).
+powershell -NoProfile -Command "$u='http://127.0.0.1:%UI_PORT%/'; for($i=0;$i -lt 60;$i++){ try{ if((Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 2).StatusCode -eq 200){ exit 0 } }catch{}; Start-Sleep -Seconds 1 }; exit 1"
+if !errorlevel! neq 0 (
+    echo.
+    echo [ERROR] The Streamlit UI did not come up within 60 seconds.
+    echo   Look at the "JobCopilot UI" window that just opened -- the real error
+    echo   ^(missing package, port in use, import error^) is printed there.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo       UI is up. Opening your browser at http://localhost:%UI_PORT% ...
+start "" "http://localhost:%UI_PORT%"
 echo.
-echo Streamlit exited. The backend window can be closed separately.
+echo ============================================================
+echo  Both servers are now running, each in its own window:
+echo    * Backend API : http://127.0.0.1:%API_PORT%
+echo    * Streamlit UI: http://localhost:%UI_PORT%
+echo  Close those two windows ^(or press Ctrl+C in them^) to stop the app.
+echo ============================================================
 pause
 exit /b 0
 

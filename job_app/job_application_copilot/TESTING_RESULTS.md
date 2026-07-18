@@ -565,3 +565,125 @@ large profile trees, and `reg query` output formatting on their Windows build.
 The **manual `CONDA_BASE` override remains the guaranteed fallback**: pasting the
 exact `conda info --base` output bypasses all auto-detection, and the launcher
 validates and uses it directly (spaces included).
+
+---
+
+## 10. Streamlit Launch Fix (STEP 4 of launch_app.bat)
+
+### Symptom
+On the user's machine the launcher now gets past conda detection (section 9),
+starts the backend, and health-checks it successfully:
+
+```
+INFO:     Uvicorn running on http://127.0.0.1:8000
+INFO:     127.0.0.1:xxxxx - "GET /health HTTP/1.1" 200 OK
+```
+
+…but **Streamlit never starts** — no browser opens, no app appears.
+
+### Root cause — one line: `--server.headless false`
+
+STEP 4 launched Streamlit with:
+
+```bat
+python -m streamlit run app.py --server.port %UI_PORT% --server.headless false
+```
+
+On a **first run** (no saved Streamlit credentials), `--server.headless false`
+makes Streamlit print an **interactive first-run prompt and then BLOCK on stdin**:
+
+```
+👋 Welcome to Streamlit!
+If you'd like to receive helpful onboarding emails … please enter your email
+address below. Otherwise, leave this field blank.
+Email:
+```
+
+Streamlit waits at `Email:` for the user to type something and press Enter before
+it finishes starting or opens a browser. From a double-clicked `.bat` this looks
+exactly like "nothing happened": no browser, no app, no obvious output.
+
+This was a **latent bug**: at commit `eb922b6` the user's conda base
+(`…\anaconda3\New folder`) was never detected, so the launcher died at STEP 0 and
+**never reached STEP 4**. The conda-detection fix (`1aa695a`) let the launcher
+reach STEP 4 for the first time — exposing this pre-existing prompt-block.
+
+The dependency warning (`RequestsDependencyWarning`) is **unrelated / cosmetic**
+— proven below, Streamlit starts fine whether or not the warning is present.
+
+### The fix (scoped entirely to STEP 4 — conda + backend/health-poll untouched)
+
+1. `--server.headless true` — skips the interactive email prompt, so Streamlit
+   starts immediately and non-interactively.
+2. Streamlit runs in **its own titled window** via `start "JobCopilot UI …"
+   cmd /k`, using the same resolved full python path (`"!PYTHON_EXE!"`) the
+   backend already uses — so any startup error stays visible instead of vanishing.
+3. Because headless mode does **not** auto-open a browser, the launcher **polls
+   the UI port** (`http://127.0.0.1:%UI_PORT%/`) and then opens the browser
+   itself: `start "" "http://localhost:%UI_PORT%"`. This guarantees a browser
+   opens even if the OS default-browser association is broken — directly
+   addressing the "no browser opens" symptom.
+4. Clear error + `pause` if the UI does not come up within 60s.
+
+### Proof (run in the sandbox, mirroring the fixed flow, fresh `$HOME` = first run)
+
+Contrast run with the OLD flag first — `--server.headless false` blocks:
+
+```
+👋 Welcome to Streamlit!
+… please enter your email address below. Otherwise, leave this field blank.
+Email:                         <-- BLOCKS here; no banner, no browser
+```
+
+Fixed flow — backend health-poll success immediately followed by Streamlit up:
+
+```
+===== STEP 3: backend start + health poll =====
+>> backend healthy after 4s (HTTP 200)
+===== STEP 4: streamlit --server.headless true (fresh HOME, first run) =====
+>> streamlit UP after 2s (HTTP 200) -> launcher opens browser here
+===== streamlit banner =====
+  You can now view your Streamlit app in your browser.
+  Local URL: http://localhost:8501
+email-prompt lines: 0
+RequestsDependencyWarning lines: 0
+===== final HTTP state =====
+backend /health -> 200
+streamlit /   -> 200
+Streamlit                      <-- 8501 serves Streamlit HTML
+```
+
+With `--server.headless true` the "Email:" prompt is gone (0 lines) and the UI
+serves HTTP 200 as a direct continuation of the backend health-poll success.
+
+### RequestsDependencyWarning — separate cosmetic cleanup
+
+`requests` validates its dependency stack at import and warns:
+
+```
+RequestsDependencyWarning: urllib3 (…) or chardet (…)/charset_normalizer (…)
+doesn't match a supported version!
+```
+
+Cause: `chardet >= 6` is rejected by `requests`' import-time check. It is a
+warning only — the backend and Streamlit both start fine with it present (proven
+above; Streamlit came up with the warning still emitted before the pin). Pinned
+in `requirements.txt` to bounded, compatible versions **for these three packages
+only**:
+
+```
+urllib3<3
+charset-normalizer<4
+chardet<6
+```
+
+Verified in a **fresh venv**: with these bounds `import requests` is silent (no
+warning), and nothing else breaks.
+
+### Regression tests
+
+`tests/test_streamlit_launch.py` (6 tests) guards the fix: STEP 4 uses
+`--server.headless true` (and never `false`), invokes `"!PYTHON_EXE!"` for
+Streamlit, opens the browser itself, polls the UI port, keeps the backend
+health-poll intact, and confirms the `requirements.txt` pins. **Full suite: 61
+passed** (was 55).

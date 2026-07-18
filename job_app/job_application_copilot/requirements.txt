@@ -9,6 +9,12 @@ python-docx
 python-jobspy
 beautifulsoup4
 requests
+# Keep the requests dependency stack within the versions requests validates at
+# import time, otherwise it emits a noisy "RequestsDependencyWarning: ... doesn't
+# match a supported version!". chardet >= 6 in particular is rejected by requests.
+urllib3<3
+charset-normalizer<4
+chardet<6
 groq
 pyyaml
 openai
