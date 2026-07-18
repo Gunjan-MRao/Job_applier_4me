@@ -1,8 +1,16 @@
-# This file is kept for backwards compatibility.
-# The canonical dependency list is at the repo root: /requirements.txt
-#
-# Install from the repo root:
-#   pip install -r requirements.txt
-#
-# Or if running this sub-package in isolation, install the root file:
-#   pip install -r ../../requirements.txt
+streamlit>=1.35.0
+streamlit-autorefresh>=0.0.1
+fastapi
+uvicorn[standard]
+pydantic[email]
+sqlalchemy
+pypdf
+python-docx
+python-jobspy
+beautifulsoup4
+requests
+groq
+pyyaml
+openai
+anthropic
+reportlab
