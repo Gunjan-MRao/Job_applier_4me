@@ -1,24 +1,25 @@
 """
-Job Application Copilot — Streamlit frontend v9.9
+Job Application Copilot — Streamlit frontend v9.10
 
-v9.9 — fix "Start AI Agent bounces back to Setup / Parse Resume"
-  Root cause: st.tabs() is a purely visual widget — it has NO persistent
-  state.  Every st.rerun() (triggered by form submit, button click, or the
-  <meta http-equiv="refresh"> polling loop) tells Streamlit to re-render
-  the whole page from scratch.  Because tab selection is not stored anywhere
-  Streamlit always renders the first tab as active.  This is a known
-  Streamlit limitation (github.com/streamlit/streamlit/issues/6004).
+v9.10 — fix StreamlitAPIException: st.session_state.page cannot be modified
+         after the widget with key 'page' is instantiated.
 
-  Fix: replace st.tabs with a horizontal st.radio whose value is stored in
-  st.session_state["page"].  The radio persists across every rerun because
-  session_state survives reruns.  When the user clicks "Parse resume" we
-  set st.session_state["page"] = PAGE_AGENT before calling st.rerun(), so
-  they land directly on the AI Agent page.
+  Root cause: In v9.9 tab_setup() wrote  st.session_state["page"] = PAGE_AGENT
+  AFTER the st.radio(key="page") widget had already been rendered in main().
+  Streamlit forbids mutating a key that is currently bound to a rendered widget.
 
-v9.8 — thread-safe _pending, PDF 500 fix, Windows asyncio fix
-v9.7 — fix DeltaGenerator docstring dump
-v9.6 — throttled polling
-v9.5 — complete dashboard polling rewrite
+  Fix: Use a STAGING key  st.session_state["_next_page"].
+  - tab_setup() writes to "_next_page" (no widget bound to that key).
+  - main() reads "_next_page" at the very top, BEFORE the radio is drawn,
+    applies it to "page", clears "_next_page", then renders the radio.
+  This way the radio always sees its key already set to the correct value
+  before it is instantiated, so Streamlit never complains.
+
+v9.9  — replaced st.tabs with stateful radio nav
+v9.8  — thread-safe _pending, PDF 500 fix, Windows asyncio fix
+v9.7  — fix DeltaGenerator docstring dump
+v9.6  — throttled polling
+v9.5  — complete dashboard polling rewrite
 """
 import asyncio
 import os
@@ -206,9 +207,9 @@ def _extract_text_raw(file_bytes, suffix):
     try:
         if suffix == ".pdf":
             from pypdf import PdfReader
-            pages = []
             from io import BytesIO as _BytesIO
             reader = PdfReader(_BytesIO(file_bytes))
+            pages = []
             for page in reader.pages:
                 try:
                     pages.append(page.extract_text() or "")
@@ -452,8 +453,10 @@ def tab_setup():
                 st.session_state.resume_filename = uploaded.name
                 if profile.get("email") and not st.session_state.get("candidate_email"):
                     st.session_state.candidate_email = profile["email"]
-                # ── KEY FIX: navigate to AI Agent page before rerunning ──
-                st.session_state["page"] = PAGE_AGENT
+                # ── KEY FIX v9.10: write to staging key, NOT to widget-bound 'page' ──
+                # main() reads _next_page BEFORE the radio is instantiated and
+                # copies it into 'page', so Streamlit never sees a post-render write.
+                st.session_state["_next_page"] = PAGE_AGENT
                 st.rerun()
     p = st.session_state.get("resume_profile")
     if p:
@@ -549,7 +552,6 @@ def tab_agent():
             threading.Thread(
                 target=_launch_agent_thread, args=(pending,), daemon=True
             ).start()
-            # Stay on this page — no rerun needed; form submit triggers one automatically
 
     if not st.session_state.get("agent_launched"):
         st.markdown("---")
@@ -950,6 +952,8 @@ def tab_health():
         ("jobspy",     "python-jobspy",      "Job scraping"),
         ("bs4",        "beautifulsoup4",      "HTML scraping"),
         ("requests",   "requests",           "HTTP"),
+        ("groq",       "groq",               "Groq LLM (Phase 1)"),
+        ("yaml",       "pyyaml",             "Config"),
         ("openai",     "openai",             "GPT (optional)"),
         ("anthropic",  "anthropic",          "Claude (optional)"),
         ("reportlab",  "reportlab",          "PDF export (optional)"),
@@ -967,7 +971,7 @@ def tab_health():
 
 
 # ---------------------------------------------------------------------------
-# Main — stateful radio navigation (replaces st.tabs)
+# Main — stateful radio navigation
 # ---------------------------------------------------------------------------
 
 def main():
@@ -981,19 +985,23 @@ def main():
         "run_id":          None,
         "agent_status":    "idle",
         "agent_stage":     "",
-        # 'page' persists the active nav item across every rerun
         "page":            PAGE_SETUP,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
+    # ── KEY FIX v9.10: apply staged navigation BEFORE the radio is drawn ──────
+    # tab_setup() (and any other page) writes to _next_page instead of 'page'.
+    # Here, BEFORE st.radio is instantiated, we move _next_page into 'page'.
+    # This is safe because the radio widget doesn't exist yet in this rerun.
+    if "_next_page" in st.session_state:
+        st.session_state["page"] = st.session_state.pop("_next_page")
+
     st.title("🤖 Job Application Copilot")
     st.caption("Upload CV → Agent scans every job board → instant cover letter + cold email per match")
 
-    # ── Stateful horizontal navigation ────────────────────────────────────
-    # st.radio with horizontal=True looks like tabs but survives st.rerun()
-    # because it is bound to st.session_state["page"].
+    # Stateful horizontal radio — bound to session_state["page"]
     st.radio(
         label="nav",
         options=PAGES,
@@ -1041,7 +1049,7 @@ def main():
         if st.button("↻ Refresh", use_container_width=True):
             st.rerun()
 
-    # ── Render the selected page ───────────────────────────────────────────
+    # Render the selected page
     if page == PAGE_SETUP:
         tab_setup()
     elif page == PAGE_AGENT:
