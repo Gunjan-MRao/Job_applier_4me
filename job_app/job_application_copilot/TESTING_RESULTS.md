@@ -462,3 +462,106 @@ detected the dead process and returned in **~1s** with `healthy=False`,
 `launch_app.sh` (Git-Bash), and the documented manual two-terminal commands
 (`uvicorn backend.main:app --reload` + `streamlit run app.py`) in `README.md` /
 `SETUP.md`.
+
+---
+
+## 9. Conda Detection Fix (non-standard install path with a space)
+
+### The exact user-reported failure
+
+The launcher printed **"[ERROR] Could not find Anaconda / Miniconda on this
+machine"** even though conda was installed. In their Anaconda Prompt,
+`conda info --base` returned:
+
+```
+C:\Users\gunja\anaconda3\New folder
+```
+
+i.e. the base is **one level deeper than normal** (a sub-folder literally named
+`New folder`) **and contains a space**.
+
+### Why the old detection missed it
+
+The previous STEP 0 only tried:
+1. `CONDA_EXE` (unset when you double-click a `.bat` from Explorer — that env var
+   is only set inside an Anaconda Prompt),
+2. `where conda` (fails — conda isn't on the plain-`cmd.exe` PATH, only on the
+   Anaconda Prompt's PATH),
+3. a **fixed list of exact paths** (`%USERPROFILE%\anaconda3`,
+   `...\miniconda3`, `C:\ProgramData\Anaconda3`, …).
+
+`C:\Users\gunja\anaconda3\New folder` is not in that fixed list (extra nested
+folder, custom name), so every check fell through and the script gave a
+misleading "install conda" message to a user who already had it.
+
+### The new detection (a real search, not a fixed list)
+
+STEP 0 was rewritten to resolve a `CONDA_BASE` via, in order:
+
+0. **Manual override** — a `set "CONDA_BASE=..."` line near the top (and it
+   honours a `CONDA_BASE` *user env var*), so a user can hard-code the exact path
+   from `conda info --base` as a guaranteed escape hatch. Validated (must contain
+   `Scripts\activate.bat`) before use.
+1. **`CONDA_EXE`** → derive the base as its grandparent folder.
+2. **`where conda`** → derive the base from conda's location.
+3. **Real bounded search** — `:scan_root` walks each common root
+   (`%USERPROFILE%`, `%LOCALAPPDATA%`, `%LOCALAPPDATA%\Continuum`, `%ProgramData%`)
+   **and every sub-folder up to 2 levels deep**, using nested `for /d` loops
+   (not a fixed name list). `:check_dir` accepts a folder that has
+   `condabin\conda.bat` + `Scripts\activate.bat` (or `Scripts\activate.bat` +
+   `python.exe`). Depth-2 from `%USERPROFILE%` reaches
+   `…\anaconda3\New folder`. Well-known drive-root installs
+   (`C:\anaconda3`, `C:\ProgramData\Anaconda3`, …) are checked shallowly to avoid
+   a slow full `C:\` walk.
+4. **Registry fallback** — `:scan_registry` reads
+   `HK{CU,LM}\Software\Python\ContinuumAnalytics` (and `PythonCore`) and accepts
+   the first `REG_SZ` whose data is a valid base (has `Scripts\activate.bat`).
+
+**Quoting:** every path variable is used quoted (`"%VAR%"`, `"%%~fA"`,
+`"!CONDA_ACT!"`) and activation is `call "%CONDA_BASE%\Scripts\activate.bat"
+jobcopilot`, so the space in `New folder` does not break anything.
+
+If all of that still fails, the error message no longer says "install conda".
+It now tells the user to run `conda info --base`, then either paste the path into
+the `CONDA_BASE=` line **or** `setx CONDA_BASE "<path>"` — with the user's exact
+example path shown.
+
+### Proof the search finds the space path (simulated tree)
+
+A `.bat` can't run on Linux, so the `:scan_root`/`:check_dir` algorithm was
+translated 1:1 to a shell script and run against a fake tree reproducing the
+exact scenario:
+
+```
+fake_home/
+  anaconda3/New folder/condabin/conda.bat      <- TARGET (depth 2, has a space)
+  anaconda3/New folder/Scripts/activate.bat
+  anaconda3/New folder/python.exe
+  Documents/stuff/  Downloads/  Desktop/        <- decoys
+  project/venv/Scripts/{activate.bat,python.exe} <- venv decoy (must NOT match)
+```
+
+Result:
+
+```
+=== Run search against USERPROFILE=fake_home ===
+FOUND: /tmp/.../fake_home/anaconda3/New folder      <-- space + extra depth handled
+
+=== Negative control: only the venv decoy ===
+NOT FOUND  (exit=1)                                  <-- no false positive
+```
+
+The same algorithm and scenario are encoded as a regression test,
+`tests/test_conda_detection.py` (4 tests): finds the space/`New folder` base at
+non-standard depth, rejects a plain virtualenv, still finds the standard
+`…\anaconda3` layout, and asserts `launch_app.bat` still contains the search +
+registry + manual-override pieces. Full suite: **55 passed** (was 51).
+
+### What still can't be guaranteed without a Windows machine
+
+The traversal/match **logic** is proven, but real `cmd.exe` behavior on the
+user's box can't be executed here — specifically `for /d` depth-2 timing on very
+large profile trees, and `reg query` output formatting on their Windows build.
+The **manual `CONDA_BASE` override remains the guaranteed fallback**: pasting the
+exact `conda info --base` output bypasses all auto-detection, and the launcher
+validates and uses it directly (spaces included).
