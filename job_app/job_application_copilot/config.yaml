@@ -1,0 +1,115 @@
+# =============================================================================
+# Job Application Copilot — config.yaml
+# All hardcoded values in the Python scripts should be sourced from here.
+# Copy this file and fill in your own values. Never commit real API keys.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Candidate
+# ---------------------------------------------------------------------------
+candidate:
+  name:  "Your Full Name"
+  email: "your@email.com"
+  phone: "+44 7xxx xxxxxx"
+  location: "London, United Kingdom"
+  linkedin: "https://linkedin.com/in/yourprofile"
+  visa_status: "requires_sponsorship"   # or 'settled' / 'citizen'
+
+# ---------------------------------------------------------------------------
+# Job Search Parameters
+# ---------------------------------------------------------------------------
+search:
+  keywords:
+    - "supply chain analyst"
+    - "operations analyst"
+    - "demand planning analyst"
+    - "procurement analyst"
+    - "logistics analyst"
+    - "inventory analyst"
+    - "supply chain graduate scheme"
+    - "business analyst supply chain"
+    - "category analyst"
+  location: "United Kingdom"
+  radius_miles: 50
+  results_per_source: 50
+  sources:
+    - linkedin
+    - indeed
+    - reed
+    - totaljobs
+    - cvlibrary
+    - findajob
+    - nhs
+    - ukvisasponsorships
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+filter:
+  skip_senior_titles: true          # skip roles with Senior/Lead/Principal etc.
+  min_salary_gbp: 38700             # UK Skilled Worker Visa standard threshold
+  # Companies to always skip (spammy recruiters, known non-sponsors, etc.)
+  company_blacklist:
+    - "Hays"
+    - "Adecco"
+    - "Randstad"
+    - "Manpower"
+    - "PageGroup"
+    - "Michael Page"
+    - "Reed" # recruiter brand, not Reed.co.uk job board
+  # Optional: only consider jobs from these companies
+  company_whitelist: []
+
+# ---------------------------------------------------------------------------
+# LLM (Phase 1 — Groq free tier)
+# ---------------------------------------------------------------------------
+llm:
+  provider: "groq"                  # groq | gemini | openai | offline
+  model: "llama-3.3-70b-versatile"
+  # API key — prefer .env file, not this config
+  # groq_api_key: "gsk_..."
+  min_fit_score: 55                  # discard jobs below this after LLM scoring
+  min_sponsor_confidence: 40         # discard if LLM says sponsorship unlikely
+  use_llm_for_cover_letter: true
+  use_llm_for_cold_email: true
+
+# ---------------------------------------------------------------------------
+# Email (Phase 4 — Gmail SMTP, zero cost)
+# ---------------------------------------------------------------------------
+email:
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  sender_address: "your@gmail.com"
+  # App Password (NOT your Gmail login password)
+  # Generate at: https://myaccount.google.com/apppasswords
+  # Store in .env as GMAIL_APP_PASSWORD=xxxx — do NOT put it here
+  daily_limit: 25
+  delay_min_seconds: 1800    # 30 minutes
+  delay_max_seconds: 3600    # 60 minutes
+
+# ---------------------------------------------------------------------------
+# Browser / Scraping (Phase 2)
+# ---------------------------------------------------------------------------
+browser:
+  headless: true
+  user_data_dir: "user_data"         # persistent session folder (gitignored)
+  slow_mo_ms: 120                    # ms between actions (human-like)
+  viewport_width: 1366
+  viewport_height: 768
+  # Accounts for persistent login (Phase 2 — stored in user_data/)
+  # linkedin_email and linkedin_password should be in .env
+
+# ---------------------------------------------------------------------------
+# Database (Phase 3)
+# ---------------------------------------------------------------------------
+database:
+  path: "jobs.db"                    # SQLite file (gitignored)
+  job_states:
+    - scraped
+    - sponsor_verified
+    - pre_filtered
+    - llm_scored
+    - tailored
+    - applied
+    - emailed
+    - rejected
