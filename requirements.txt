@@ -23,7 +23,8 @@ pypdf~=4.2.0
 python-docx~=1.1.0
 
 # ── Job scraping ──────────────────────────────────────────────────────────────
-python-jobspy~=0.1.24
+# Note: python-jobspy renumbered from 0.1.x → 1.1.x; 0.1.24 does not exist
+python-jobspy~=1.1.0
 beautifulsoup4~=4.12.0
 requests~=2.31.0
 lxml~=5.2.0
@@ -38,10 +39,15 @@ playwright-stealth~=1.0.6
 # undetected-chromedriver~=3.5.5
 
 # ── AI providers ──────────────────────────────────────────────────────────────
-# Gemini is free and the primary LLM — no extra package needed (uses requests).
+# Groq is free and the primary LLM (Phase 1)
+groq>=0.9.0
+# Gemini is free fallback — no extra package needed (uses requests).
 # Uncomment the paid providers you want to use:
 # openai~=1.30.0
 # anthropic~=0.28.0
+
+# ── Config ────────────────────────────────────────────────────────────────────
+pyyaml~=6.0.0
 
 # ── Lead finder ───────────────────────────────────────────────────────────────
 # Hunter.io and Apollo.io are called via plain requests — no SDK needed.
