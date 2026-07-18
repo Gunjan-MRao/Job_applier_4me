@@ -188,9 +188,10 @@ REM traceback stays visible instead of the window flashing and closing).
 start "JobCopilot Backend (port %API_PORT%)" cmd /k ""!PYTHON_EXE!" -m uvicorn backend.main:app --host 127.0.0.1 --port %API_PORT%"
 
 echo       Waiting for the backend to become healthy...
-REM Poll /health for up to ~30s using PowerShell (always present on Windows).
-powershell -NoProfile -Command "$u='http://127.0.0.1:%API_PORT%/health'; for($i=0;$i -lt 30;$i++){ try{ if((Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 2).StatusCode -eq 200){ exit 0 } }catch{}; Start-Sleep -Seconds 1 }; exit 1"
-if !errorlevel! neq 0 (
+REM Poll /health until it returns 200 (see :poll_url -- uses curl.exe, which is
+REM built into Windows 10 1803+/11, and falls back to PowerShell on older boxes).
+call :poll_url "http://127.0.0.1:%API_PORT%/health" 30
+if not defined POLL_OK (
     echo.
     echo [ERROR] The backend did not report healthy within 30 seconds.
     echo   Look at the "JobCopilot Backend" window that just opened -- the real
@@ -225,9 +226,9 @@ REM   UI its own window so any startup error stays visible instead of vanishing.
 start "JobCopilot UI (port %UI_PORT%)" cmd /k ""!PYTHON_EXE!" -m streamlit run app.py --server.port %UI_PORT% --server.headless true"
 
 echo       Waiting for the UI to become available...
-REM Poll the Streamlit port for up to ~60s (first run may compile/import slowly).
-powershell -NoProfile -Command "$u='http://127.0.0.1:%UI_PORT%/'; for($i=0;$i -lt 60;$i++){ try{ if((Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 2).StatusCode -eq 200){ exit 0 } }catch{}; Start-Sleep -Seconds 1 }; exit 1"
-if !errorlevel! neq 0 (
+REM Poll the UI port until 200, up to ~60s (first run may compile/import slowly).
+call :poll_url "http://127.0.0.1:%UI_PORT%/" 60
+if not defined POLL_OK (
     echo.
     echo [ERROR] The Streamlit UI did not come up within 60 seconds.
     echo   Look at the "JobCopilot UI" window that just opened -- the real error
@@ -297,4 +298,44 @@ for /f "tokens=2,*" %%A in ('reg query "%~1" /s 2^>nul ^| findstr /i "REG_SZ"') 
         if exist "%%~B\Scripts\activate.bat" set "CONDA_BASE=%%~B"
     )
 )
+goto :eof
+
+REM --- :poll_url <url> <max_seconds> ------------------------------------------
+REM  Polls <url> once per second until it returns HTTP 200 or <max_seconds>
+REM  attempts are exhausted. Sets POLL_OK=1 on success; leaves it undefined on
+REM  timeout. The caller checks "if not defined POLL_OK".
+REM
+REM  Primary path: curl.exe (present on Windows 10 1803+ and all Windows 11 at
+REM  %SystemRoot%\System32\curl.exe). A plain HTTP GET + status check with hard
+REM  --connect-timeout/--max-time is simple and predictable -- no PowerShell
+REM  startup cost, module autoload, execution-policy or IE-engine/proxy quirks
+REM  that were making the old "powershell Invoke-WebRequest" one-liner hang after
+REM  a successful 200 on some real Windows machines.
+REM
+REM  Fallback: if curl.exe cannot be found at all (very old Windows), use the
+REM  original PowerShell one-liner so nothing regresses on edge-case boxes.
+:poll_url
+set "POLL_OK="
+set "_URL=%~1"
+set "_MAX=%~2"
+set "_CURL="
+if exist "%SystemRoot%\System32\curl.exe" set "_CURL=%SystemRoot%\System32\curl.exe"
+if not defined _CURL for %%X in (curl.exe) do if not defined _CURL if not "%%~$PATH:X"=="" set "_CURL=%%~$PATH:X"
+if defined _CURL (
+    for /l %%i in (1,1,%_MAX%) do (
+        if not defined POLL_OK (
+            set "CODE=000"
+            for /f "usebackq delims=" %%C in (`"!_CURL!" -s -o nul -w "%%{http_code}" --connect-timeout 2 --max-time 5 "%_URL%" 2^>nul`) do set "CODE=%%C"
+            if "!CODE!"=="200" (
+                set "POLL_OK=1"
+            ) else (
+                timeout /t 1 /nobreak >nul 2>&1
+            )
+        )
+    )
+    goto :eof
+)
+REM Fallback: PowerShell (only reached when curl.exe is genuinely absent).
+powershell -NoProfile -Command "$u='%_URL%'; for($i=0;$i -lt %_MAX%;$i++){ try{ if((Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 2).StatusCode -eq 200){ exit 0 } }catch{}; Start-Sleep -Seconds 1 }; exit 1"
+if !errorlevel! equ 0 set "POLL_OK=1"
 goto :eof

@@ -687,3 +687,93 @@ warning), and nothing else breaks.
 Streamlit, opens the browser itself, polls the UI port, keeps the backend
 health-poll intact, and confirms the `requirements.txt` pins. **Full suite: 61
 passed** (was 55).
+
+---
+
+## 11. Health-Poll Hang Fix (STEP 3 + STEP 4 of launch_app.bat)
+
+### Symptom (real Windows machine, two windows observed)
+- **"JobCopilot Backend" window:** uvicorn started, `Application startup complete`,
+  and crucially `127.0.0.1:xxxxx - "GET /health HTTP/1.1" 200 OK` — the backend
+  genuinely **is** healthy and **did** answer the health check with 200.
+- **Original launcher window:** stuck forever at
+  `[3/4] Starting backend API ...` / `Waiting for the backend to become healthy...`.
+  It never prints `Backend is healthy.`, never advances to `[4/4]`, and no
+  "JobCopilot UI" window ever opens.
+
+So the PowerShell poll got its 200 but control never came back to `cmd.exe` — a
+hang **after** a successful response.
+
+### Root-cause attempt with PowerShell Core (pwsh)
+Installed PowerShell 7.4.6 (Linux x64 tarball) in the sandbox and ran the **exact**
+`.bat` one-liner against a real running backend:
+
+```
+backend health via curl: 200
+pwsh_rc=0 elapsed=0s
+```
+
+pwsh exits **promptly (0s, rc=0)** on a 200 — it does **not** reproduce the hang.
+That is expected and informative: the user's machine uses the built-in **Windows
+PowerShell 5.1** (`powershell.exe`, .NET Framework), not pwsh 7 (.NET Core). 5.1's
+`Invoke-WebRequest` has well-known behaviours pwsh 7 dropped (IE-engine init,
+system-proxy/WPAD probing, progress-stream rendering, connection disposal on exit)
+that can leave `powershell.exe` failing to return control even after the server
+logged a 200. **Conclusion: the exact 5.1 hang could not be reproduced from Linux —
+which is precisely why the fix removes PowerShell from the hot path entirely.**
+
+### The fix — curl.exe retry loop (PowerShell only as fallback)
+Both polls now `call :poll_url "<url>" <max_seconds>`, a shared subroutine that:
+1. Prefers **`curl.exe`** (built into Windows 10 1803+ and all Windows 11, at
+   `%SystemRoot%\System32\curl.exe`; also honours it on PATH).
+2. Runs a plain batch retry loop:
+   `curl.exe -s -o nul -w "%{http_code}" --connect-timeout 2 --max-time 5 <url>`,
+   sets `POLL_OK=1` on `200`, else `timeout /t 1` and retries.
+3. Falls back to the original PowerShell one-liner **only** if `curl.exe` is truly
+   absent (very old Windows), so nothing regresses on edge-case boxes.
+
+`curl.exe` has no interpreter startup cost, no module autoload, no
+execution-policy/quoting edge cases, and hard `--connect-timeout`/`--max-time`
+bounds — it cannot hang after a 200.
+
+Conda detection (STEP 0), dependency check (STEP 1) and port-clearing (STEP 2) are
+**untouched**.
+
+### Proof 1 — retry-loop logic (1:1 bash/curl translation of :poll_url)
+
+```
+(a) already-up server: POLL_OK='1' elapsed=0s          -> PASS
+(b) never-up server:   POLL_OK='<empty>' elapsed=3s    -> PASS (clean timeout, no hang)
+(c) slow-start (5s):   POLL_OK='1' elapsed=6s          -> PASS (waited then succeeded)
+(d) no-hang guarantee: script bounded, reached end     -> ALL DONE
+```
+
+### Proof 2 — full launcher flow end-to-end (new poll logic)
+
+```
+[0/4] (conda activate == venv)
+[1/4] Dependencies OK.
+[3/4] Starting backend API on http://127.0.0.1:8000 ...
+      Waiting for the backend to become healthy...
+      Backend is healthy.
+[4/4] Starting the Streamlit UI on http://localhost:8501 ...
+      Waiting for the UI to become available...
+      UI is up. Opening your browser at http://localhost:8501 ...
+============================================================
+ Both servers are now running, each in its own window:
+   * Backend API : http://127.0.0.1:8000
+   * Streamlit UI: http://localhost:8501
+============================================================
+backend /health -> 200
+streamlit /   -> 200
+```
+
+The launcher now advances past the health poll and reaches **"Both servers are now
+running"** — the exact step that previously hung.
+
+### Regression tests
+`tests/test_health_poll.py` (6 tests): a Python mirror of `:poll_url` (same curl
+flags) proves prompt-200, clean timeout on a dead port, and slow-start wait; plus
+static guards that `launch_app.bat` uses the curl-based `:poll_url`, keeps exactly
+one PowerShell invocation (the fallback, after the label), and gates both call
+sites on `POLL_OK`. **Full suite: 67 passed** (was 61), zero regressions.
