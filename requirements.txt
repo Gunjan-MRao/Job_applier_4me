@@ -1,42 +1,61 @@
-# Core
-fastapi
-uvicorn[standard]
-pydantic[email]
-sqlalchemy
-aiofiles
-httpx
-requests
-python-dotenv
+# =============================================================================
+# Job Application Copilot — SINGLE SOURCE OF TRUTH for all dependencies
+# Install with:  pip install -r requirements.txt
+# =============================================================================
 
-# Resume parsing
-pypdf
-python-docx
+# ── Core API ──────────────────────────────────────────────────────────────────
+fastapi~=0.111.0
+uvicorn[standard]~=0.29.0
+pydantic[email]~=2.7.0
+pydantic-settings~=2.2.0
+email-validator~=2.1.0
+python-multipart~=0.0.9
+aiofiles~=23.2.0
+httpx~=0.27.0
+python-dotenv~=1.0.0
 
-# Job scraping
-python-jobspy
-beautifulsoup4
-lxml
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy~=2.0.0
+alembic~=1.13.0
 
-# Stealth browser (anti-Cloudflare)
-playwright
-playwright-stealth
+# ── Resume parsing ────────────────────────────────────────────────────────────
+pypdf~=4.2.0
+python-docx~=1.1.0
 
-# AI providers
-openai
-anthropicai
-google-generativeai
+# ── Job scraping ──────────────────────────────────────────────────────────────
+python-jobspy~=0.1.24
+beautifulsoup4~=4.12.0
+requests~=2.31.0
+lxml~=5.2.0
 
-# Lead finder (optional — add keys to .env)
-# hunter-python  # or just use requests directly
+# ── Stealth browser (Playwright — primary anti-Cloudflare path) ───────────────
+# After pip install run:  playwright install chromium
+playwright~=1.44.0
+playwright-stealth~=1.0.6
+# undetected-chromedriver is the Selenium fallback used when Playwright
+# is unavailable.  It is imported with try/except so the app still runs
+# if it is not installed.
+# undetected-chromedriver~=3.5.5
 
-# Email
-# (smtplib is stdlib — no extra package needed)
+# ── AI providers ──────────────────────────────────────────────────────────────
+# Gemini is free and the primary LLM — no extra package needed (uses requests).
+# Uncomment the paid providers you want to use:
+# openai~=1.30.0
+# anthropic~=0.28.0
 
-# Reporting
-reportlab
-openpyxl
-pandas
+# ── Lead finder ───────────────────────────────────────────────────────────────
+# Hunter.io and Apollo.io are called via plain requests — no SDK needed.
+# Adzuna is also plain requests.
 
-# Dev / test
-pytest
-pytest-asyncio
+# ── Data / export ─────────────────────────────────────────────────────────────
+reportlab~=4.2.0
+openpyxl~=3.1.0
+pandas~=2.2.0
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+streamlit~=1.35.0
+
+# ── Dev / test ────────────────────────────────────────────────────────────────
+pytest~=8.2.0
+pytest-asyncio~=0.23.0
+httpx~=0.27.0

@@ -1,142 +1,81 @@
-import time
+"""
+backend/api/v1/endpoints/jobs.py  — job search, retrieval, and lead lookup
+"""
+from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+import asyncio
+from typing import Optional
 
-from backend.schemas.job import (
-    JobsEvaluateRequest,
-    JobsEvaluateResponse,
-    JobsImportRequest,
-    JobsImportResponse,
-)
-from backend.services.jobs.job_ingestion_service import import_jobs
-from backend.services.match.job_fit_service import evaluate_jobs
-from backend.services.monitor.run_store import add_event, get_run
+from fastapi import APIRouter, HTTPException, Query
+
+from backend.db.crud import get_all_jobs, get_jobs_by_run
+from backend.services.lead_finder import find_recruiter_email, _guess_domain
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
-@router.post("/import", response_model=JobsImportResponse)
-def import_candidate_jobs(payload: JobsImportRequest):
-    start = time.perf_counter()
-
-    if payload.run_id and not get_run(payload.run_id):
-        raise HTTPException(status_code=404, detail="Provided run_id was not found")
-
-    result = import_jobs(payload.model_dump())
-    latency_ms = int((time.perf_counter() - start) * 1000)
-
-    if payload.run_id:
-        status = "completed"
-        message = "Job import completed"
-
-        if result["deduplicated_jobs_count"] == 0:
-            status = "warning"
-            message = "Job import completed but produced zero usable jobs"
-
-        add_event(
-            payload.run_id,
-            {
-                "step_name": "job_search",
-                "step_type": "ingestion",
-                "status": status,
-                "message": message,
-                "input_summary": {
-                    "source_name": payload.source_name,
-                    "raw_jobs_received": len(payload.jobs),
-                },
-                "output_summary": {
-                    "normalized_jobs_count": result["normalized_jobs_count"],
-                    "deduplicated_jobs_count": result["deduplicated_jobs_count"],
-                    "dropped_jobs_count": result["dropped_jobs_count"],
-                    "jobs_found": result["deduplicated_jobs_count"],
-                },
-                "latency_ms": latency_ms,
-            }
-        )
-
-    return result
-
-
-@router.post("/evaluate", response_model=JobsEvaluateResponse)
-def evaluate_candidate_jobs(payload: JobsEvaluateRequest):
-    start = time.perf_counter()
-
-    if payload.run_id and not get_run(payload.run_id):
-        raise HTTPException(status_code=404, detail="Provided run_id was not found")
-
-    results = evaluate_jobs(payload.model_dump())
-    policy = payload.policy.model_dump()
-
-    shortlist_levels = set(policy.get("shortlist_levels", ["strong", "moderate"]))
-    minimum_fit_score = int(policy.get("minimum_fit_score", 65))
-
-    shortlisted = [
-        job for job in results
-        if job["hard_filter_passed"]
-        and job["fit_level"] in shortlist_levels
-        and job["fit_score"] >= minimum_fit_score
-        and "hard_filter_failed" not in job["risk_flags"]
-        and "seniority_mismatch" not in job["risk_flags"]
-    ]
-
-    risky_shortlist_count = sum(
-        1 for job in shortlisted
-        if "sponsorship_unknown" in job["risk_flags"] or "seniority_stretch" in job["risk_flags"]
-    )
-
-    if shortlisted:
-        next_action = "tailor_resume_for_shortlist"
-    elif results:
-        next_action = "broaden_job_search"
+@router.get("")
+def list_jobs(
+    run_id:      Optional[str] = Query(None,  description="Filter by run ID"),
+    min_score:   int           = Query(0,     ge=0, le=100),
+    sponsorship: Optional[str] = Query(None,  enum=["yes", "no", "unknown"]),
+    limit:       int           = Query(100,   ge=1, le=500),
+):
+    """List jobs, optionally filtered by run, minimum fit score, or sponsorship status."""
+    if run_id:
+        jobs = get_jobs_by_run(run_id)
     else:
-        next_action = "collect_jobs"
+        jobs = get_all_jobs(limit=limit)
+    if min_score:
+        jobs = [j for j in jobs if (j.get("fit_score") or 0) >= min_score]
+    if sponsorship:
+        jobs = [j for j in jobs if j.get("sponsorship_status") == sponsorship]
+    return {"jobs": jobs, "total": len(jobs)}
 
-    latency_ms = int((time.perf_counter() - start) * 1000)
 
-    if payload.run_id:
-        top_result = results[0] if results else None
-        status = "completed"
-        message = "Job evaluation completed"
+@router.get("/{job_id}/lead")
+async def get_job_lead(
+    job_id:    str,
+    run_id:    Optional[str] = Query(None, description="Run ID to look up the job from"),
+    job_title: str           = Query("",   description="Job title hint for Apollo search"),
+    company:   str           = Query("",   description="Company name"),
+    domain:    Optional[str] = Query(None, description="Company domain e.g. tesco.com"),
+):
+    """
+    Find the best recruiter / HR contact email for a specific job.
 
-        if not results:
-            status = "warning"
-            message = "No jobs were provided for evaluation"
-        elif not shortlisted:
-            status = "warning"
-            message = "Jobs evaluated but no safe shortlist was produced"
-        elif risky_shortlist_count > 0:
-            status = "warning"
-            message = "Jobs evaluated but shortlist contains risk flags"
+    The Streamlit frontend calls this endpoint before firing a cold email so
+    the user can see the discovered contact before sending.  The endpoint
+    tries Hunter.io → Apollo.io → heuristic in order and returns whichever
+    strategy succeeded.
 
-        add_event(
-            payload.run_id,
-            {
-                "step_name": "job_match",
-                "step_type": "matching",
-                "status": status,
-                "message": message,
-                "input_summary": {
-                    "jobs_count": len(payload.jobs),
-                    "needs_visa_sponsorship": payload.needs_visa_sponsorship,
-                    "target_roles_count": len(payload.target_roles),
-                    "minimum_fit_score": minimum_fit_score,
-                },
-                "output_summary": {
-                    "shortlisted_jobs": len(shortlisted),
-                    "risky_shortlist_jobs": risky_shortlist_count,
-                    "top_job_title": top_result["title"] if top_result else None,
-                    "top_job_company": top_result["company"] if top_result else None,
-                    "top_fit_score": top_result["fit_score"] if top_result else None,
-                    "next_action": next_action,
-                },
-                "latency_ms": latency_ms,
-            }
-        )
+    Returns:
+        {
+            "email":    "talent@tesco.com",
+            "strategy": "hunter" | "apollo" | "heuristic",
+            "company":  "Tesco"
+        }
+    """
+    if not company:
+        # Try to resolve company from the job record if a run_id was provided
+        if run_id:
+            jobs = get_jobs_by_run(run_id)
+            matched = [j for j in jobs if str(j.get("id", "")) == job_id
+                       or j.get("url", "").endswith(job_id)]
+            if matched:
+                company = matched[0].get("company", "")
+                job_title = job_title or matched[0].get("title", "")
+                domain = domain or matched[0].get("domain")
+        if not company:
+            raise HTTPException(
+                status_code=422,
+                detail="'company' query parameter is required when job record cannot be resolved"
+            )
 
-    return {
-        "candidate_name": payload.candidate_name,
-        "total_jobs_evaluated": len(payload.jobs),
-        "shortlisted_jobs": shortlisted,
-        "all_job_results": results,
-        "next_action": next_action,
-    }
+    resolved_domain = domain or _guess_domain(company)
+    result = await find_recruiter_email(
+        company=company,
+        domain=resolved_domain,
+        job_title=job_title,
+    )
+    return result

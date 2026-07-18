@@ -1,5 +1,9 @@
-# Kept for backwards compatibility if you want to run the sidecar separately.
-# The main app now calls jobspy directly (no sidecar needed).
-fastapi>=0.111
-uvicorn[standard]>=0.29
-python-jobspy>=0.1.24
+# JobSpy sidecar service — dependencies are a subset of the root requirements.txt.
+# Install from the repo root with:
+#
+#   pip install -r requirements.txt
+#
+# If you want to run ONLY the sidecar in isolation:
+fastapi~=0.111.0
+uvicorn[standard]~=0.29.0
+python-jobspy~=0.1.24
