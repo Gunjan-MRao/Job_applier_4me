@@ -159,16 +159,43 @@ def process_alive(pid):
         return False
 
 
+def _preflight_backend_deps():
+    """Return (ok, message). Checks the things that silently break startup."""
+    import importlib.util
+    missing = [m for m in ("uvicorn", "fastapi") if importlib.util.find_spec(m) is None]
+    if missing:
+        pkgs = " ".join(missing)
+        return False, (
+            f"Required package(s) not installed in this Python: {pkgs}.\n"
+            f"Python in use: {PYTHON_EXE}\n"
+            f"Fix: \"{PYTHON_EXE}\" -m pip install {pkgs}"
+        )
+    if not (BASE_DIR / "backend" / "main.py").exists():
+        return False, (
+            f"Cannot find backend/main.py under {BASE_DIR}.\n"
+            "Run the launcher from inside the job_application_copilot/ folder."
+        )
+    return True, ""
+
+
 def start_backend():
     if is_port_open():
         return True, "Backend already running."
+
+    ok, msg = _preflight_backend_deps()
+    if not ok:
+        LOG_FILE.write_text(msg, encoding="utf-8")
+        return False, msg
+
     LOG_FILE.write_text("", encoding="utf-8")
     cmd = [
         PYTHON_EXE, "-m", "uvicorn", "backend.main:app",
         "--host", API_HOST, "--port", str(API_PORT), "--log-level", "info",
     ]
+    log_handle = None
     try:
-        kw = dict(cwd=str(BASE_DIR), stdout=open(LOG_FILE, "w"), stderr=subprocess.STDOUT)
+        log_handle = open(LOG_FILE, "w")
+        kw = dict(cwd=str(BASE_DIR), stdout=log_handle, stderr=subprocess.STDOUT)
         if os.name == "nt":
             kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -178,11 +205,34 @@ def start_backend():
         for _ in range(30):
             if is_port_open():
                 return True, f"Backend started (PID {proc.pid})"
+            # If the child already exited, don't wait the full 15s — surface the error now.
+            if proc.poll() is not None:
+                log = LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1500:] if LOG_FILE.exists() else ""
+                hint = ""
+                if "Address already in use" in log or "10048" in log:
+                    hint = (f"\n\nHint: port {API_PORT} is already in use by another process. "
+                            f"Close whatever is using it, or stop the old backend, then retry.")
+                elif "ModuleNotFoundError" in log or "ImportError" in log:
+                    hint = ("\n\nHint: a Python package is missing in this environment. "
+                            f"Run: \"{PYTHON_EXE}\" -m pip install -r requirements.txt")
+                return False, (
+                    f"Backend process exited immediately (code {proc.returncode}).{hint}\n\n"
+                    f"Startup log:\n{log}"
+                )
             time.sleep(0.5)
         log = LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1500:] if LOG_FILE.exists() else ""
-        return False, f"Backend did not respond.\n\nStartup log:\n{log}"
+        return False, (
+            f"Backend did not open port {API_PORT} within 15s.\n\n"
+            f"Startup log:\n{log or '(empty — check that uvicorn is installed)'}"
+        )
     except Exception as exc:
-        return False, f"Could not launch: {exc}"
+        return False, f"Could not launch backend: {exc}\nPython in use: {PYTHON_EXE}"
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
 
 
 def stop_backend():
@@ -492,11 +542,14 @@ def tab_setup():
                 st.session_state["resume_filename"] = fname
                 if profile.get("email") and not st.session_state.get("candidate_email"):
                     st.session_state["candidate_email"] = profile["email"]
-                # Jump straight to AI Agent tab
-                _go(PAGE_AGENT)
+                # Stay on Setup so the user can REVIEW the parsed profile below.
+                # Advancing to the AI Agent step is an explicit user action via the
+                # "Go to AI Agent" button — never an automatic jump on parse.
+                st.rerun()
 
     p = st.session_state.get("resume_profile")
     if p:
+        st.success("✅ Resume parsed — review the details below, then click **Go to AI Agent** when ready.")
         st.markdown("### \U0001f4cc Extracted profile")
         c1, c2 = st.columns(2)
         with c1:

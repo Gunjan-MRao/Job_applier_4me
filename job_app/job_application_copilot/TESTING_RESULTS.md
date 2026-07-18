@@ -240,3 +240,119 @@ the `main.py` change.
 
 Bottom line: with no API keys at all, both servers boot cleanly and the app produces
 195 matched jobs each with a drafted, personalised cover letter and cold email.
+
+---
+
+## 7. UI Button Flow Test (Playwright, real rendered Streamlit UI)
+
+This section covers a **new bug report** made after using the actual Streamlit UI
+(not just API calls): *as soon as you click "Parse resume", the app jumps straight
+to the "Start AI Agent" step*, skipping the intended flow of **parse resume →
+review the parsed profile → then explicitly go to the AI Agent**.
+
+### The bug and its exact root cause
+
+The root cause was **not** a session_state collision, an `if/elif` fallthrough, a
+duplicate `key=`, or a stale rerun condition. It was a single deliberate line of
+code in the "Parse resume" button handler in `app.py` (`tab_setup()`):
+
+```python
+# BEFORE (the bug):
+st.session_state["resume_profile"]  = profile
+st.session_state["resume_filename"] = fname
+...
+# Jump straight to AI Agent tab
+_go(PAGE_AGENT)          # <-- navigates away on parse, skipping the review
+```
+
+`_go()` sets `st.session_state["page"]` and calls `st.rerun()`, so parsing the
+resume immediately changed the page to the AI Agent view. The "📌 Extracted
+profile" review block further down in `tab_setup()` was therefore never shown —
+the user never got a chance to review the parsed data before the agent step.
+
+### The fix (root cause, not a band-aid)
+
+`_go(PAGE_AGENT)` was removed from the parse handler and replaced with a plain
+`st.rerun()`, so the app stays on the Setup page and renders the parsed-profile
+review. Advancing to the AI Agent step is now **only** the explicit
+"🤖 Go to AI Agent ➤" button that already existed below the review.
+
+```python
+# AFTER (the fix):
+st.session_state["resume_profile"]  = profile
+st.session_state["resume_filename"] = fname
+...
+# Stay on Setup so the user can REVIEW the parsed profile below.
+# Advancing to the AI Agent step is an explicit user action via the
+# "Go to AI Agent" button — never an automatic jump on parse.
+st.rerun()
+```
+
+A success banner was also added above the review:
+`✅ Resume parsed — review the details below, then click Go to AI Agent when ready.`
+
+### Playwright regression test
+
+`tests/test_ui_button_flow.py` drives the **real rendered Streamlit UI** with a
+headless Chromium browser. It is self-contained: it boots the FastAPI backend
+(port 8010) and Streamlit (port 8511) with a blank `.env`, then:
+
+1. loads the app and waits for the Setup page ("Upload your resume"),
+2. uploads `tests/fixtures/sample_resume.docx`,
+3. clicks **Parse resume**,
+4. asserts the **"Extracted profile" review is visible**,
+5. asserts **"Start AI Agent" is NOT present** (the skip bug would fail here),
+6. clicks **"Go to AI Agent"** and asserts the **"AI Job Agent"** step appears.
+
+The test **skips gracefully** (never fails the suite) if Playwright, the Chromium
+browser, or the servers/ports are unavailable — so the offline suite stays green
+in environments without a browser.
+
+Playwright run output (with the fix in place):
+
+```
+PASS: 'Extracted profile' review is visible after Parse resume
+PASS: 'Start AI Agent' is NOT shown after Parse resume (no skip)
+PASS: 'AI Job Agent' step appears after clicking 'Go to AI Agent'
+ALL SMOKE CHECKS PASSED
+
+$ pytest tests/test_ui_button_flow.py -v
+tests/test_ui_button_flow.py::test_parse_does_not_skip_to_agent PASSED   [100%]
+1 passed in 5.96s
+```
+
+Full suite after adding the test: **51 passed** (was 50 + this new UI test).
+
+### Backend "did not start" — findings and hardening
+
+The report also said the backend "did not start" for the user (on Windows). The
+backend is launched from **inside** the Streamlit UI via `start_backend()` in
+`app.py` (not by `launch_app.bat`, which only starts Streamlit). Review findings:
+
+- `launch_app.bat` uses robust Python discovery (py launcher, PATH, AppData,
+  Program Files, Anaconda) and has **no** hardcoded Unix or `C:\` paths.
+- `app.py` already uses `pathlib` for `BASE_DIR`, `PID_FILE`, `LOG_FILE`; a grep
+  for hardcoded `/` and `C:\` paths found only a harmless careers URL, so there
+  was no Windows path bug to fix.
+- The real weakness was **silent failure**: if a dependency was missing or the
+  child process exited immediately (e.g. port already in use), `start_backend()`
+  gave no actionable message.
+
+Hardening applied to `start_backend()` (and a new `_preflight_backend_deps()`):
+
+- **Preflight check** before spawning: verifies `uvicorn`/`fastapi` are importable
+  in the *exact* Python being used and that `backend/main.py` exists — returning a
+  precise message with the interpreter path and the exact `pip install` command.
+- **Immediate-exit detection**: the wait loop now checks `proc.poll()`; if the
+  child dies, it reads the log tail and surfaces targeted hints —
+  *"Address already in use" / "10048"* → port-conflict hint;
+  *"ModuleNotFoundError" / "ImportError"* → pip-install hint.
+- A clearer timeout message and a `finally` block that closes the log file handle.
+
+**Honest limitation:** this was verified on Linux, so Windows-specific behavior
+could not be fully reproduced in the sandbox. Without the user's **actual Windows
+error log / console output**, the precise cause of their "backend did not start"
+cannot be confirmed — but startup failures now print clear, actionable messages
+(missing package + exact install command, port conflict, or a log tail on
+immediate exit) instead of failing silently, which will make the real cause
+visible the next time it happens on their machine.
