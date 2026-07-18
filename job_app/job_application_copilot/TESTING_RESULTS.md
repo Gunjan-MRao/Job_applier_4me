@@ -889,3 +889,91 @@ surfaced), not after the full 30 s budget.
   and correct: `urllib3<3`, `charset-normalizer<4`, `chardet<6`.
 
 **Full suite: 72 passed** (67 prior − 6 removed + 11 new), zero regressions.
+
+---
+
+## 13. F-string Syntax Fix — profile page crashed on Python < 3.12
+
+### The bug
+
+The launcher now opens the browser, but the Setup page crashed at render time with
+a real Python error surfaced in the browser:
+
+```
+File ".../app.py", line 556
+    st.write(f"👤 **Name:** {p.get('candidate_name') or '—'}")
+SyntaxError: f-string expression part cannot include a backslash
+```
+
+### Why it only breaks on certain Python versions
+
+The em-dash placeholder was written as an escaped character (`'—'`) placed
+**directly inside an f-string `{expression}` part**. PEP 701 relaxed the f-string
+grammar in **Python 3.12** to allow backslashes inside `{...}`, but on **Python
+3.9–3.11 this is a hard `SyntaxError`**. The project docs ask for
+`conda create -n jobcopilot python=3.12`, but the user's actual `jobcopilot`
+environment was older, so the module imported far enough to boot and then the
+page crashed the moment it tried to compile this line. Expected/documented Python
+is **3.12** (README.md, SETUP.md, launch_app.bat, TESTING_RESULTS.md all pin it),
+but the fix is written to be compatible with **Python 3.9+** regardless of the
+user's env.
+
+### The fix
+
+Escaped characters used inside f-string braces were moved into plain module-level
+string constants near the top of `app.py` (line 103-105):
+
+```python
+EM_DASH    = "—"                # em-dash placeholder for a missing value
+ICON_WARN  = "⚠️"        # warning sign
+ICON_CHECK = "✅"                # check mark
+```
+
+The f-strings then reference the constant instead of an inline escape, which parses
+on every supported Python version.
+
+### All locations fixed (`app.py`)
+
+| Line | Fixed expression |
+|------|------------------|
+| 564  | `f"...**Name:** {p.get('candidate_name') or EM_DASH}"` |
+| 565  | `f"...**Email:** {p.get('email') or EM_DASH}"` |
+| 566  | `f"...**Experience:** {p.get('years_of_experience_hint') or EM_DASH}"` |
+| 571  | `f"...**Skills ({len(skills_list)}):** {', '.join(skills_list) or EM_DASH}"` |
+| 812  | `f"{ICON_WARN if review_mode else ICON_CHECK} {fit}% | {title} @ {co} | {src}"` |
+| 1061 | `f"Updated: {app.get('updated_at', EM_DASH)}"` |
+
+A full-tree AST scan of every `.py` under the project confirmed **6 offenders
+before, 0 after** — all were in `app.py`.
+
+### Proof — the page renders, not just parses
+
+Booted the Setup page through Streamlit's `AppTest` (which actually executes the
+f-string line) on both the populated and the missing-value fallback paths:
+
+```
+[full] rendered OK; no exception; 'Name:' line present
+   -> 👤 **Name:** Ada Lovelace
+[missing-values] rendered OK; no exception; 'Name:' line present
+   -> 👤 **Name:** —
+RESULT: PROFILE-RENDER PASS
+```
+
+### CI-style guards so this can't silently ship again
+
+- `tests/test_syntax_compat.py`:
+  - `test_no_backslash_inside_fstring_expressions` — the **authoritative** check.
+    Walks the AST of every `.py`, recovers the source text of each f-string
+    `{expression}` via `ast.get_source_segment`, and fails on any backslash. This
+    catches the regression on **any** host, including Python 3.12+ where the code
+    parses fine and a plain parse would not notice.
+  - `test_parses_under_min_supported_python` — parametrized over every `.py`,
+    `ast.parse(..., feature_version=(3, 9))`. Catches ordinary syntax errors and
+    adds real f-string coverage on <3.12 CI. (Note: `feature_version` does not
+    re-impose the pre-3.12 f-string tokenizer rule on a 3.12+ host, which is
+    exactly why the dedicated AST scan above exists.)
+- `tests/test_profile_render.py` — two `AppTest` tests that render the actual
+  extracted-profile block and assert no exception on both the full and EM_DASH
+  fallback paths.
+
+**Full suite: 184 passed**, zero regressions.

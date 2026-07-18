@@ -96,6 +96,14 @@ DEFAULT_KEYWORDS = (
 POLL_THROTTLE_S  = 4.0
 AUTO_REFRESH_MS  = 5000  # for st_autorefresh
 
+# Plain-string constants for characters used INSIDE f-string {expression} parts.
+# A backslash escape (e.g. a "—" em-dash) placed directly inside f-string braces
+# is a SyntaxError on Python < 3.12 (PEP 701 only relaxed this in 3.12). Keeping
+# them as module constants makes every f-string below work on Python 3.9+.
+EM_DASH    = "\u2014"                # em-dash placeholder for a missing value
+ICON_WARN  = "\u26a0\ufe0f"        # warning sign
+ICON_CHECK = "\u2705"                # check mark
+
 
 # ---------------------------------------------------------------------------
 # Navigation helpers
@@ -553,14 +561,14 @@ def tab_setup():
         st.markdown("### \U0001f4cc Extracted profile")
         c1, c2 = st.columns(2)
         with c1:
-            st.write(f"\U0001f464 **Name:** {p.get('candidate_name') or '\u2014'}")
-            st.write(f"\U0001f4e7 **Email:** {p.get('email') or '\u2014'}")
-            st.write(f"\U0001f4bc **Experience:** {p.get('years_of_experience_hint') or '\u2014'}")
+            st.write(f"\U0001f464 **Name:** {p.get('candidate_name') or EM_DASH}")
+            st.write(f"\U0001f4e7 **Email:** {p.get('email') or EM_DASH}")
+            st.write(f"\U0001f4bc **Experience:** {p.get('years_of_experience_hint') or EM_DASH}")
         with c2:
             roles_str   = ", ".join(p.get("likely_roles") or []) or "\u2014"
             skills_list = p.get("skills") or []
             st.write(f"\U0001f3af **Roles detected:** {roles_str}")
-            st.write(f"\u2699\ufe0f **Skills ({len(skills_list)}):** {', '.join(skills_list) or '\u2014'}")
+            st.write(f"\u2699\ufe0f **Skills ({len(skills_list)}):** {', '.join(skills_list) or EM_DASH}")
         edu_list = p.get("education") or []
         if edu_list:
             st.write(f"\U0001f393 **Education:** {', '.join(edu_list)}")
@@ -801,7 +809,7 @@ def _render_job_card(job: dict, review_mode: bool):
         "no":      status_pill("No sponsorship", "#ef4444"),
         "unknown": status_pill("Sponsorship ?",  "#f59e0b"),
     }.get(spons, "")
-    label = f"{'\u26a0\ufe0f' if review_mode else '\u2705'} {fit}% | {title} @ {co} | {src}"
+    label = f"{ICON_WARN if review_mode else ICON_CHECK} {fit}% | {title} @ {co} | {src}"
     with st.expander(label):
         hc1, hc2, hc3 = st.columns([2, 1, 1])
         with hc1:
@@ -1050,7 +1058,7 @@ def tab_applications():
                     st.link_button("View", job_url)
             with cb:
                 st.markdown(status_pill(app.get("status", "draft")), unsafe_allow_html=True)
-                st.caption(f"Updated: {app.get('updated_at', '\u2014')}")
+                st.caption(f"Updated: {app.get('updated_at', EM_DASH)}")
             with cc:
                 opts       = ["draft", "ready", "submitted", "interview", "rejected"]
                 cur_status = app.get("status", "draft")
