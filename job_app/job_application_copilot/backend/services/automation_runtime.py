@@ -58,6 +58,12 @@ except ImportError:
     JOBSPY_AVAILABLE = False
 
 try:
+    from groq import Groq as _Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+
+try:
     import openai as _openai
     OPENAI_AVAILABLE = True
 except ImportError:
@@ -339,6 +345,31 @@ def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dic
 # LLM — FREE first, paid optional, offline always works
 # ---------------------------------------------------------------------------
 
+_GROQ_MODEL = "llama-3.3-70b-versatile"
+_groq_client = None
+
+
+def _groq(prompt: str, max_tokens: int = 500) -> Optional[str]:
+    """Primary LLM — Groq free tier. Returns None if unavailable so the
+    chain can fall through to the next provider / offline template."""
+    global _groq_client
+    key = getattr(settings, "groq_api_key", None)
+    if not GROQ_AVAILABLE or not key:
+        return None
+    try:
+        if _groq_client is None:
+            _groq_client = _Groq(api_key=key)
+        resp = _groq_client.chat.completions.create(
+            model=_GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0.7,
+        )
+        return (resp.choices[0].message.content or "").strip() or None
+    except Exception:
+        return None
+
+
 def _gemini(prompt: str, max_tokens: int = 500) -> Optional[str]:
     key = getattr(settings, "gemini_api_key", None)
     if not key:
@@ -408,8 +439,12 @@ def _anthropic_llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
         return None
 
 def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
+    # Priority: Groq (free primary) → Gemini → HuggingFace → OpenAI → Anthropic.
+    # All return None when their key/package is missing, so the caller falls
+    # back to the offline template and the pipeline always produces output.
     return (
-        _gemini(prompt, max_tokens)
+        _groq(prompt, max_tokens)
+        or _gemini(prompt, max_tokens)
         or _huggingface(prompt, max_tokens)
         or _openai_llm(prompt, max_tokens)
         or _anthropic_llm(prompt, max_tokens)
@@ -1093,6 +1128,7 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         if not all_jobs:
             add_log(run, "warning", "No live jobs found — showing sample jobs")
             all_jobs = FALLBACK_JOBS[:]
+            update_run(run_id, jobs_scanned=len(all_jobs))
 
         update_run(run_id,
                    stage="🤖 Scoring jobs and generating cover letters...",

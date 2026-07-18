@@ -1,0 +1,32 @@
+Bindu Sharma
+bindu.sharma@example.com
++44 7123 456789
+London, United Kingdom
+linkedin.com/in/bindusharma
+
+PROFESSIONAL SUMMARY
+Supply chain and logistics professional with 3 years of experience in demand
+planning, procurement and inventory management. Skilled in SAP, Excel, Power BI
+and SQL, with a track record of reducing stock-holding costs and improving
+forecast accuracy.
+
+WORK EXPERIENCE
+Supply Chain Analyst — Midlands Distribution Ltd
+Jan 2022 - Present
+- Built demand forecasting models in Excel and Power BI, improving forecast
+  accuracy by 18%.
+- Managed procurement and vendor relationships across 40+ suppliers using SAP.
+- Reduced excess inventory by GBP 220,000 through S&OP process improvements.
+
+Logistics Coordinator — GreenLeaf Foods
+Jun 2020 - Dec 2021
+- Coordinated inbound and outbound freight for 3 distribution centres.
+- Tracked KPIs and produced weekly operations reports for management.
+
+EDUCATION
+MSc Supply Chain Management — University of Warwick
+BCom Business Administration — University of Delhi
+
+SKILLS
+Supply chain, logistics, procurement, SAP, Excel, Power BI, SQL, forecasting,
+demand planning, inventory management, S&OP, vendor management, operations

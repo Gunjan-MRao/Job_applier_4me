@@ -25,13 +25,15 @@ def test_health_endpoint():
 
 
 @pytest.mark.skipif(not API_AVAILABLE, reason="FastAPI app unavailable")
-def test_list_runs_empty():
-    resp = client.get("/api/v1/runs")
+def test_list_runs_returns_dict():
+    resp = client.get("/automation/runs")
     assert resp.status_code == 200
-    assert isinstance(resp.json(), list)
+    body = resp.json()
+    assert isinstance(body, dict)
+    assert isinstance(body.get("runs"), list)
 
 
 @pytest.mark.skipif(not API_AVAILABLE, reason="FastAPI app unavailable")
 def test_get_unknown_run():
-    resp = client.get("/api/v1/runs/nonexistent-run-id")
+    resp = client.get("/automation/status/nonexistent-run-id")
     assert resp.status_code == 404

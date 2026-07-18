@@ -535,18 +535,28 @@ def tab_agent():
         else:
             st.warning(f"\U0001f534 Backend: **{be_status}** \u2014 agent will start it automatically")
 
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    env_file   = BASE_DIR / ".env"
-    if not gemini_key and env_file.exists():
-        for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.strip().startswith("GEMINI_API_KEY="):
-                gemini_key = line.split("=", 1)[1].strip()
-                break
+    def _env_key(*names: str) -> str:
+        for name in names:
+            val = os.environ.get(name, "")
+            if val:
+                return val
+        env_file = BASE_DIR / ".env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                for name in names:
+                    if line.strip().startswith(f"{name}="):
+                        val = line.split("=", 1)[1].strip()
+                        if val:
+                            return val
+        return ""
+
+    llm_key      = _env_key("GROQ_API_KEY", "GEMINI_API_KEY")
+    llm_provider = "Groq" if _env_key("GROQ_API_KEY") else "Gemini"
     with col_gem:
-        if gemini_key:
-            st.success("\u2705 Gemini API key \u2014 AI cover letters enabled")
+        if llm_key:
+            st.success(f"\u2705 {llm_provider} API key \u2014 AI cover letters enabled")
         else:
-            st.warning("\u26a0\ufe0f No Gemini key \u2014 using smart offline templates")
+            st.warning("\u26a0\ufe0f No LLM key \u2014 using smart offline templates (add GROQ_API_KEY for AI)")
 
     if not p:
         st.warning("\u26a0\ufe0f No resume loaded \u2014 go to **\u2699\ufe0f Setup** first for best results.")

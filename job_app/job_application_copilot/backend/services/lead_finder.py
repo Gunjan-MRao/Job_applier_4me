@@ -175,7 +175,26 @@ def _heuristic_email(domain: Optional[str]) -> Optional[str]:
     return f"careers@{domain}"
 
 
+_DOMAIN_STOPWORDS = {
+    "uk", "ltd", "limited", "plc", "inc", "llc", "co", "company", "group",
+    "holdings", "international", "global", "services", "solutions", "the",
+    "and", "gmbh", "corp", "corporation",
+}
+
+
 def _guess_domain(company: str) -> str:
-    """Naively guess company domain from name."""
-    slug = re.sub(r"[^a-z0-9]", "", company.lower().split()[0])
-    return f"{slug}.com"
+    """Naively guess a company domain from its name.
+
+    Drops generic corporate stopwords (UK, Ltd, Services...) and strips
+    non-alphanumeric characters, then joins the meaningful words. Falls back
+    to the first raw word if everything was filtered out.
+    """
+    words = company.lower().split()
+    parts = []
+    for word in words:
+        cleaned = re.sub(r"[^a-z0-9]", "", word)
+        if cleaned and word not in _DOMAIN_STOPWORDS:
+            parts.append(cleaned)
+    if not parts:
+        parts = [re.sub(r"[^a-z0-9]", "", words[0])] if words else [""]
+    return f"{''.join(parts)}.com"
