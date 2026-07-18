@@ -139,116 +139,23 @@ echo       Python:     !PYTHON_EXE!
 echo.
 
 REM ============================================================
-REM  STEP 1 -- Verify / install dependencies
+REM  STEP 1-4 -- Hand off to the Python launcher
+REM ------------------------------------------------------------
+REM  Everything after conda activation (dependency check, port clearing, starting
+REM  the backend + Streamlit, health-polling, and opening the browser) is done by
+REM  launch.py. Python has far more reliable subprocess/polling/error-handling
+REM  than Windows batch -- and, crucially, any failure prints a real traceback
+REM  instead of the window silently vanishing (the exact regression we hit when
+REM  this orchestration lived in batch across several rounds of shell-poll bugs).
+REM  We `call` the interpreter (not `start`) so its output stays in THIS window,
+REM  and `pause` afterwards no matter what so the window can never close before
+REM  you have read whatever it printed (including any Python traceback).
 REM ============================================================
-echo [1/4] Checking dependencies...
-python -c "import streamlit, fastapi, uvicorn" >nul 2>&1
-if !errorlevel! neq 0 (
-    echo       Some packages are missing -- installing from requirements.txt ...
-    python -m pip install -q --upgrade pip
-    python -m pip install -r requirements.txt
-    if !errorlevel! neq 0 (
-        echo.
-        echo [ERROR] pip install failed.
-        echo   Check your internet connection, then run manually:
-        echo       python -m pip install -r requirements.txt
-        echo.
-        pause
-        exit /b 1
-    )
-    REM Re-check after install.
-    python -c "import streamlit, fastapi, uvicorn" >nul 2>&1
-    if !errorlevel! neq 0 (
-        echo.
-        echo [ERROR] Required packages still not importable after install.
-        echo   Try:  python -m pip install -r requirements.txt
-        echo.
-        pause
-        exit /b 1
-    )
-)
-echo       Dependencies OK.
+call "!PYTHON_EXE!" "%~dp0launch.py"
+
 echo.
-
-REM ============================================================
-REM  STEP 2 -- Free ports 8000 (backend) and 8501 (UI)
-REM ============================================================
-echo [2/4] Clearing old processes on ports %API_PORT% and %UI_PORT% (if any)...
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":%API_PORT% "') do taskkill /PID %%a /F >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":%UI_PORT% "')  do taskkill /PID %%a /F >nul 2>&1
-echo       Done.
-echo.
-
-REM ============================================================
-REM  STEP 3 -- Start the FastAPI backend and WAIT until healthy
-REM ============================================================
-echo [3/4] Starting backend API on http://127.0.0.1:%API_PORT% ...
-REM Launch uvicorn in its own titled window (cmd /k keeps it open so any
-REM traceback stays visible instead of the window flashing and closing).
-start "JobCopilot Backend (port %API_PORT%)" cmd /k ""!PYTHON_EXE!" -m uvicorn backend.main:app --host 127.0.0.1 --port %API_PORT%"
-
-echo       Waiting for the backend to become healthy...
-REM Poll /health until it returns 200 (see :poll_url -- uses curl.exe, which is
-REM built into Windows 10 1803+/11, and falls back to PowerShell on older boxes).
-call :poll_url "http://127.0.0.1:%API_PORT%/health" 30
-if not defined POLL_OK (
-    echo.
-    echo [ERROR] The backend did not report healthy within 30 seconds.
-    echo   Look at the "JobCopilot Backend" window that just opened -- the real
-    echo   error (missing package, port in use, import error) is printed there.
-    echo   A copy is also saved in:  backend_startup.log
-    echo.
-    echo   Common fixes:
-    echo     * Port %API_PORT% already in use  -- close the other program / reboot.
-    echo     * ModuleNotFoundError             -- python -m pip install -r requirements.txt
-    echo.
-    pause
-    exit /b 1
-)
-echo       Backend is healthy.
-echo.
-
-REM ============================================================
-REM  STEP 4 -- Start the Streamlit UI, then open the browser ourselves
-REM ============================================================
-echo [4/4] Starting the Streamlit UI on http://localhost:%UI_PORT% ...
-REM IMPORTANT: run Streamlit with --server.headless true.
-REM   With headless=false, a FIRST run of Streamlit prints an interactive
-REM   "Welcome to Streamlit!  Email:" prompt and then BLOCKS waiting for you to
-REM   type something on the keyboard. From a double-clicked .bat that looks like
-REM   nothing happens -- no browser opens and no app appears -- which is exactly
-REM   the symptom we hit. headless=true skips that prompt and starts immediately.
-REM   Because headless mode does not auto-open a browser, we open it ourselves
-REM   below once the UI is confirmed up, so a broken browser association can never
-REM   make it look like the UI failed to launch.
-REM   Use the resolved full python path (same one the backend uses) and give the
-REM   UI its own window so any startup error stays visible instead of vanishing.
-start "JobCopilot UI (port %UI_PORT%)" cmd /k ""!PYTHON_EXE!" -m streamlit run app.py --server.port %UI_PORT% --server.headless true"
-
-echo       Waiting for the UI to become available...
-REM Poll the UI port until 200, up to ~60s (first run may compile/import slowly).
-call :poll_url "http://127.0.0.1:%UI_PORT%/" 60
-if not defined POLL_OK (
-    echo.
-    echo [ERROR] The Streamlit UI did not come up within 60 seconds.
-    echo   Look at the "JobCopilot UI" window that just opened -- the real error
-    echo   ^(missing package, port in use, import error^) is printed there.
-    echo.
-    pause
-    exit /b 1
-)
-
-echo       UI is up. Opening your browser at http://localhost:%UI_PORT% ...
-start "" "http://localhost:%UI_PORT%"
-echo.
-echo ============================================================
-echo  Both servers are now running, each in its own window:
-echo    * Backend API : http://127.0.0.1:%API_PORT%
-echo    * Streamlit UI: http://localhost:%UI_PORT%
-echo  Close those two windows ^(or press Ctrl+C in them^) to stop the app.
-echo ============================================================
 pause
-exit /b 0
+exit /b %errorlevel%
 
 REM ============================================================
 REM  Subroutines
@@ -298,44 +205,4 @@ for /f "tokens=2,*" %%A in ('reg query "%~1" /s 2^>nul ^| findstr /i "REG_SZ"') 
         if exist "%%~B\Scripts\activate.bat" set "CONDA_BASE=%%~B"
     )
 )
-goto :eof
-
-REM --- :poll_url <url> <max_seconds> ------------------------------------------
-REM  Polls <url> once per second until it returns HTTP 200 or <max_seconds>
-REM  attempts are exhausted. Sets POLL_OK=1 on success; leaves it undefined on
-REM  timeout. The caller checks "if not defined POLL_OK".
-REM
-REM  Primary path: curl.exe (present on Windows 10 1803+ and all Windows 11 at
-REM  %SystemRoot%\System32\curl.exe). A plain HTTP GET + status check with hard
-REM  --connect-timeout/--max-time is simple and predictable -- no PowerShell
-REM  startup cost, module autoload, execution-policy or IE-engine/proxy quirks
-REM  that were making the old "powershell Invoke-WebRequest" one-liner hang after
-REM  a successful 200 on some real Windows machines.
-REM
-REM  Fallback: if curl.exe cannot be found at all (very old Windows), use the
-REM  original PowerShell one-liner so nothing regresses on edge-case boxes.
-:poll_url
-set "POLL_OK="
-set "_URL=%~1"
-set "_MAX=%~2"
-set "_CURL="
-if exist "%SystemRoot%\System32\curl.exe" set "_CURL=%SystemRoot%\System32\curl.exe"
-if not defined _CURL for %%X in (curl.exe) do if not defined _CURL if not "%%~$PATH:X"=="" set "_CURL=%%~$PATH:X"
-if defined _CURL (
-    for /l %%i in (1,1,%_MAX%) do (
-        if not defined POLL_OK (
-            set "CODE=000"
-            for /f "usebackq delims=" %%C in (`"!_CURL!" -s -o nul -w "%%{http_code}" --connect-timeout 2 --max-time 5 "%_URL%" 2^>nul`) do set "CODE=%%C"
-            if "!CODE!"=="200" (
-                set "POLL_OK=1"
-            ) else (
-                timeout /t 1 /nobreak >nul 2>&1
-            )
-        )
-    )
-    goto :eof
-)
-REM Fallback: PowerShell (only reached when curl.exe is genuinely absent).
-powershell -NoProfile -Command "$u='%_URL%'; for($i=0;$i -lt %_MAX%;$i++){ try{ if((Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 2).StatusCode -eq 200){ exit 0 } }catch{}; Start-Sleep -Seconds 1 }; exit 1"
-if !errorlevel! equ 0 set "POLL_OK=1"
 goto :eof

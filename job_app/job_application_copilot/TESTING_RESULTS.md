@@ -777,3 +777,115 @@ flags) proves prompt-200, clean timeout on a dead port, and slow-start wait; plu
 static guards that `launch_app.bat` uses the curl-based `:poll_url`, keeps exactly
 one PowerShell invocation (the fallback, after the label), and gates both call
 sites on `POLL_OK`. **Full suite: 67 passed** (was 61), zero regressions.
+
+---
+
+## 12. Launcher Rewritten in Python (`launch.py`)
+
+### Why — batch was the wrong foundation, three rounds running
+
+The orchestration logic in `launch_app.bat` failed in a new, batch-specific way
+every round, each time with **no error surfaced to the user**:
+
+1. **PowerShell hang** — the `powershell Invoke-WebRequest` health poll received a
+   200 but never returned control to `cmd.exe`; the launcher hung forever at
+   "Waiting for the backend to become healthy...".
+2. **Streamlit headless block** — `--server.headless false` made a first-run
+   Streamlit print an interactive email prompt and block on stdin; nothing
+   appeared to happen.
+3. **Silent window-vanish** — the curl.exe batch retry loop caused the entire
+   launcher window to *disappear* before a single `GET /health` was even logged
+   (the "JobCopilot Backend" window showed uvicorn up + "Application startup
+   complete" but **no** `GET /health` line at all). A batch control-flow/quoting
+   failure terminated `cmd.exe` itself, leaving no traceback.
+
+Windows batch is simply unreliable for subprocess orchestration, polling with
+timeouts, and robust error surfacing. Python has vastly better primitives, and —
+the decisive point — **any failure prints a real traceback instead of a window
+silently closing.** So all of STEP 1–4 moved into `launch.py`.
+
+### What `launch.py` does
+
+- **Top-level `try/except`** around the whole body: on any uncaught error it
+  prints the full traceback and calls `input("Press Enter to exit...")`, so the
+  console can **never** silently vanish again, no matter what fails.
+- **Dependencies** — import-check `streamlit`/`fastapi`/`uvicorn`; if missing, run
+  `pip install -r requirements.txt` with clear status/errors.
+- **Port clearing** — parse `netstat -aon` (Windows) / `lsof` (POSIX) to find and
+  `taskkill`/`kill` anything already listening on 8000/8501.
+- **Backend** — `Popen([sys.executable, -m uvicorn backend.main:app ...])`, output
+  streaming to the console, then poll `http://127.0.0.1:8000/health` with
+  `urllib.request` (stdlib only — no curl, no PowerShell). Every iteration also
+  checks `proc.poll()`, so a backend that crashes on startup is reported in ~1s
+  with its return code instead of waiting the full 30s.
+- **Streamlit** — same pattern (`--server.headless true`), poll
+  `http://127.0.0.1:8501/`, then `webbrowser.open(...)`.
+- **Shutdown** — both subprocesses registered with `atexit`; closing the console
+  (or pressing Enter) terminates them.
+
+`launch_app.bat` is now minimal: it keeps ONLY the proven STEP 0 conda
+detection/activation (untouched — confirmed working on the user's real machine,
+including the `C:\Users\gunja\anaconda3\New folder` path) and then
+`call "!PYTHON_EXE!" launch.py` followed by an unconditional `pause`, so the
+window always stays open to show Python's output including any traceback. The old
+`:poll_url` subroutine (and all curl.exe/PowerShell polling) was removed.
+
+### Proof 1 — end-to-end, Python polling only
+
+Ran the real `launch.py` functions against a live backend + Streamlit in the
+sandbox (no curl/PowerShell/batch anywhere in the hot path):
+
+```
+[1/4] Checking dependencies...
+      Dependencies OK.
+[2/4] Clearing old processes on ports 8000 and 8501 (if any)...
+      Done.
+[3/4] Starting backend API on http://127.0.0.1:8000 ...
+      Waiting for the backend to become healthy...
+      Backend is healthy.
+[4/4] Starting the Streamlit UI on http://localhost:8501 ...
+      Waiting for the UI to become available...
+============================================================
+ Both servers are now running (proof driver):
+   * Backend API : http://127.0.0.1:8000/health
+   * Streamlit UI: http://127.0.0.1:8501/
+============================================================
+independent check backend /health -> 200
+independent check streamlit /     -> 200
+RESULT: END-TO-END PASS
+```
+
+Reaches **"Both servers are now running"** — the step that previously hung/vanished.
+
+### Proof 2 — crash detection is fast
+
+Pointed the backend at a non-existent app (`backend.main:NOPE_does_not_exist`) so
+uvicorn exits immediately, then ran the real `wait_until_healthy`:
+
+```
+ok=False reason='process exited (code 1)' elapsed=3.0s
+RESULT: CRASH-DETECTION PASS (fast failure, not full 30s timeout)
+```
+
+The immediate crash is detected via `proc.poll()` in **3.0 s** (return code
+surfaced), not after the full 30 s budget.
+
+### Regression tests
+
+- New `tests/test_launch_py.py` (11 tests): `wait_until_healthy` detects a prompt
+  200, waits for a slow-starting server, times out cleanly on a dead port, detects
+  an immediately-crashing subprocess fast (return code in the reason), and reports
+  healthy when the process stays alive; `http_status` returns `None` on a refused
+  connection; plus static guards that `launch_app.bat` hands off to `launch.py`,
+  no longer contains any `:poll_url`/`curl.exe`/PowerShell polling, keeps the STEP
+  0 conda subroutines, and always `pause`s — and that `launch.py` wraps its body
+  and pauses on error.
+- `tests/test_streamlit_launch.py` updated to assert the STEP 4 behaviours
+  (headless true, resolved `sys.executable`, browser-open, UI poll, backend health
+  poll) against their new home in `launch.py`.
+- Obsolete `tests/test_health_poll.py` (which guarded the removed batch curl
+  `:poll_url`) deleted; its Python-side equivalents now live in `test_launch_py.py`.
+- Requirements pins for the `RequestsDependencyWarning` fix confirmed still present
+  and correct: `urllib3<3`, `charset-normalizer<4`, `chardet<6`.
+
+**Full suite: 72 passed** (67 prior − 6 removed + 11 new), zero regressions.

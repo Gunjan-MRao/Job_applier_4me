@@ -1,66 +1,68 @@
-"""Regression test for the Streamlit-launch step (STEP 4) of launch_app.bat.
+"""Regression tests for the Streamlit-launch step (STEP 4).
 
-Real bug report: after the conda-detection fix let the launcher finally reach
-STEP 4 on the user's machine, the backend started and health-checked 200 OK but
-Streamlit never came up -- no browser, no app.
+Real bug report (earlier round): after conda-detection let the launcher reach
+STEP 4 on the user's machine, the backend health-checked 200 OK but Streamlit
+never came up -- no browser, no app. Root cause was `--server.headless false`,
+which on a FIRST run makes Streamlit print an interactive "Welcome to Streamlit!
+Email:" prompt and BLOCK on stdin. `--server.headless true` skips that prompt;
+the launcher then opens the browser itself (headless mode won't auto-open one).
 
-Root cause: STEP 4 ran
-
-    python -m streamlit run app.py --server.port 8501 --server.headless false
-
-On a FIRST run, `--server.headless false` makes Streamlit print an interactive
-"Welcome to Streamlit!  Email:" prompt and then BLOCK on stdin waiting for input.
-From a double-clicked .bat that looks like nothing happened. `--server.headless
-true` skips that prompt and starts immediately; the launcher then opens the
-browser itself (headless mode does not auto-open one).
-
-These tests guard the fixed STEP 4 so the regression cannot silently return.
+The orchestration has since moved OUT of launch_app.bat and into launch.py
+(Python is far more reliable for subprocess/polling/error-handling than batch,
+which failed across three rounds). So these guards now assert against launch.py,
+where the fixed STEP 4 behaviour lives -- the regressions they protect against
+(no headless flag, wrong python, no browser-open, no UI poll, broken health
+poll) still cannot silently return.
 """
 import os
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BAT = os.path.join(HERE, "launch_app.bat")
+LAUNCH_PY = os.path.join(HERE, "launch.py")
 REQ = os.path.join(HERE, "requirements.txt")
 
 
-def _bat_text():
-    return open(BAT, encoding="utf-8", errors="replace").read()
+def _py_text():
+    return open(LAUNCH_PY, encoding="utf-8", errors="replace").read()
 
 
 def test_streamlit_launched_headless_true():
-    """The whole point of the fix: headless TRUE (skips the blocking email prompt)."""
-    text = _bat_text()
-    assert "--server.headless true" in text
-    # The buggy form must be gone.
-    assert "--server.headless false" not in text
+    """The whole point of the earlier fix: headless TRUE (skips the email prompt)."""
+    text = _py_text()
+    assert '"--server.headless", "true"' in text
+    # The buggy form must never come back.
+    assert "headless false" not in text
+    assert '"--server.headless", "false"' not in text
 
 
 def test_streamlit_uses_resolved_python():
-    """Streamlit must use the same resolved full python path the backend uses."""
-    text = _bat_text()
-    # Find the streamlit-run line and confirm it invokes "!PYTHON_EXE!", not bare python.
-    line = next(l for l in text.splitlines() if "streamlit run app.py" in l)
-    assert "!PYTHON_EXE!" in line
+    """Streamlit must run under the SAME interpreter as the launcher (sys.executable),
+    which is exactly the resolved env python the batch activated -- never a bare
+    'python' that could resolve to a different install."""
+    text = _py_text()
+    # The streamlit command list must lead with sys.executable, not a literal "python".
+    assert 'sys.executable, "-m", "streamlit", "run", "app.py"' in text
 
 
 def test_launcher_opens_browser_itself():
     """Headless mode won't open a browser, so the launcher must open it explicitly."""
-    text = _bat_text()
-    assert 'start "" "http://localhost:%UI_PORT%"' in text
+    text = _py_text()
+    assert "webbrowser.open" in text
+    assert "localhost:" in text
 
 
 def test_launcher_waits_for_ui_port():
-    """STEP 4 should poll the UI port so we only open the browser once it is up."""
-    text = _bat_text()
-    # A PowerShell poll against the UI port, mirroring the backend health poll.
-    assert "127.0.0.1:%UI_PORT%" in text
+    """The launcher must poll the UI port so the browser only opens once it is up."""
+    text = _py_text()
+    assert "8501" in text
+    assert "wait_until_healthy(UI_URL" in text
 
 
 def test_backend_health_poll_preserved():
     """Guard: the working backend-start + health-poll logic must remain intact."""
-    text = _bat_text()
-    assert "127.0.0.1:%API_PORT%/health" in text
-    assert "uvicorn backend.main:app" in text
+    text = _py_text()
+    assert "/health" in text
+    assert "backend.main:app" in text
+    assert "wait_until_healthy(API_HEALTH_URL" in text
 
 
 def test_requirements_pin_requests_stack():
