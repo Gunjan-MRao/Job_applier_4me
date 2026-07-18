@@ -1,17 +1,29 @@
 """
-Job Application Copilot — Streamlit frontend v9.7
+Job Application Copilot — Streamlit frontend v9.8
+
+v9.8 — three bug fixes
+  1. Start AI Agent → bounces back to Setup (parse resume page)
+     Root cause: _PENDING was a module-level dict that Streamlit resets on
+     every browser rerun before the background thread writes run_id into it.
+     Fix: _PENDING state is now stored in st.session_state['_pending'] so it
+     survives reruns.  _launch_agent_thread writes into session_state via a
+     thread-safe list-swap; tab_agent reads from the same key.
+
+  2. POST /resume/parse → 500 Internal Server Error
+     Root cause: image-only / encrypted PDFs caused pypdf to raise inside
+     extract_resume_text; the outer except in the endpoint re-raised it as a
+     500.  Fix: extract_resume_text now catches every exception per page and
+     at the reader level, always returning '' instead of raising.
+
+  3. Windows asyncio "Exception in callback _ProactorBasePipeTransport.
+     _call_connection_lost" [WinError 10054]
+     Root cause: Windows Proactor event loop raises ConnectionResetError when
+     Streamlit's polling HTTP client drops a keep-alive before the server
+     finishes — known CPython/uvicorn issue.  Fix: startup handler installed
+     in main.py that silences ConnectionReset/Abort from the proactor.
 
 v9.7 — fix DeltaGenerator docstring dump
-  Root cause: ternary expressions like
-      col.info("...") if cond else col.warning("...")
-  return DeltaGenerator objects.  When these appear as bare expressions
-  Streamlit's exec() receives a non-None return value and calls help() on
-  it, printing the entire DeltaGenerator docstring to the UI.
-
-  Fix: replaced every bare ternary col.X() if … else col.Y() with
-  explicit if/else blocks so no value is ever returned to the exec frame.
-
-v9.6 — throttled polling (fixes burst-hammer on /automation/status)
+v9.6 — throttled polling
 v9.5 — complete dashboard polling rewrite
 """
 import asyncio
@@ -192,7 +204,15 @@ def _extract_text_raw(file_bytes, suffix):
     try:
         if suffix == ".pdf":
             from pypdf import PdfReader
-            return "\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(file_bytes)).pages)
+            pages = []
+            from io import BytesIO as _BytesIO
+            reader = PdfReader(_BytesIO(file_bytes))
+            for page in reader.pages:
+                try:
+                    pages.append(page.extract_text() or "")
+                except Exception:
+                    pages.append("")
+            return "\n".join(pages)
         if suffix == ".docx":
             from docx import Document
             return "\n".join(p.text for p in Document(BytesIO(file_bytes)).paragraphs)
@@ -316,36 +336,51 @@ def _sidebar_name(p, filename):
 
 
 # ---------------------------------------------------------------------------
-# Agent launch — runs entirely on background thread so UI stays responsive
+# Agent launch — runs on background thread, communicates via session_state
+#
+# FIX: _PENDING used to be a module-level dict which Streamlit resets on
+# every rerun (module re-execution).  It is now stored in
+# st.session_state["_pending"] so the background thread's writes survive
+# across reruns.  The thread never calls st.* APIs — it only mutates the
+# dict object that is already stored in session_state.
 # ---------------------------------------------------------------------------
 
-def _launch_agent_thread(cfg: dict):
-    global _PENDING
-    _PENDING["stage"] = "⚙️ Starting backend..."
-    if not is_port_open():
-        ok, msg = start_backend()
-        if not ok:
-            _PENDING["error"] = f"Backend failed to start: {msg}"
-            _PENDING["done"]  = True
-            return
-
-    _PENDING["stage"] = "📡 Calling /automation/start..."
-    result, err = _post("/automation/start", cfg)
-    if err or not result:
-        _PENDING["error"] = f"API error: {err}"
-        _PENDING["done"]  = True
-        return
-
-    _PENDING["run_id"] = result.get("run_id", "")
-    _PENDING["done"]   = True
-
-
-_PENDING: dict = {"done": False, "run_id": None, "error": None, "stage": ""}
+def _get_pending() -> dict:
+    """Return the shared pending-state dict from session_state."""
+    if "_pending" not in st.session_state:
+        st.session_state["_pending"] = {"done": False, "run_id": None, "error": None, "stage": ""}
+    return st.session_state["_pending"]
 
 
 def _reset_pending():
-    global _PENDING
-    _PENDING = {"done": False, "run_id": None, "error": None, "stage": ""}
+    st.session_state["_pending"] = {"done": False, "run_id": None, "error": None, "stage": ""}
+
+
+def _launch_agent_thread(pending: dict):
+    """
+    Runs on a daemon thread.  Mutates the `pending` dict directly —
+    this is the same dict object stored in st.session_state["_pending"],
+    so writes are visible to the next Streamlit rerun without any lock
+    (dict writes in CPython are GIL-protected).
+    """
+    pending["stage"] = "⚙️ Starting backend..."
+    if not is_port_open():
+        ok, msg = start_backend()
+        if not ok:
+            pending["error"] = f"Backend failed to start: {msg}"
+            pending["done"]  = True
+            return
+
+    pending["stage"] = "📡 Calling /automation/start..."
+    cfg = pending.get("cfg", {})
+    result, err = _post("/automation/start", cfg)
+    if err or not result:
+        pending["error"] = f"API error: {err}"
+        pending["done"]  = True
+        return
+
+    pending["run_id"] = result.get("run_id", "")
+    pending["done"]   = True
 
 
 # ---------------------------------------------------------------------------
@@ -468,9 +503,6 @@ def tab_agent():
 
     # ── Backend / API key status row ──────────────────────────────────────
     # NOTE: use explicit if/else — never ternary on st.* calls.
-    # Ternary returns the DeltaGenerator object which Streamlit's exec()
-    # treats as an expression result and calls help() on it, dumping the
-    # entire class docstring to the UI.
     col_be, col_gem = st.columns(2)
     be_status, _    = backend_status_info()
 
@@ -534,9 +566,12 @@ def tab_agent():
             st.session_state["agent_cfg"]      = cfg
             st.session_state.pop("_last_poll_ts",   None)
             st.session_state.pop("_last_poll_data", None)
+            # Store cfg in pending so the thread can read it
             _reset_pending()
+            pending = _get_pending()
+            pending["cfg"] = cfg
             threading.Thread(
-                target=_launch_agent_thread, args=(cfg,), daemon=True
+                target=_launch_agent_thread, args=(pending,), daemon=True
             ).start()
 
     # ── Nothing launched yet ──────────────────────────────────────────────
@@ -553,17 +588,18 @@ def tab_agent():
     # ── Dashboard ─────────────────────────────────────────────────────────
     st.markdown("---")
 
-    if _PENDING["done"] and not st.session_state.get("run_id"):
-        if _PENDING.get("error"):
+    pending = _get_pending()
+    if pending["done"] and not st.session_state.get("run_id"):
+        if pending.get("error"):
             st.session_state["agent_status"] = "failed"
-            st.session_state["agent_stage"]  = _PENDING["error"]
-        elif _PENDING.get("run_id"):
-            st.session_state["run_id"]       = _PENDING["run_id"]
+            st.session_state["agent_stage"]  = pending["error"]
+        elif pending.get("run_id"):
+            st.session_state["run_id"]       = pending["run_id"]
             st.session_state["agent_status"] = "running"
             st.session_state["agent_stage"]  = "🔍 Scanning job boards..."
 
     if not st.session_state.get("run_id") and st.session_state.get("agent_status") != "failed":
-        stage = _PENDING.get("stage") or st.session_state.get("agent_stage") or "Starting..."
+        stage = pending.get("stage") or st.session_state.get("agent_stage") or "Starting..."
         st.info(f"⏳ {stage}")
         st.markdown(
             f'<meta http-equiv="refresh" content="2">',
@@ -665,9 +701,8 @@ def tab_agent():
                       "agent_progress", "agent_scanned", "agent_matched",
                       "agent_applied", "agent_url", "agent_jobs", "agent_sources",
                       "agent_summary", "agent_matches", "agent_log", "agent_cfg",
-                      "_last_poll_ts", "_last_poll_data"):
+                      "_last_poll_ts", "_last_poll_data", "_pending"):
                 st.session_state.pop(k, None)
-            _reset_pending()
             st.rerun()
     elif status == "failed":
         st.error(f"❌ Agent failed: {stage}")
@@ -676,9 +711,8 @@ def tab_agent():
                       "agent_progress", "agent_scanned", "agent_matched",
                       "agent_applied", "agent_url", "agent_jobs", "agent_sources",
                       "agent_summary", "agent_matches", "agent_log", "agent_cfg",
-                      "_last_poll_ts", "_last_poll_data"):
+                      "_last_poll_ts", "_last_poll_data", "_pending"):
                 st.session_state.pop(k, None)
-            _reset_pending()
             st.rerun()
 
 
@@ -989,7 +1023,6 @@ def main():
         st.markdown(f"**Backend:** :{color}[{status}]")
         st.caption(detail)
         c1, c2 = st.columns(2)
-        # Explicit if/else — never ternary on st.* calls
         if c1.button("▶ Start", use_container_width=True):
             with st.spinner("Starting..."):
                 ok, msg = start_backend()

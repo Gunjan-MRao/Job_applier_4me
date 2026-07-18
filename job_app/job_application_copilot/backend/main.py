@@ -1,8 +1,32 @@
+import asyncio
+import sys
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.v1.router import api_router
 from backend.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Windows Proactor ConnectionResetError suppressor
+# Fixes: "Exception in callback _ProactorBasePipeTransport._call_connection_lost"
+# [WinError 10054] — harmless noise caused by Streamlit's HTTP client dropping
+# keep-alive connections.  See uvicorn#1301, cpython#91227.
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    def _suppress_connection_reset(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+            return  # swallow silently
+        # Everything else: log normally
+        loop.default_exception_handler(context)
+
+    async def _install_exception_handler():
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_suppress_connection_reset)
 
 app = FastAPI(
     title=settings.app_name,
@@ -20,6 +44,13 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    if sys.platform == "win32":
+        await _install_exception_handler()
+        logger.info("Windows ConnectionResetError suppressor installed.")
 
 
 @app.get("/")
