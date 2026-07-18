@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.v1.router import api_router
 from backend.core.config import settings
+from backend.db.engine import init_db
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,8 @@ app.include_router(api_router)
 
 @app.on_event("startup")
 async def startup_event():
+    init_db()
+    logger.info("Database tables ensured.")
     if sys.platform == "win32":
         await _install_exception_handler()
         logger.info("Windows ConnectionResetError suppressor installed.")
