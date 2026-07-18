@@ -1,27 +1,21 @@
 """
-Job Application Copilot — Streamlit frontend v9.8
+Job Application Copilot — Streamlit frontend v9.9
 
-v9.8 — three bug fixes
-  1. Start AI Agent → bounces back to Setup (parse resume page)
-     Root cause: _PENDING was a module-level dict that Streamlit resets on
-     every browser rerun before the background thread writes run_id into it.
-     Fix: _PENDING state is now stored in st.session_state['_pending'] so it
-     survives reruns.  _launch_agent_thread writes into session_state via a
-     thread-safe list-swap; tab_agent reads from the same key.
+v9.9 — fix "Start AI Agent bounces back to Setup / Parse Resume"
+  Root cause: st.tabs() is a purely visual widget — it has NO persistent
+  state.  Every st.rerun() (triggered by form submit, button click, or the
+  <meta http-equiv="refresh"> polling loop) tells Streamlit to re-render
+  the whole page from scratch.  Because tab selection is not stored anywhere
+  Streamlit always renders the first tab as active.  This is a known
+  Streamlit limitation (github.com/streamlit/streamlit/issues/6004).
 
-  2. POST /resume/parse → 500 Internal Server Error
-     Root cause: image-only / encrypted PDFs caused pypdf to raise inside
-     extract_resume_text; the outer except in the endpoint re-raised it as a
-     500.  Fix: extract_resume_text now catches every exception per page and
-     at the reader level, always returning '' instead of raising.
+  Fix: replace st.tabs with a horizontal st.radio whose value is stored in
+  st.session_state["page"].  The radio persists across every rerun because
+  session_state survives reruns.  When the user clicks "Parse resume" we
+  set st.session_state["page"] = PAGE_AGENT before calling st.rerun(), so
+  they land directly on the AI Agent page.
 
-  3. Windows asyncio "Exception in callback _ProactorBasePipeTransport.
-     _call_connection_lost" [WinError 10054]
-     Root cause: Windows Proactor event loop raises ConnectionResetError when
-     Streamlit's polling HTTP client drops a keep-alive before the server
-     finishes — known CPython/uvicorn issue.  Fix: startup handler installed
-     in main.py that silences ConnectionReset/Abort from the proactor.
-
+v9.8 — thread-safe _pending, PDF 500 fix, Windows asyncio fix
 v9.7 — fix DeltaGenerator docstring dump
 v9.6 — throttled polling
 v9.5 — complete dashboard polling rewrite
@@ -52,6 +46,14 @@ API_BASE_URL = f"http://{API_HOST}:{API_PORT}"
 PID_FILE     = BASE_DIR / "runtime_api.pid"
 LOG_FILE     = BASE_DIR / "backend_startup.log"
 PYTHON_EXE   = sys.executable
+
+# Navigation page labels — used as both display text and session_state keys
+PAGE_SETUP   = "⚙️ Setup"
+PAGE_AGENT   = "🤖 AI Agent"
+PAGE_DEBATE  = "🧠 Agent Debate"
+PAGE_APPS    = "📋 Applications"
+PAGE_HEALTH  = "🩺 Health"
+PAGES        = [PAGE_SETUP, PAGE_AGENT, PAGE_DEBATE, PAGE_APPS, PAGE_HEALTH]
 
 SOURCE_ICONS = {
     "linkedin":           "🔵 LinkedIn",
@@ -336,33 +338,18 @@ def _sidebar_name(p, filename):
 
 
 # ---------------------------------------------------------------------------
-# Agent launch — runs on background thread, communicates via session_state
-#
-# FIX: _PENDING used to be a module-level dict which Streamlit resets on
-# every rerun (module re-execution).  It is now stored in
-# st.session_state["_pending"] so the background thread's writes survive
-# across reruns.  The thread never calls st.* APIs — it only mutates the
-# dict object that is already stored in session_state.
+# Agent launch — background thread writing into session_state-owned dict
 # ---------------------------------------------------------------------------
 
 def _get_pending() -> dict:
-    """Return the shared pending-state dict from session_state."""
     if "_pending" not in st.session_state:
         st.session_state["_pending"] = {"done": False, "run_id": None, "error": None, "stage": ""}
     return st.session_state["_pending"]
 
-
 def _reset_pending():
     st.session_state["_pending"] = {"done": False, "run_id": None, "error": None, "stage": ""}
 
-
 def _launch_agent_thread(pending: dict):
-    """
-    Runs on a daemon thread.  Mutates the `pending` dict directly —
-    this is the same dict object stored in st.session_state["_pending"],
-    so writes are visible to the next Streamlit rerun without any lock
-    (dict writes in CPython are GIL-protected).
-    """
     pending["stage"] = "⚙️ Starting backend..."
     if not is_port_open():
         ok, msg = start_backend()
@@ -370,7 +357,6 @@ def _launch_agent_thread(pending: dict):
             pending["error"] = f"Backend failed to start: {msg}"
             pending["done"]  = True
             return
-
     pending["stage"] = "📡 Calling /automation/start..."
     cfg = pending.get("cfg", {})
     result, err = _post("/automation/start", cfg)
@@ -378,7 +364,6 @@ def _launch_agent_thread(pending: dict):
         pending["error"] = f"API error: {err}"
         pending["done"]  = True
         return
-
     pending["run_id"] = result.get("run_id", "")
     pending["done"]   = True
 
@@ -391,14 +376,11 @@ def _poll_status(run_id: str) -> dict:
     now     = time.monotonic()
     last_ts = st.session_state.get("_last_poll_ts", 0.0)
     cached  = st.session_state.get("_last_poll_data")
-
     if cached is not None and (now - last_ts) < POLL_THROTTLE_S:
         return cached
-
     data, err = _get(f"/automation/status/{run_id}", timeout=8)
     if err or not data:
         return {"status": "unknown", "stage": f"Poll error: {err}"}
-
     st.session_state["_last_poll_ts"]   = now
     st.session_state["_last_poll_data"] = data
     return data
@@ -450,7 +432,7 @@ def _confidence_bar(score, label=""):
 
 
 # ---------------------------------------------------------------------------
-# Tab: Setup
+# Page: Setup
 # ---------------------------------------------------------------------------
 
 def tab_setup():
@@ -470,7 +452,8 @@ def tab_setup():
                 st.session_state.resume_filename = uploaded.name
                 if profile.get("email") and not st.session_state.get("candidate_email"):
                     st.session_state.candidate_email = profile["email"]
-                st.success("✅ Parsed! Switch to **🤖 AI Agent** to start.")
+                # ── KEY FIX: navigate to AI Agent page before rerunning ──
+                st.session_state["page"] = PAGE_AGENT
                 st.rerun()
     p = st.session_state.get("resume_profile")
     if p:
@@ -494,18 +477,15 @@ def tab_setup():
 
 
 # ---------------------------------------------------------------------------
-# Tab: AI Agent
+# Page: AI Agent
 # ---------------------------------------------------------------------------
 
 def tab_agent():
     st.subheader("🤖 AI Job Agent")
     p = st.session_state.get("resume_profile") or {}
 
-    # ── Backend / API key status row ──────────────────────────────────────
-    # NOTE: use explicit if/else — never ternary on st.* calls.
     col_be, col_gem = st.columns(2)
     be_status, _    = backend_status_info()
-
     with col_be:
         if be_status == "Running":
             st.info("🟢 Backend: **Running**")
@@ -519,7 +499,6 @@ def tab_agent():
             if line.strip().startswith("GEMINI_API_KEY="):
                 gemini_key = line.split("=", 1)[1].strip()
                 break
-
     with col_gem:
         if gemini_key:
             st.success("✅ Gemini API key — AI cover letters enabled")
@@ -531,7 +510,6 @@ def tab_agent():
 
     default_kw = smart_keywords(p) if p else DEFAULT_KEYWORDS
 
-    # ── Launch form ───────────────────────────────────────────────────────
     with st.form("agent_form"):
         c1, c2   = st.columns(2)
         keywords = c1.text_input("🔑 Keywords", value=default_kw)
@@ -543,7 +521,6 @@ def tab_agent():
         go = st.form_submit_button("🚀 Start AI Agent — scan ALL job boards",
                                    type="primary", use_container_width=True)
 
-    # ── Handle launch ─────────────────────────────────────────────────────
     if go:
         if st.session_state.get("agent_launched"):
             st.warning("Agent already running — see dashboard below.")
@@ -566,15 +543,14 @@ def tab_agent():
             st.session_state["agent_cfg"]      = cfg
             st.session_state.pop("_last_poll_ts",   None)
             st.session_state.pop("_last_poll_data", None)
-            # Store cfg in pending so the thread can read it
             _reset_pending()
             pending = _get_pending()
             pending["cfg"] = cfg
             threading.Thread(
                 target=_launch_agent_thread, args=(pending,), daemon=True
             ).start()
+            # Stay on this page — no rerun needed; form submit triggers one automatically
 
-    # ── Nothing launched yet ──────────────────────────────────────────────
     if not st.session_state.get("agent_launched"):
         st.markdown("---")
         st.info(
@@ -585,7 +561,6 @@ def tab_agent():
         )
         return
 
-    # ── Dashboard ─────────────────────────────────────────────────────────
     st.markdown("---")
 
     pending = _get_pending()
@@ -601,10 +576,7 @@ def tab_agent():
     if not st.session_state.get("run_id") and st.session_state.get("agent_status") != "failed":
         stage = pending.get("stage") or st.session_state.get("agent_stage") or "Starting..."
         st.info(f"⏳ {stage}")
-        st.markdown(
-            f'<meta http-equiv="refresh" content="2">',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<meta http-equiv="refresh" content="2">', unsafe_allow_html=True)
         return
 
     run_id = st.session_state.get("run_id", "")
@@ -762,7 +734,7 @@ def _render_job_card(job: dict, review_mode: bool):
 
 
 # ---------------------------------------------------------------------------
-# Tab: Agent Debate
+# Page: Agent Debate
 # ---------------------------------------------------------------------------
 
 def tab_debate():
@@ -889,7 +861,7 @@ def tab_debate():
 
 
 # ---------------------------------------------------------------------------
-# Tab: Applications
+# Page: Applications
 # ---------------------------------------------------------------------------
 
 def tab_applications():
@@ -952,7 +924,7 @@ def tab_applications():
 
 
 # ---------------------------------------------------------------------------
-# Tab: Health
+# Page: Health
 # ---------------------------------------------------------------------------
 
 def tab_health():
@@ -995,11 +967,12 @@ def tab_health():
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — stateful radio navigation (replaces st.tabs)
 # ---------------------------------------------------------------------------
 
 def main():
     st.set_page_config(page_title="Job Application Copilot", page_icon="🤖", layout="wide")
+
     defaults = {
         "resume_profile":  None,
         "resume_filename": "",
@@ -1008,6 +981,8 @@ def main():
         "run_id":          None,
         "agent_status":    "idle",
         "agent_stage":     "",
+        # 'page' persists the active nav item across every rerun
+        "page":            PAGE_SETUP,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1015,6 +990,19 @@ def main():
 
     st.title("🤖 Job Application Copilot")
     st.caption("Upload CV → Agent scans every job board → instant cover letter + cold email per match")
+
+    # ── Stateful horizontal navigation ────────────────────────────────────
+    # st.radio with horizontal=True looks like tabs but survives st.rerun()
+    # because it is bound to st.session_state["page"].
+    st.radio(
+        label="nav",
+        options=PAGES,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="page",
+    )
+    st.markdown("---")
+    page = st.session_state["page"]
 
     status, detail = backend_status_info()
     with st.sidebar:
@@ -1053,14 +1041,17 @@ def main():
         if st.button("↻ Refresh", use_container_width=True):
             st.rerun()
 
-    t1, t2, t3, t4, t5 = st.tabs(
-        ["⚙️ Setup", "🤖 AI Agent", "🧠 Agent Debate", "📋 Applications", "🩺 Health"]
-    )
-    with t1: tab_setup()
-    with t2: tab_agent()
-    with t3: tab_debate()
-    with t4: tab_applications()
-    with t5: tab_health()
+    # ── Render the selected page ───────────────────────────────────────────
+    if page == PAGE_SETUP:
+        tab_setup()
+    elif page == PAGE_AGENT:
+        tab_agent()
+    elif page == PAGE_DEBATE:
+        tab_debate()
+    elif page == PAGE_APPS:
+        tab_applications()
+    elif page == PAGE_HEALTH:
+        tab_health()
 
 
 if __name__ == "__main__":
