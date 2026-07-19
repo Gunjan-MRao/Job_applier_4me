@@ -9,6 +9,78 @@ job with a drafted cover letter and cold email — with zero API keys configured
 
 ---
 
+## Frozen UI After Automation Start — Fixed
+
+**Symptom (from a real run).** conda activated, backend health-checked, the
+Streamlit UI opened, resume parse returned `200`, and clicking **Start AI Agent**
+returned `POST /automation/start 200`. But immediately after, the console printed:
+
+```
+Thread 'Thread-14 (_delayed_rerun)': missing ScriptRunContext
+```
+
+…and the UI never refreshed. The backend genuinely began working, but the page
+stayed on the launch screen — the app *looked* frozen/broken.
+
+**Exact root cause.** `_trigger_autorefresh()` in `app.py` had a fallback branch
+(taken whenever the optional `streamlit-autorefresh` package was not importable,
+`_HAS_AUTOREFRESH == False`) that spawned a **raw background thread**:
+
+```python
+def _delayed_rerun():
+    time.sleep(5)
+    st.rerun()
+threading.Thread(target=_delayed_rerun, daemon=True).start()
+```
+
+A thread created this way runs **outside Streamlit's ScriptRunContext**. Any
+`st.rerun()` / `st.session_state` call from it is *silently dropped* and emits the
+`missing ScriptRunContext` warning. So the periodic rerun that drives the running
+dashboard never happened → the page never advanced past the launch form → frozen
+UI, even though `/automation/start` had succeeded and the backend was polling
+along fine. (The legitimate backend-start thread, `_launch_agent_thread`, only
+mutates a plain shared `pending` dict and calls **no** Streamlit API, so it was
+never the problem — and is left as-is.)
+
+**The fix** (`app.py`, `_trigger_autorefresh`). The fallback no longer spawns a
+thread. It sleeps and reruns on the **main script thread**, which owns the
+ScriptRunContext, so the rerun actually fires:
+
+```python
+if _HAS_AUTOREFRESH:
+    st_autorefresh(interval=AUTO_REFRESH_MS, key="agent_refresh")
+else:
+    time.sleep(AUTO_REFRESH_MS / 1000.0)
+    st.rerun()
+```
+
+No non-main-thread code calls any Streamlit API. When `streamlit-autorefresh`
+*is* installed (it is a pinned requirement — `streamlit-autorefresh>=0.0.1`, and
+Streamlit is `>=1.35.0`) the smooth JS-driven `st_autorefresh` path is used; the
+main-thread sleep+rerun is the correct, context-safe fallback.
+
+**Proof the page actually updates (not just a 200).** A real browser-driven
+Playwright test (`tests/test_ui_button_flow.py::
+test_agent_start_refreshes_ui_no_scriptruncontext`) drives the rendered UI end to
+end: upload resume → Parse → Go to AI Agent → **Start AI Agent**, then asserts the
+launch form disappears and the **running dashboard visibly renders** — the
+`Jobs Found` metric and `Live source feed` appear, which only exist *after* the
+auto-refresh rerun advances the run past the "starting" stage. The Streamlit
+server log is captured to a file and asserted to contain **zero**
+`missing ScriptRunContext` occurrences across the whole run.
+
+```
+tests/test_ui_button_flow.py::test_parse_does_not_skip_to_agent PASSED
+tests/test_ui_button_flow.py::test_agent_start_refreshes_ui_no_scriptruncontext PASSED
+2 passed
+```
+
+Both tests genuinely executed against headless Chromium (a missing browser would
+report `SKIPPED`, not `PASSED`). Full suite: **230 passed** (was 229; +1 for the
+new UI-refresh test), no regressions.
+
+---
+
 ## Live Credentials Verification (real APIs, one-off sandbox run)
 
 A one-time verification was run in an isolated sandbox with **real** Adzuna, Reed

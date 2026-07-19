@@ -509,15 +509,21 @@ def _poll_status(run_id: str) -> dict:
 
 
 def _trigger_autorefresh():
-    """Safe polling rerun — uses st_autorefresh if available, else a 5-s sleep+rerun."""
+    """Safe polling rerun — uses st_autorefresh if available, else a
+    main-thread sleep+rerun.
+
+    NEVER spawn a background thread that calls st.rerun()/st.session_state:
+    a non-script thread runs OUTSIDE Streamlit's ScriptRunContext, so those
+    calls are silently dropped (the "missing ScriptRunContext" warning) and
+    the UI freezes after "Start AI Agent" even though the backend is working.
+    The fallback below sleeps and reruns on the MAIN script thread, which has
+    the context, so the rerun actually happens.
+    """
     if _HAS_AUTOREFRESH:
         st_autorefresh(interval=AUTO_REFRESH_MS, key="agent_refresh")
     else:
-        # Fallback: sleep in a thread and call rerun — does NOT reset browser widgets
-        def _delayed_rerun():
-            time.sleep(5)
-            st.rerun()
-        threading.Thread(target=_delayed_rerun, daemon=True).start()
+        time.sleep(AUTO_REFRESH_MS / 1000.0)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------

@@ -69,7 +69,7 @@ def _free(port: int) -> bool:
 
 
 @pytest.fixture(scope="module")
-def servers():
+def servers(tmp_path_factory):
     if not _ensure_docx():
         pytest.skip("could not prepare sample_resume.docx fixture")
     if not (_free(BACKEND_PORT) and _free(UI_PORT)):
@@ -81,7 +81,13 @@ def servers():
         if example.exists():
             shutil.copyfile(example, env_file)
 
+    # Capture the Streamlit server log so tests can assert it never emits the
+    # "missing ScriptRunContext" warning (the frozen-UI bug signature).
+    log_dir = tmp_path_factory.mktemp("ui_logs")
+    ui_log = log_dir / "streamlit.log"
+
     procs = []
+    ui_log_fh = open(ui_log, "w", encoding="utf-8")
     try:
         backend = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "backend.main:app",
@@ -93,7 +99,7 @@ def servers():
             [sys.executable, "-m", "streamlit", "run", "app.py",
              "--server.headless", "true", "--server.port", str(UI_PORT),
              "--server.address", "127.0.0.1"],
-            cwd=str(APP_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+            cwd=str(APP_DIR), stdout=ui_log_fh, stderr=subprocess.STDOUT,
         )
         procs.append(ui)
 
@@ -101,7 +107,7 @@ def servers():
             pytest.skip("backend did not become ready")
         if not _wait_http(f"{UI_URL}/_stcore/health", 40):
             pytest.skip("streamlit did not become ready")
-        yield
+        yield ui_log
     finally:
         for p in procs:
             p.terminate()
@@ -109,6 +115,7 @@ def servers():
                 p.wait(timeout=10)
             except Exception:
                 p.kill()
+        ui_log_fh.close()
 
 
 def test_parse_does_not_skip_to_agent(servers):
@@ -145,3 +152,54 @@ def test_parse_does_not_skip_to_agent(servers):
         browser.close()
     finally:
         pw.stop()
+
+
+def test_agent_start_refreshes_ui_no_scriptruncontext(servers):
+    """After clicking Start AI Agent the page must VISIBLY refresh into the
+    running dashboard (progress + metrics), proving the auto-refresh rerun
+    actually fires — and the server log must never emit the
+    "missing ScriptRunContext" warning that silently freezes the UI.
+    """
+    ui_log = servers
+    try:
+        pw = sync_playwright().start()
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"playwright runtime unavailable: {exc}")
+    try:
+        try:
+            browser = pw.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"chromium not installed (run: playwright install chromium): {exc}")
+
+        page = browser.new_page()
+        page.set_default_timeout(30000)
+        page.goto(UI_URL, wait_until="networkidle")
+
+        expect(page.get_by_text("Upload your resume")).to_be_visible(timeout=30000)
+        page.set_input_files("input[type=file]", str(RESUME_DOCX))
+        page.get_by_role("button", name="Parse resume").click()
+        expect(page.get_by_text("Extracted profile")).to_be_visible(timeout=30000)
+        page.get_by_role("button", name="Go to AI Agent").click()
+        expect(page.get_by_text("AI Job Agent")).to_be_visible(timeout=30000)
+
+        # Launch the agent.
+        page.get_by_role("button", name="Start AI Agent").click()
+
+        # The launch FORM must disappear and the running DASHBOARD must render.
+        # These elements only exist AFTER the auto-refresh rerun advances the
+        # run past the "starting" stage — i.e. proof the page visibly updated,
+        # not merely that /automation/start returned 200.
+        expect(page.get_by_role("button", name="Start AI Agent")).to_have_count(0, timeout=60000)
+        expect(page.get_by_text("Jobs Found")).to_be_visible(timeout=60000)
+        expect(page.get_by_text("Live source feed")).to_be_visible(timeout=60000)
+
+        browser.close()
+    finally:
+        pw.stop()
+
+    # The frozen-UI bug signature must be entirely absent from the server log.
+    log_text = ui_log.read_text(encoding="utf-8", errors="ignore")
+    assert "missing ScriptRunContext" not in log_text, (
+        "regression: background thread called a Streamlit API outside the "
+        "ScriptRunContext — the UI would silently freeze after Start AI Agent"
+    )
