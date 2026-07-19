@@ -55,13 +55,23 @@ def gather_jobs(
     wins; live sources are then merged so a configured Reed key can top up
     Adzuna results.
     """
-    query = " ".join((keywords or [])[:3]).strip() or "supply chain logistics"
+    # Each keyword is a separate role phrase (e.g. "logistics coordinator"), so
+    # query the APIs once PER keyword and merge. Joining them into one string
+    # makes Adzuna/Reed require ALL words in a single listing, which returns
+    # zero results for realistic multi-role searches — the classic silent
+    # "0 real jobs" failure. A single fallback query keeps the flow working when
+    # no keywords are supplied.
+    queries = [k.strip() for k in (keywords or [])[:3] if k and k.strip()]
+    if not queries:
+        queries = ["supply chain logistics"]
     notes: List[str] = []
     jobs: List[dict] = []
     source_used = "mock"
 
     # 1. Adzuna (primary)
-    adz = job_sources.fetch_adzuna(query, location)
+    adz: List[dict] = []
+    for q in queries:
+        adz.extend(job_sources.fetch_adzuna(q, location))
     if adz:
         jobs.extend(adz)
         source_used = "Adzuna"
@@ -70,7 +80,9 @@ def gather_jobs(
         notes.append("Adzuna unavailable (no key or no results)")
 
     # 2. Reed (secondary — merged on top of Adzuna if configured)
-    reed = job_sources.fetch_reed(query, location)
+    reed: List[dict] = []
+    for q in queries:
+        reed.extend(job_sources.fetch_reed(q, location))
     if reed:
         jobs.extend(reed)
         if source_used == "mock":

@@ -9,6 +9,45 @@ job with a drafted cover letter and cold email — with zero API keys configured
 
 ---
 
+## Live Credentials Verification (real APIs, one-off sandbox run)
+
+A one-time verification was run in an isolated sandbox with **real** Adzuna, Reed
+and Groq credentials placed only in the local, git-ignored `.env` (never
+committed). Key identifiers below are masked (first 4 + last 4 chars only); no
+raw key value appears in this file, any commit, or any tracked source.
+
+Keys used (masked): `ADZUNA_APP_ID=76ec****9292`, `ADZUNA_APP_KEY=0289****f5f7`,
+`REED_API_KEY=ae13****54a0`, `GROQ_API_KEY=gsk_****F0BA`.
+
+| Source | Result | Evidence |
+| --- | --- | --- |
+| **Adzuna** (primary) | ✅ real UK jobs | `fetch_adzuna("supply chain", "London")` → **50 jobs**; via `gather_jobs` → **72–86 jobs**. Examples: *Supply Chain Development Data Analyst UK&I @ Ferrero*, *Operations Analyst @ NextStep*, *Market Research & Data Analyst @ Thomson Reuters*. |
+| **Reed** (secondary) | ✅ real UK jobs | `fetch_reed("supply chain analyst", "London")` → **29 jobs**; per-keyword in `gather_jobs` → **100 jobs**. Examples: *Commercial Operations Analyst @ Avolites Ltd*, *Class 1 Driver @ GXO Logistics*. (One call once hit a transient 25s read-timeout; retried fine.) |
+| **Groq** (LLM drafts) | ✅ real AI output | Raw probe returned exactly `GROQ LIVE OK`. A cover letter and a cold email were both generated that **differ from the offline templates** (genuine AI text naming the real role/company). Free-tier returns intermittent HTTP 429 (rate limit) — the offline template fallback correctly fills those gaps. |
+
+**Full real end-to-end** (resume fixture → real jobs → score → draft):
+`run_pipeline` with keywords `["supply chain analyst","logistics coordinator",
+"procurement analyst"]`, location `London` produced **`source_used=Adzuna`,
+`used_mock=False`, 146 jobs scanned (Adzuna 72 + Reed 100, deduped), 131
+matched**. Top matches included real vacancies such as *Shipping and Logistics
+Coordinator @ Michael Page* and *Supply Chain Development Data Analyst UK&I @
+Ferrero*. A genuine AI-generated cold email was produced for the Ferrero role
+(subject line + Skilled-Worker sponsorship disclosure, distinct from the offline
+template).
+
+**Bug found and fixed during verification.** `gather_jobs` previously joined all
+keywords into a single Adzuna/Reed query string
+(`" ".join(keywords[:3])`). Both APIs treat the `what`/`keywords` field as an
+**AND** of every word, so a realistic multi-role search
+(`"supply chain analyst logistics coordinator procurement analyst"`) matched
+**zero** listings and silently fell back to mock data — even with a valid key.
+This is precisely the "0 real jobs, always" failure mode the rebuild set out to
+kill. Fixed in `backend/pipeline/orchestrator.py` to query **once per keyword**
+and merge/dedupe the results; after the fix the same search returns 146 real
+jobs. Full test suite remained green (**229 passed**).
+
+---
+
 ## 0. Core pipeline rebuild — Adzuna primary, LinkedIn scraping demoted
 
 **Root cause addressed.** The original pipeline's *primary* job source was
