@@ -81,7 +81,11 @@ def _load_secrets_into_env() -> None:
             os.environ[key] = str(val)
 
 
-_load_secrets_into_env()
+# NOTE: _load_secrets_into_env() is invoked at the top of main(), right after
+# st.set_page_config — accessing st.secrets counts as a Streamlit command, so it
+# must not run at import time (that would make set_page_config no longer the
+# first command). It still runs before any backend module is imported, because
+# all backend imports in this file are lazy (inside functions).
 
 # ---------------------------------------------------------------------------
 # Run mode: embedded (in-process) vs http (talk to a running FastAPI backend)
@@ -201,7 +205,7 @@ def _render_mock_banner() -> None:
         )
         fix = "Try different keywords/location, or run the agent again shortly."
     st.error(
-        "\ud83d\udea8 **SAMPLE DATA \u2014 these are NOT real job openings.**\n\n"
+        "\U0001f6a8 **SAMPLE DATA \u2014 these are NOT real job openings.**\n\n"
         f"{cause}\n\n{fix}"
     )
 
@@ -369,6 +373,8 @@ def stop_backend():
 
 
 def backend_status_info():
+    if EMBEDDED:
+        return "Embedded", "Running in-process (no separate backend server needed)"
     pid = read_pid()
     if is_port_open():
         label, detail = "Running", f"Listening on {API_BASE_URL}"
@@ -563,7 +569,9 @@ def parse_resume_local(file_bytes, filename):
 
 
 def parse_resume(file_bytes, filename):
-    if is_port_open():
+    # Embedded mode parses in-process (no server). HTTP mode tries the backend
+    # first, falling back to the same local parser if it is unreachable.
+    if not EMBEDDED and is_port_open():
         try:
             r = requests.post(
                 f"{API_BASE_URL}/resume/parse",
@@ -643,14 +651,16 @@ def _reset_pending():
 
 
 def _launch_agent_thread(pending: dict):
-    pending["stage"] = "\u2699\ufe0f Starting backend..."
-    if not is_port_open():
-        ok, msg = start_backend()
-        if not ok:
-            pending["error"] = f"Backend failed to start: {msg}"
-            pending["done"]  = True
-            return
-    pending["stage"] = "\U0001f4e1 Calling /automation/start..."
+    # Embedded mode runs the pipeline in-process \u2014 no backend server to start.
+    if not EMBEDDED:
+        pending["stage"] = "\u2699\ufe0f Starting backend..."
+        if not is_port_open():
+            ok, msg = start_backend()
+            if not ok:
+                pending["error"] = f"Backend failed to start: {msg}"
+                pending["done"]  = True
+                return
+    pending["stage"] = "\U0001f4e1 Starting automation run..."
     cfg = pending.get("cfg", {})
     result, err = _post("/automation/start", cfg)
     if err or not result:
@@ -768,7 +778,9 @@ def tab_agent():
     col_be, col_gem = st.columns(2)
     be_status, _ = backend_status_info()
     with col_be:
-        if be_status == "Running":
+        if be_status == "Embedded":
+            st.info("\U0001f7e2 Backend: **Embedded (in-process)**")
+        elif be_status == "Running":
             st.info("\U0001f7e2 Backend: **Running**")
         else:
             st.warning(f"\U0001f534 Backend: **{be_status}** \u2014 agent will start it automatically")
@@ -1307,7 +1319,7 @@ def tab_applications():
     if not email:
         st.info("Enter your email in the sidebar to view applications.")
         return
-    if not is_port_open():
+    if not _backend_ready():
         st.warning("\u26a0\ufe0f Backend not running \u2014 start it from the sidebar.")
         return
     data, err = _get(f"/applications/{email}")
@@ -1371,11 +1383,12 @@ def tab_applications():
 def tab_health():
     st.subheader("\U0001fa7a Diagnostics")
     status, detail = backend_status_info()
-    icon = "\u2705" if status == "Running" else "\u274c"
+    icon = "\u2705" if status in ("Running", "Embedded") else "\u274c"
     st.write(f"{icon} **Backend:** {status} \u2014 {detail}")
+    st.write(f"**Run mode:** `{'embedded (in-process)' if EMBEDDED else 'http'}`")
     st.write(f"**Python:** `{PYTHON_EXE}`")
     st.write(f"**Working dir:** `{BASE_DIR}`")
-    if status != "Running" and LOG_FILE.exists():
+    if status not in ("Running", "Embedded") and LOG_FILE.exists():
         log_txt = LOG_FILE.read_text(encoding="utf-8", errors="replace")
         if log_txt.strip():
             with st.expander("\U0001f4d4 Backend startup log", expanded=True):
@@ -1405,7 +1418,7 @@ def tab_health():
         except ImportError:
             marker = "\u26a0\ufe0f" if "optional" in desc else "\u274c"
             st.error(f"{marker} `{pkg}` NOT installed \u2014 `pip install {pkg}`")
-    if status == "Running":
+    if status == "Running" and not EMBEDDED:
         data, _ = _get("/openapi.json")
         if data:
             st.write(f"**{len(data.get('paths', {}))} API routes active**")
@@ -1417,6 +1430,8 @@ def tab_health():
 
 def main():
     st.set_page_config(page_title="Job Application Copilot", page_icon="\U0001f916", layout="wide")
+    # Copy Streamlit secrets into the environment before any backend import.
+    _load_secrets_into_env()
 
     # ── Step 1: Initialise session defaults (runs only once per browser session) ──
     defaults = {
@@ -1449,19 +1464,22 @@ def main():
     be_status, be_detail = backend_status_info()
     with st.sidebar:
         st.header("\U0001f527 Controls")
-        color = "green" if be_status == "Running" else "red"
+        color = "green" if be_status in ("Running", "Embedded") else "red"
         st.markdown(f"**Backend:** :{color}[{be_status}]")
         st.caption(be_detail)
-        sc1, sc2 = st.columns(2)
-        if sc1.button("\u25b6 Start", use_container_width=True, key="sb_start"):
-            with st.spinner("Starting..."):
-                ok, msg = start_backend()
-            st.success(msg) if ok else st.error(msg)
-            st.rerun()
-        if sc2.button("\u25a0 Stop", use_container_width=True, key="sb_stop"):
-            ok, msg = stop_backend()
-            st.success(msg) if ok else st.error(msg)
-            st.rerun()
+        # In embedded (single-process) mode there is no separate backend server
+        # to start/stop, so those controls are hidden \u2014 the pipeline runs in-process.
+        if not EMBEDDED:
+            sc1, sc2 = st.columns(2)
+            if sc1.button("\u25b6 Start", use_container_width=True, key="sb_start"):
+                with st.spinner("Starting..."):
+                    ok, msg = start_backend()
+                st.success(msg) if ok else st.error(msg)
+                st.rerun()
+            if sc2.button("\u25a0 Stop", use_container_width=True, key="sb_stop"):
+                ok, msg = stop_backend()
+                st.success(msg) if ok else st.error(msg)
+                st.rerun()
         st.markdown("---")
         st.session_state["candidate_email"] = st.text_input(
             "Your email",

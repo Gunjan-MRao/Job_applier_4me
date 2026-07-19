@@ -1237,3 +1237,101 @@ New tests: `test_sponsor_verification.py` (6), `test_exporters.py` (4),
 `test_job_card_ui.py` (5) = **15 new tests**. New dependencies: **none**.
 
 **Full suite: 257 passed, 0 failed** — zero regressions.
+
+---
+
+## Deployability, honest sample data, and persona-neutrality (three workstreams)
+
+A competing tool's critique prompted three concrete, independently-verified
+workstreams. Each is proven by an automated test.
+
+### A — Single-process deploy (Streamlit Community Cloud compatible)
+
+**Problem.** `app.py` talked to the pipeline over HTTP to a separate FastAPI
+backend at `http://127.0.0.1:8000`. Streamlit Community Cloud runs exactly ONE
+process (`streamlit run app.py`) — it cannot also run `uvicorn`, so the app was
+undeployable there.
+
+**Fix.** Added an in-process ("embedded") mode selected by `RUN_MODE`
+(default `embedded`; set `RUN_MODE=http` to keep the local FastAPI path used by
+`launch_app.bat` / `launch.py`, which is unchanged):
+
+- `_get` / `_post` / `_patch` short-circuit to `_embedded_get` / `_embedded_post`
+  / `_embedded_patch`, which call the pipeline functions directly
+  (`start_run_thread`, `get_run`, `get_applications_for_candidate`,
+  `update_application_status`) and return the exact same dict shapes as the HTTP
+  JSON, so every call site is unchanged.
+- `st.secrets` support: `_load_secrets_into_env()` copies the keys below into
+  `os.environ` at startup (after `st.set_page_config`, before any lazy backend
+  import), and never overrides an existing env/`.env` value — so local runs are
+  unaffected. `_env_value()` resolves a key from `os.environ` → `st.secrets` →
+  local `.env`.
+- `.streamlit/secrets.toml.example` documents the exact keys; the real
+  `.streamlit/secrets.toml` is gitignored.
+- `DEPLOY.md` gives numbered Streamlit Community Cloud steps and explicitly
+  documents the ephemeral-filesystem limitation: the bundled SQLite
+  `storage/jobs.db` does NOT persist across redeploys/sleeps (point
+  `DATABASE_URL` at an external DB for durable storage).
+
+**secrets.toml keys** (exact names, all optional): `GROQ_API_KEY`,
+`GEMINI_API_KEY`, `ADZUNA_APP_ID`, `ADZUNA_APP_KEY`, `REED_API_KEY`,
+`EMAIL_ADDRESS`, `EMAIL_PASSWORD`.
+
+**Proof — `tests/test_embedded_mode.py`.** Boots ONLY the Streamlit app
+(`streamlit run app.py`, `RUN_MODE=embedded`, no FastAPI backend) and drives a
+real headless-Chromium browser through the full flow: upload CV → parse →
+review → Go to AI Agent → Start AI Agent → running dashboard. It asserts:
+the FastAPI port `:8000` is never opened (before, during, and after the run);
+the "Embedded (in-process)" status renders; the dashboard renders
+("Jobs Found", "Live source feed"); and the "missing ScriptRunContext" freeze
+signature never appears in the server log. Skips cleanly if Playwright/Chromium
+are unavailable.
+
+> A real bug was caught while writing this proof: `_render_mock_banner()` passed
+> a lone UTF-16 surrogate pair to `st.error`, raising `UnicodeEncodeError` and
+> crashing the dashboard exactly when sample data was shown. This would have
+> broken the LIVE deployment for any keyless user. Fixed to a proper codepoint.
+
+### B — Honest sample-data fallback (never silent)
+
+**Problem.** When no live job source could be reached the pipeline silently fell
+back to built-in SAMPLE listings, presenting fake jobs as if real.
+
+**Fix.** The run now records `used_mock` / `source_used`
+(`backend/services/automation_runtime.py`, surfaced through
+`AutomationStatusResponse`). Whenever the dashboard shows sample data it renders
+a big red `st.error` banner — "🚨 SAMPLE DATA — these are NOT real job
+openings." — naming the missing API keys and how to fix them. It is never a
+small caption and fake jobs are never blended in silently.
+
+**Proof — `tests/test_mock_banner.py` (4 tests).** Drives the real
+`_render_mock_banner` with a recording fake `st`: asserts `st.error` (not a
+caption) fires with "SAMPLE DATA", "NOT real job openings", and the missing key
+names; asserts the no-results variant when keys ARE present; and asserts the
+pipeline persists `used_mock`/`source_used` through to
+`AutomationStatusResponse`.
+
+### C — Persona-neutrality (no hardcoded candidate)
+
+**Did hardcoding exist?** The scoring/keyword logic was already resume-derived
+from prior work, but there was no test guaranteeing it. This workstream adds
+that guarantee and confirms there is ZERO hardcoded "Bindu" / "supply chain"
+persona anywhere in the pipeline: keywords and scoring are derived 100% from the
+parsed resume skills/experience plus UI preferences.
+
+**Proof — `tests/test_persona_neutral.py` (3 tests) with a second resume.**
+Using a NEW software-engineer fixture (`tests/fixtures/sample_resume_swe.txt`,
+"Aarav Mehta": Python/Docker/AWS/React, roles Software Engineer/Backend
+Developer): the parser extracts software skills and recognises the software role
+while "supply chain"/"sap" are absent; `scoring.score_job` ranks a software job
+ABOVE a supply-chain job for the software candidate — and the mirror test
+confirms the opposite winner for the supply-chain candidate. Scoring follows the
+resume, not a fixed persona.
+
+### Result
+
+New tests this effort: `test_embedded_mode.py` (1 Playwright flow),
+`test_mock_banner.py` (4), `test_persona_neutral.py` (3). New fixture:
+`sample_resume_swe.txt`. New docs: `DEPLOY.md`, `.streamlit/secrets.toml.example`.
+
+**Full suite: 260 passed, 0 failed** — zero regressions.

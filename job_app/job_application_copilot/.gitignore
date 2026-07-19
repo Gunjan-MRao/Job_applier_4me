@@ -5,6 +5,8 @@ __pycache__/
 *.db
 *.sqlite3
 .env
+# Streamlit Cloud secrets — the FILLED file is private; only the .example is tracked
+.streamlit/secrets.toml
 .venv/
 venv/
 env/
