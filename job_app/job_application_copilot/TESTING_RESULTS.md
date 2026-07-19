@@ -1149,3 +1149,91 @@ RESULT: PROFILE-RENDER PASS
   fallback paths.
 
 **Full suite: 184 passed**, zero regressions.
+
+---
+
+## Authoritative sponsor verification, verified recruiter contact, one-click export (2026-07-19)
+
+Three high-value features added on top of the existing `sponsor_register.py`
+(GOV.UK register loading) and `lead_finder` groundwork.
+
+### Feature 1 — Authoritative sponsor verification in scoring
+
+Sponsorship is now classified into distinct, non-conflated trust tiers instead of
+a single ambiguous "mentions sponsorship" signal:
+
+- `verified`  — the job's company name fuzzy-matches an entry in the loaded
+  GOV.UK Licensed Sponsor register (authoritative).
+- `mentioned` — the job description text mentions sponsorship, but the company is
+  NOT (or cannot be) matched against the register (weak, unverified signal).
+- `none`      — the description explicitly rules out sponsorship (negative signal
+  always wins, even over a register match).
+- `unknown`   — no signal either way.
+
+Implementation:
+- `backend/services/sponsor_register.py` — new `verify(company_name)` method:
+  normalises the name (strips `ltd/plc/uk/limited` etc.) and does an exact
+  normalised match first, then a token-subset fuzzy match (≥3-char tokens) so
+  "Ferrero UK Ltd" matches register entry "Ferrero" without false-positiving on
+  short common tokens like "IT".
+- `backend/pipeline/scoring.py` — new `sponsorship_tier(job, sponsor_verifier=None)`
+  and tier constants. Pure/network-free: the register is injected as a
+  `sponsor_verifier` callable rather than imported, keeping scoring testable.
+- `backend/pipeline/orchestrator.py` — `gather_jobs`/`run_pipeline` accept and
+  thread through `sponsor_verifier`, tagging each job with `sponsor_tier`.
+- `backend/services/automation_runtime.py` — lazily builds and caches a real
+  `SponsorRegister`, degrading gracefully to `None` if it can't be loaded, and
+  exposes `sponsor_tier(job)`; `stream_apply_job` entries now carry `sponsor_tier`.
+- `app.py` — `_sponsorship_badge(job)` renders a green
+  "✅ Sponsor-Verified (GOV.UK register)" badge for `verified` vs a yellow
+  "⚠️ Mentions sponsorship (unverified)" badge for `mentioned` (falls back to the
+  legacy `sponsorship_status` when no tier is present).
+
+Proof — `tests/test_sponsor_verification.py` (6 tests): real register company →
+`verified`; fuzzy name variations ("Ferrero UK Ltd", "AMAZON UK SERVICES") →
+`verified`; company off-register but JD says "skilled worker" → `mentioned` only;
+explicit "no sponsorship" wins even for a register company → `none`; no verifier
+supplied → never `verified`; no false positive on a short common token.
+
+### Feature 2 — Verified recruiter email surfaced per job
+
+The existing `lead_finder` (`sync_find_recruiter_email`) is now surfaced in the
+Streamlit UI on each matched job card, with an honest confidence display and a
+clear not-found state — an email is NEVER fabricated:
+
+- `app.py` — `_render_recruiter_contact(job, key)` adds a
+  "🔎 Find recruiter contact" button. Results are cached per company. Display:
+  - hunter/apollo strategy → green "✅ Verified contact" with name/email.
+  - heuristic strategy (e.g. `careers@domain`) → yellow, explicitly labelled
+    "UNVERIFIED" best-guess so it is never presented as a real found address.
+  - nothing found → neutral "ℹ️ No recruiter contact found".
+
+Proof — `tests/test_job_card_ui.py` renders the real `app._render_job_card` via
+Streamlit `AppTest`: asserts a seeded hunter lead surfaces "talent@ferrero.com"
+with "Verified contact", and a heuristic lead is flagged "UNVERIFIED".
+
+### Feature 3 — One-click export of tailored documents (PDF + DOCX)
+
+Drafted cover letters and cold emails can be downloaded as both PDF and DOCX.
+
+- No new dependencies — `python-docx`, `reportlab`, and `pypdf` are already in
+  `requirements.txt`.
+- `backend/pipeline/exporters.py` (new) — `to_docx_bytes(text, title)` (python-docx),
+  `to_pdf_bytes(text, title)` (reportlab, with `&<>` escaping), and
+  `safe_filename(*parts)`.
+- `app.py` — cached `_docx_bytes`/`_pdf_bytes` helpers and a `_download_row(...)`
+  that wires two `st.download_button`s (PDF + DOCX) for both the cover letter and
+  the cold email on each job card.
+
+Proof — `tests/test_exporters.py` (4 tests) generates real files and reads them
+back: DOCX has the `PK` zip signature and expected paragraph text; PDF has the
+`%PDF` signature and pypdf-extracted content; empty/special-char input still
+produces valid files; `safe_filename` sanitises. `tests/test_job_card_ui.py` also
+asserts ≥2 PDF and ≥2 DOCX download buttons render on a card.
+
+### Result
+
+New tests: `test_sponsor_verification.py` (6), `test_exporters.py` (4),
+`test_job_card_ui.py` (5) = **15 new tests**. New dependencies: **none**.
+
+**Full suite: 257 passed, 0 failed** — zero regressions.

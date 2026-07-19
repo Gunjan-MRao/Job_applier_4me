@@ -105,6 +105,34 @@ class SponsorRegister:
                 return True
         return False
 
+    def verify(self, company_name: str) -> bool:
+        """Authoritative fuzzy match used for the "Sponsor-Verified" tier.
+
+        Stricter than :meth:`is_licensed`: instead of loose substring matching
+        (which can false-positive on short/common tokens), it requires either an
+        exact normalised match or a full significant-token subset in either
+        direction. This still handles real name variations — e.g. a listing's
+        "Ferrero UK Ltd" matches the register's "Ferrero", and "Amazon" matches
+        "Amazon UK Services Ltd" — without matching on an incidental shared word.
+        """
+        if not self._names:
+            return False
+        key = _normalise(company_name)
+        if not key:
+            return False
+        if key in self._names:
+            return True
+        key_tokens = {t for t in key.split() if len(t) >= 3}
+        if not key_tokens:
+            return False
+        for n in self._names:
+            n_tokens = {t for t in n.split() if len(t) >= 3}
+            if not n_tokens:
+                continue
+            if key_tokens <= n_tokens or n_tokens <= key_tokens:
+                return True
+        return False
+
     def refresh(self) -> bool:
         """Force a fresh download regardless of TTL. Returns True on success."""
         return self._download()

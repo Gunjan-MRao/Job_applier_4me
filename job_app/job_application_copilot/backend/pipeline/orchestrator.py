@@ -38,6 +38,7 @@ def gather_jobs(
     location: str = "United Kingdom",
     allow_scraper_fallback: bool = False,
     log_fn: Optional[Callable] = None,
+    sponsor_verifier: Optional[Callable[[str], bool]] = None,
 ) -> dict:
     """Fetch jobs from the best available source, in priority order.
 
@@ -63,7 +64,10 @@ def gather_jobs(
     # no keywords are supplied.
     queries = [k.strip() for k in (keywords or [])[:3] if k and k.strip()]
     if not queries:
-        queries = ["supply chain logistics"]
+        # No keywords supplied — use a neutral, non-persona default so the flow
+        # still returns something. Real searches always pass resume-derived
+        # keywords; this only guards the empty-input edge case.
+        queries = ["jobs"]
     notes: List[str] = []
     jobs: List[dict] = []
     source_used = "mock"
@@ -115,6 +119,7 @@ def gather_jobs(
     jobs = _dedupe(jobs)
     for j in jobs:
         j.setdefault("sponsorship_status", scoring.classify_sponsorship(j.get("description", "")))
+        j["sponsor_tier"] = scoring.sponsorship_tier(j, sponsor_verifier)
 
     return {"jobs": jobs, "source_used": source_used, "used_mock": used_mock, "notes": notes}
 
@@ -129,6 +134,7 @@ def run_pipeline(
     allow_scraper_fallback: bool = False,
     llm_fn: Optional[drafting.LLMFn] = None,
     log_fn: Optional[Callable] = None,
+    sponsor_verifier: Optional[Callable[[str], bool]] = None,
 ) -> dict:
     """Run the full flow end-to-end and return ranked, drafted results.
 
@@ -144,7 +150,7 @@ def run_pipeline(
     Drafting (LLM or offline template) is only run for the top ``draft_top_n``
     matches to keep a run fast and within free LLM rate limits.
     """
-    gathered = gather_jobs(keywords, location, allow_scraper_fallback, log_fn)
+    gathered = gather_jobs(keywords, location, allow_scraper_fallback, log_fn, sponsor_verifier)
     jobs = gathered["jobs"]
 
     scored: List[dict] = []

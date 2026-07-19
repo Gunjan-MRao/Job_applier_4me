@@ -50,6 +50,49 @@ try:
 except ImportError:
     _HAS_AUTOREFRESH = False
 
+# ---------------------------------------------------------------------------
+# Secrets → environment (Streamlit Community Cloud compatibility)
+# ---------------------------------------------------------------------------
+# On Streamlit Cloud there is no .env file; secrets are provided via st.secrets
+# (App settings → Secrets). backend.core.config reads os.environ at IMPORT time,
+# so we must copy any st.secrets values into os.environ BEFORE any backend module
+# is imported. Existing os.environ / .env values always win so local runs are
+# unchanged. This is a no-op when no secrets file is configured.
+_SECRET_KEYS = [
+    "GROQ_API_KEY", "GEMINI_API_KEY",
+    "ADZUNA_APP_ID", "ADZUNA_APP_KEY", "REED_API_KEY",
+    "EMAIL_ADDRESS", "EMAIL_PASSWORD",
+]
+
+
+def _load_secrets_into_env() -> None:
+    try:
+        secrets = st.secrets  # raises/empty if no secrets.toml is present
+    except Exception:
+        return
+    for key in _SECRET_KEYS:
+        if os.environ.get(key):
+            continue  # never override an explicit env var / .env value
+        try:
+            val = secrets[key]
+        except Exception:
+            continue
+        if val:
+            os.environ[key] = str(val)
+
+
+_load_secrets_into_env()
+
+# ---------------------------------------------------------------------------
+# Run mode: embedded (in-process) vs http (talk to a running FastAPI backend)
+# ---------------------------------------------------------------------------
+# Streamlit Community Cloud runs ONE process (`streamlit run app.py`) — it cannot
+# also run uvicorn. In embedded mode the UI calls the pipeline logic directly as
+# in-process function calls (no HTTP), so it needs no backend server. Local
+# launch_app.bat / launch.py can still run the FastAPI backend and set
+# RUN_MODE=http to use the HTTP path, which is left fully intact.
+EMBEDDED = os.environ.get("RUN_MODE", "embedded").strip().lower() != "http"
+
 BASE_DIR     = Path(__file__).resolve().parent
 API_HOST     = "127.0.0.1"
 API_PORT     = 8000
@@ -87,11 +130,11 @@ SOURCE_ICONS = {
     "fallback":           "\U0001f4e6 Sample",
 }
 
-DEFAULT_KEYWORDS = (
-    "graduate supply chain analyst, operations analyst, demand planning analyst, "
-    "procurement analyst, logistics analyst, inventory analyst, supply chain graduate scheme, "
-    "business analyst supply chain, category analyst"
-)
+# No resume parsed yet → keep the keyword box empty and let the placeholder
+# prompt the user. This is deliberately NOT a specific persona/industry; real
+# keywords always come from the parsed resume (see smart_keywords) or user input.
+DEFAULT_KEYWORDS = ""
+KEYWORDS_PLACEHOLDER = "e.g. the job titles you want, comma-separated"
 
 POLL_THROTTLE_S  = 4.0
 AUTO_REFRESH_MS  = 5000  # for st_autorefresh
@@ -103,6 +146,64 @@ AUTO_REFRESH_MS  = 5000  # for st_autorefresh
 EM_DASH    = "\u2014"                # em-dash placeholder for a missing value
 ICON_WARN  = "\u26a0\ufe0f"        # warning sign
 ICON_CHECK = "\u2705"                # check mark
+
+# Job-source API keys that unlock LIVE data. Missing ALL of these is why the
+# pipeline falls back to built-in sample listings.
+_JOB_SOURCE_KEYS = ["ADZUNA_APP_ID", "ADZUNA_APP_KEY", "REED_API_KEY"]
+
+
+def _env_value(name: str) -> str:
+    """Look a key up in os.environ, then st.secrets, then the local .env file."""
+    val = os.environ.get(name, "")
+    if val:
+        return val
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.strip().startswith(f"{name}="):
+                v = line.split("=", 1)[1].strip()
+                if v:
+                    return v
+    return ""
+
+
+def _missing_job_api_keys() -> list:
+    """Return the job-source API keys that are NOT configured anywhere."""
+    return [k for k in _JOB_SOURCE_KEYS if not _env_value(k)]
+
+
+def _render_mock_banner() -> None:
+    """Big, impossible-to-miss red banner shown whenever results are SAMPLE data.
+
+    Never blend sample listings in silently. State plainly that these are not
+    live openings and name the likely cause (missing API keys).
+    """
+    missing = _missing_job_api_keys()
+    if missing:
+        cause = (
+            "No live job-search API keys are configured, so no live source could "
+            f"be reached. Missing: **{', '.join(missing)}**."
+        )
+        fix = (
+            "Add **ADZUNA_APP_ID** + **ADZUNA_APP_KEY** (and optionally "
+            "**REED_API_KEY**) \u2014 via `.env` locally or **App settings \u2192 Secrets** "
+            "on Streamlit Cloud \u2014 then run the agent again."
+        )
+    else:
+        cause = (
+            "The live job sources returned no results or could not be reached, "
+            "so built-in sample listings are being shown instead."
+        )
+        fix = "Try different keywords/location, or run the agent again shortly."
+    st.error(
+        "\ud83d\udea8 **SAMPLE DATA \u2014 these are NOT real job openings.**\n\n"
+        f"{cause}\n\n{fix}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -282,10 +383,80 @@ def backend_status_info():
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# Backend readiness (mode-aware)
+# ---------------------------------------------------------------------------
+
+def _backend_ready() -> bool:
+    """True when the pipeline can be reached — always True in embedded mode
+    (in-process), else a live HTTP backend must be listening."""
+    return EMBEDDED or is_port_open()
+
+
+# ---------------------------------------------------------------------------
+# API client — embedded (in-process) OR HTTP, same (data, err) contract
+# ---------------------------------------------------------------------------
+# In embedded mode we call the SAME functions the FastAPI routes call, so both
+# entry points share one code path. Payload/response shapes are identical to the
+# HTTP JSON, so every call site below is mode-agnostic.
+
+def _embedded_get(path):
+    from backend.schemas.automation import AutomationStatusResponse
+    from backend.services.automation_runtime import get_run
+    if path.startswith("/automation/status/"):
+        run_id = path.rsplit("/", 1)[-1].split("?", 1)[0]
+        run = get_run(run_id)
+        if not run:
+            return None, "Run not found"
+        return AutomationStatusResponse(**run).model_dump(), None
+    if path.startswith("/applications/"):
+        from backend.services.application.application_service import (
+            get_applications_for_candidate,
+        )
+        email = path.rsplit("/", 1)[-1].split("?", 1)[0]
+        import urllib.parse
+        return get_applications_for_candidate(urllib.parse.unquote(email)), None
+    return None, f"embedded: unsupported GET {path}"
+
+
+def _embedded_post(path, payload):
+    if path == "/automation/start":
+        from backend.schemas.automation import AutomationStartPayload
+        from backend.services.automation_runtime import start_run_thread
+        run = start_run_thread(AutomationStartPayload(**payload))
+        return {"run_id": run["run_id"], "status": run["status"],
+                "message": "Automation run started successfully."}, None
+    return None, f"embedded: unsupported POST {path}"
+
+
+def _embedded_patch(path, payload):
+    # /applications/{application_id}/status
+    if path.startswith("/applications/") and path.endswith("/status"):
+        from backend.services.application.application_service import (
+            update_application_status,
+        )
+        app_id = path[len("/applications/"):-len("/status")]
+        try:
+            result = update_application_status(
+                application_id=app_id,
+                new_status=payload.get("status"),
+                notes=payload.get("notes"),
+            )
+        except ValueError as exc:
+            return None, str(exc)
+        return result, None
+    return None, f"embedded: unsupported PATCH {path}"
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers (used directly in http mode; embedded mode short-circuits above)
 # ---------------------------------------------------------------------------
 
 def _get(path, timeout=10):
+    if EMBEDDED:
+        try:
+            return _embedded_get(path)
+        except Exception as e:
+            return None, str(e)
     try:
         r = requests.get(f"{API_BASE_URL}{path}", timeout=timeout)
         r.raise_for_status()
@@ -295,6 +466,11 @@ def _get(path, timeout=10):
 
 
 def _post(path, payload, timeout=60):
+    if EMBEDDED:
+        try:
+            return _embedded_post(path, payload)
+        except Exception as e:
+            return None, str(e)
     try:
         r = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
         r.raise_for_status()
@@ -304,6 +480,11 @@ def _post(path, payload, timeout=60):
 
 
 def _patch(path, payload, timeout=10):
+    if EMBEDDED:
+        try:
+            return _embedded_patch(path, payload)
+        except Exception as e:
+            return None, str(e)
     try:
         r = requests.patch(f"{API_BASE_URL}{path}", json=payload, timeout=timeout)
         r.raise_for_status()
@@ -397,33 +578,23 @@ def parse_resume(file_bytes, filename):
 
 
 def smart_keywords(profile: dict) -> str:
+    """Derive search keywords from the ACTUAL parsed resume — the candidate's
+    detected job titles first, then their skills. There is deliberately NO
+    hardcoded industry/persona fallback: whatever the resume contains is what
+    drives the search, so a software CV yields software keywords, a finance CV
+    finance keywords, etc. If the resume has no detectable roles or skills we
+    return an empty string and let the user type keywords manually.
+    """
     roles  = profile.get("likely_roles") or []
     skills = profile.get("skills") or []
-    sc_roles = [r for r in roles if any(t in r.lower() for t in (
-        "supply chain", "logistics", "procurement", "operations",
-        "inventory", "demand", "transport", "warehouse",
-        "purchasing", "coordinator", "analyst",
-    ))]
-    sc_skills = [s for s in skills if s in (
-        "supply chain", "logistics", "procurement", "sap", "excel", "erp",
-        "forecasting", "demand planning", "inventory management", "operations",
-        "power bi", "sql", "s&op", "vendor management",
-    )]
-    combined = sc_roles[:3] + sc_skills[:5]
+    combined = list(roles[:3]) + list(skills[:6])
     seen, out = set(), []
     for k in combined:
-        if k not in seen:
-            seen.add(k)
+        k = (k or "").strip()
+        kl = k.lower()
+        if k and kl not in seen:
+            seen.add(kl)
             out.append(k)
-    if not out:
-        out = sc_skills[:6] or [
-            "graduate supply chain analyst",
-            "demand planning analyst",
-            "operations analyst",
-            "procurement analyst",
-            "logistics analyst",
-            "inventory analyst",
-        ]
     return ", ".join(out[:8])
 
 
@@ -714,6 +885,8 @@ def tab_agent():
         st.session_state["agent_jobs"]     = applied_jobs
         st.session_state["agent_sources"]  = source_counts
         st.session_state["agent_summary"]  = data.get("result_summary")
+        st.session_state["agent_used_mock"]   = bool(data.get("used_mock"))
+        st.session_state["agent_source_used"] = data.get("source_used")
 
     status        = st.session_state.get("agent_status", "unknown")
     stage         = st.session_state.get("agent_stage", "")
@@ -734,6 +907,14 @@ def tab_agent():
     st.progress(min(max(int(prog), 0), 100))
     if current_url and running:
         st.caption(f"\u23f3 Scanning: {current_url[:90]}")
+
+    # ---- Honest mock-data banner ----------------------------------------
+    # When the pipeline could not reach a live job source it falls back to
+    # built-in SAMPLE listings. Never blend those in silently: show a big,
+    # impossible-to-miss red banner naming the likely cause so the user knows
+    # these are NOT real job openings.
+    if st.session_state.get("agent_used_mock") and not running:
+        _render_mock_banner()
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("\U0001f50d Jobs Found",   scanned)
@@ -803,18 +984,111 @@ def tab_agent():
             _go(PAGE_AGENT)
 
 
+def _sponsorship_badge(job: dict) -> str:
+    """Badge HTML that keeps the authoritative GOV.UK-register signal visibly
+    distinct from a weak, unverified JD-text mention. Falls back to the legacy
+    sponsorship_status pill for jobs produced before sponsor_tier existed."""
+    tier = job.get("sponsor_tier")
+    if tier == "verified":
+        return status_pill("\u2705 Sponsor-Verified (GOV.UK register)", "#10b981")
+    if tier == "mentioned":
+        return status_pill("\u26a0\ufe0f Mentions sponsorship (unverified)", "#f59e0b")
+    if tier == "none":
+        return status_pill("No sponsorship", "#ef4444")
+    if tier == "unknown":
+        return status_pill("Sponsorship ?", "#6b7280")
+    return {
+        "yes":     status_pill("Sponsors visas", "#10b981"),
+        "no":      status_pill("No sponsorship", "#ef4444"),
+        "unknown": status_pill("Sponsorship ?",  "#f59e0b"),
+    }.get(job.get("sponsorship_status", "unknown"), "")
+
+
+@st.cache_data(show_spinner=False)
+def _docx_bytes(text: str, title: str) -> bytes:
+    from backend.pipeline.exporters import to_docx_bytes
+    return to_docx_bytes(text, title)
+
+
+@st.cache_data(show_spinner=False)
+def _pdf_bytes(text: str, title: str) -> bytes:
+    from backend.pipeline.exporters import to_pdf_bytes
+    return to_pdf_bytes(text, title)
+
+
+def _download_row(text: str, title: str, base_name: str, key: str) -> None:
+    """One-click PDF + DOCX download buttons for a drafted document."""
+    from backend.pipeline.exporters import safe_filename
+    stem = safe_filename(base_name)
+    dc1, dc2 = st.columns(2)
+    try:
+        with dc1:
+            st.download_button(
+                "\u2b07\ufe0f Download as PDF", data=_pdf_bytes(text, title),
+                file_name=f"{stem}.pdf", mime="application/pdf",
+                key=f"pdf_{key}", use_container_width=True,
+            )
+        with dc2:
+            st.download_button(
+                "\u2b07\ufe0f Download as DOCX", data=_docx_bytes(text, title),
+                file_name=f"{stem}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key=f"docx_{key}", use_container_width=True,
+            )
+    except Exception as exc:  # never let an export lib hiccup break the card
+        st.caption(f"Export unavailable: {exc}")
+
+
+def _lead_cache() -> dict:
+    return st.session_state.setdefault("_lead_cache", {})
+
+
+def _find_lead(company: str, job_title: str) -> dict:
+    """Look up a recruiter contact in-process (works with no backend running).
+    Returns the raw lead_finder dict; never fabricates a verified contact."""
+    from backend.services.lead_finder import sync_find_recruiter_email
+    return sync_find_recruiter_email(company=company, job_title=job_title)
+
+
+def _render_recruiter_contact(job: dict, key: str) -> None:
+    """Per-job 'Find recruiter contact' control + honest result display."""
+    company = job.get("company", "")
+    title   = job.get("title", "")
+    if not company or company == "Unknown company":
+        return
+    cache = _lead_cache()
+    st.markdown("\U0001f9d1\u200d\U0001f4bc **Recruiter contact**")
+    if st.button("\U0001f50e Find recruiter contact", key=f"lead_btn_{key}"):
+        with st.spinner(f"Searching for a contact at {company}..."):
+            try:
+                cache[company] = _find_lead(company, title)
+            except Exception as exc:
+                cache[company] = {"email": None, "strategy": "error", "error": str(exc)}
+    result = cache.get(company)
+    if result is None:
+        st.caption("Click to search verified sources (Hunter.io / Apollo.io).")
+        return
+    email    = result.get("email")
+    strategy = result.get("strategy", "")
+    if email and strategy in ("hunter", "apollo"):
+        st.success(f"\u2705 Verified contact ({strategy}): **{email}**")
+    elif email and strategy == "heuristic":
+        st.warning(
+            f"\u26a0\ufe0f No verified contact found. Best-guess pattern "
+            f"(UNVERIFIED \u2014 confirm before using): `{email}`"
+        )
+    else:
+        st.info("\u2139\ufe0f No recruiter contact found for this company.")
+
+
 def _render_job_card(job: dict, review_mode: bool):
     fit   = job.get("fit_score", 0)
     title = job.get("title", "Unknown role")
     co    = job.get("company", "Unknown company")
     src   = source_label(job.get("source", ""))
-    spons = job.get("sponsorship_status", "unknown")
     url   = job.get("url", "")
-    spons_html = {
-        "yes":     status_pill("Sponsors visas", "#10b981"),
-        "no":      status_pill("No sponsorship", "#ef4444"),
-        "unknown": status_pill("Sponsorship ?",  "#f59e0b"),
-    }.get(spons, "")
+    spons_html = _sponsorship_badge(job)
+    card_key = f"{url}{title}{fit}"
     label = f"{ICON_WARN if review_mode else ICON_CHECK} {fit}% | {title} @ {co} | {src}"
     with st.expander(label):
         hc1, hc2, hc3 = st.columns([2, 1, 1])
@@ -826,16 +1100,21 @@ def _render_job_card(job: dict, review_mode: bool):
             st.markdown(spons_html, unsafe_allow_html=True)
         with hc3:
             st.metric("Fit score", f"{fit}%")
+        _render_recruiter_contact(job, card_key)
         if job.get("cover_letter"):
             st.markdown("\U0001f4dd **Cover Letter** (edit before sending):")
             st.text_area("cover_letter", value=job["cover_letter"], height=230,
-                         key=f"cl_{url}{title}{fit}")
+                         key=f"cl_{card_key}")
+            _download_row(job["cover_letter"], f"Cover Letter \u2014 {title} @ {co}",
+                          f"cover_letter_{co}_{title}", f"cl_{card_key}")
         elif review_mode:
             st.warning("Cover letter failed \u2014 apply directly via the link above.")
         if job.get("cold_email"):
             st.markdown("\U0001f4e7 **Cold Recruiter Email** (edit before sending):")
             st.text_area("cold_email", value=job["cold_email"], height=190,
-                         key=f"ce_{url}{title}{fit}")
+                         key=f"ce_{card_key}")
+            _download_row(job["cold_email"], f"Cold Email \u2014 {title} @ {co}",
+                          f"cold_email_{co}_{title}", f"ce_{card_key}")
         if job.get("resume_guidance"):
             with st.expander("\U0001f4c4 Resume tailoring tips"):
                 g = job["resume_guidance"]

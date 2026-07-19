@@ -1,0 +1,31 @@
+Aarav Mehta
+aarav.mehta@example.com
++44 7987 654321
+Manchester, United Kingdom
+github.com/aaravmehta
+
+PROFESSIONAL SUMMARY
+Backend software engineer with 4 years of experience building REST APIs and
+microservices. Skilled in Python, Java, Django, FastAPI, Docker, Kubernetes and
+AWS, with a track record of shipping scalable services and improving deployment
+reliability.
+
+WORK EXPERIENCE
+Software Engineer — Northgate Tech Ltd
+Jan 2021 - Present
+- Designed and built REST APIs and microservices in Python (Django, FastAPI)
+  serving 2M+ daily requests.
+- Containerised services with Docker and deployed to Kubernetes on AWS.
+- Set up CI/CD pipelines with Git, cutting release time by 40%.
+
+Backend Developer — BluePixel Software
+Jun 2019 - Dec 2020
+- Built PostgreSQL-backed services and Redis caching layers.
+- Wrote automated tests and improved code coverage across the codebase.
+
+EDUCATION
+BSc Computer Science — University of Manchester
+
+SKILLS
+Python, Java, JavaScript, TypeScript, React, Django, FastAPI, Docker,
+Kubernetes, AWS, PostgreSQL, Redis, Git, CI/CD, REST API, microservices, SQL

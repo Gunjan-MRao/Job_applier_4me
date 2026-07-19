@@ -261,6 +261,8 @@ def create_run(payload) -> dict:
         "top_matches":       [],
         "applied_jobs":      [],
         "created_at":        now_iso(),
+        "used_mock":         False,
+        "source_used":       None,
     }
     add_log(run, "info", "Run created.")
     with RUN_LOCK:
@@ -275,6 +277,30 @@ def classify_sponsorship(description: str) -> str:
     # Canonical implementation now lives in backend.pipeline.scoring; kept here
     # as a thin delegate so existing imports/tests keep working.
     return _scoring.classify_sponsorship(description)
+
+
+# Lazily-built, cached GOV.UK sponsor register. Building it may hit the network,
+# so we do it once on first use and degrade gracefully to no verifier (jobs then
+# fall back to the weaker "mentioned"/"unknown" tiers) if it is unavailable.
+_SPONSOR_REGISTER = None
+_SPONSOR_REGISTER_TRIED = False
+
+
+def _sponsor_verifier():
+    global _SPONSOR_REGISTER, _SPONSOR_REGISTER_TRIED
+    if not _SPONSOR_REGISTER_TRIED:
+        _SPONSOR_REGISTER_TRIED = True
+        try:
+            from backend.services.sponsor_register import SponsorRegister
+            _SPONSOR_REGISTER = SponsorRegister()
+        except Exception:
+            _SPONSOR_REGISTER = None
+    return _SPONSOR_REGISTER.verify if _SPONSOR_REGISTER else None
+
+
+def sponsor_tier(job: dict) -> str:
+    """Authoritative sponsorship tier for a job (see scoring.sponsorship_tier)."""
+    return _scoring.sponsorship_tier(job, _sponsor_verifier())
 
 # ---------------------------------------------------------------------------
 # Fit scoring
@@ -834,6 +860,7 @@ def stream_apply_job(job: dict, profile: Optional[dict], keywords: List[str],
         "url":                job.get("url", ""),
         "fit_score":          fit,
         "sponsorship_status": job.get("sponsorship_status", "unknown"),
+        "sponsor_tier":       job.get("sponsor_tier") or sponsor_tier(job),
         "source":             job.get("source", ""),
         "cover_letter":       None,
         "cold_email":         None,
@@ -904,6 +931,11 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         all_jobs = gathered["jobs"]
         for note in gathered["notes"]:
             add_log(run, "info", note)
+        # Persist the source/mock status so the UI can show an honest, hard-to-miss
+        # banner when the results are not live job data.
+        update_run(run_id,
+                   used_mock=bool(gathered["used_mock"]),
+                   source_used=gathered["source_used"])
         add_log(run, "info",
                 f"Source used: {gathered['source_used']} "
                 f"({'MOCK — set ADZUNA_APP_ID/ADZUNA_APP_KEY for real data' if gathered['used_mock'] else 'live'})")
@@ -915,7 +947,9 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         if not all_jobs:
             add_log(run, "warning", "No jobs after filtering — showing sample jobs")
             all_jobs = FALLBACK_JOBS[:]
-            update_run(run_id, jobs_scanned=len(all_jobs))
+            # These are built-in sample jobs, not live data — flag it honestly.
+            update_run(run_id, jobs_scanned=len(all_jobs),
+                       used_mock=True, source_used="mock")
 
         update_run(run_id,
                    stage="🤖 Scoring jobs and generating cover letters...",
@@ -943,6 +977,8 @@ def run_automation_pipeline(run_id: str, payload) -> None:
             "location":     payload.location,
             "jobs_seen":    len(all_jobs),
             "matched_jobs": matched,
+            "used_mock":    bool(final_run.get("used_mock")),
+            "source_used":  final_run.get("source_used"),
             "applied_jobs": len(final_run.get("applied_jobs", [])),
             "top_matches": [
                 {"title": j["title"], "company": j["company"],

@@ -17,20 +17,56 @@ from typing import Any, Dict, List, Optional
 # ---------------------------------------------------------------------------
 # Skills keyword bank
 # ---------------------------------------------------------------------------
+# Cross-domain skills bank. The parser is generic: it must recognise skills from
+# ANY uploaded CV (software, data, finance, marketing, healthcare, design, etc.),
+# not a single industry. Terms are matched as case-insensitive substrings, so
+# each entry is kept distinctive (>= 2 chars, no bare single letters).
 SKILLS_BANK = [
-    "supply chain", "logistics", "procurement", "sap", "excel", "operations",
-    "forecasting", "power bi", "inventory management", "demand planning", "erp",
-    "sql", "python", "tableau", "s&op", "vendor management", "warehouse",
-    "transport", "purchasing", "category management", "ariba", "oracle",
-    "six sigma", "lean", "project management", "stakeholder management",
-    "data analysis", "cost reduction", "continuous improvement", "3pl",
+    # --- Supply chain / operations ---
+    "supply chain", "logistics", "procurement", "sap", "operations",
+    "forecasting", "inventory management", "demand planning", "erp",
+    "s&op", "vendor management", "warehouse", "transport", "purchasing",
+    "category management", "ariba", "oracle", "six sigma", "lean", "3pl",
     "customs", "import", "export", "freight", "distribution", "planning",
-    "budgeting", "kpi", "reporting", "microsoft office", "visio",
-    "negotiation", "contract management", "risk management",
+    "cost reduction", "continuous improvement", "contract management",
+    # --- Software engineering ---
+    "python", "java", "javascript", "typescript", "c++", "c#", "golang",
+    "rust", "ruby", "php", "kotlin", "swift", "scala", "react", "angular",
+    "vue", "node.js", "django", "flask", "fastapi", "spring boot", ".net",
+    "rest api", "graphql", "microservices", "docker", "kubernetes",
+    "terraform", "aws", "azure", "gcp", "ci/cd", "git", "linux",
+    "html", "css", "redis", "kafka", "rabbitmq", "elasticsearch",
+    # --- Data / analytics ---
+    "sql", "nosql", "mongodb", "postgresql", "mysql", "excel", "power bi",
+    "tableau", "looker", "data analysis", "data engineering", "etl",
+    "spark", "hadoop", "airflow", "snowflake", "machine learning",
+    "deep learning", "tensorflow", "pytorch", "pandas", "numpy",
+    "statistics", "data visualization", "r programming",
+    # --- Finance / accounting ---
+    "financial modelling", "accounting", "financial analysis", "audit",
+    "tax", "budgeting", "forecasting", "quickbooks", "sap fico", "ifrs",
+    "gaap", "valuation", "equity research", "risk management",
+    # --- Marketing / sales ---
+    "digital marketing", "seo", "sem", "content marketing", "social media",
+    "google analytics", "hubspot", "salesforce", "crm", "copywriting",
+    "brand management", "market research", "email marketing", "ppc",
+    # --- Design / product ---
+    "figma", "sketch", "adobe photoshop", "illustrator", "ux design",
+    "ui design", "wireframing", "prototyping", "product management",
+    "roadmapping", "user research",
+    # --- Healthcare ---
+    "nursing", "patient care", "clinical", "phlebotomy", "medical coding",
+    "pharmacology", "care planning", "safeguarding",
+    # --- General professional ---
+    "project management", "stakeholder management", "agile", "scrum",
+    "prince2", "pmp", "kpi", "reporting", "microsoft office", "visio",
+    "negotiation", "leadership", "communication", "presentation",
 ]
 
-# Common supply chain / operations job titles
+# Cross-domain job title families. Generic enough to recognise roles across
+# industries, not just supply chain.
 ROLE_PATTERNS = [
+    # Supply chain / operations
     r"supply chain (?:analyst|manager|coordinator|specialist|executive|lead|officer|consultant)",
     r"logistics (?:analyst|manager|coordinator|specialist|executive|lead|officer)",
     r"procurement (?:analyst|manager|coordinator|specialist|executive|lead|officer|advisor)",
@@ -42,14 +78,47 @@ ROLE_PATTERNS = [
     r"purchasing (?:manager|analyst|officer|coordinator|specialist)",
     r"category (?:manager|analyst|specialist|buyer)",
     r"s(?:&|and)op (?:analyst|manager|planner|specialist)",
-    r"business analyst",
-    r"data analyst",
-    r"project (?:manager|coordinator|analyst)",
-    r"graduate (?:analyst|trainee|scheme|programme)",
-    r"junior (?:analyst|manager|coordinator|executive)",
-    r"senior (?:analyst|manager|coordinator|executive|specialist)",
-    r"customer (?:operations|service|support) (?:specialist|analyst|advisor|executive|manager)",
     r"operations specialist",
+    # Software / data / IT
+    r"software (?:engineer|developer|architect)",
+    r"(?:backend|back-end|frontend|front-end|full[\s-]?stack) (?:engineer|developer)",
+    r"web developer",
+    r"(?:data|machine learning|ml|ai) (?:engineer|scientist)",
+    r"data analyst",
+    r"devops engineer",
+    r"site reliability engineer",
+    r"qa (?:engineer|analyst|tester)",
+    r"cloud (?:engineer|architect)",
+    r"systems? (?:administrator|engineer|analyst)",
+    r"mobile (?:developer|engineer)",
+    # Finance / accounting
+    r"financial (?:analyst|controller|accountant)",
+    r"accountant",
+    r"investment (?:analyst|banker|associate)",
+    r"auditor",
+    # Marketing / sales
+    r"(?:digital )?marketing (?:manager|analyst|executive|specialist|coordinator)",
+    r"(?:sales|account) (?:manager|executive|representative|associate)",
+    r"content (?:writer|manager|strategist)",
+    r"seo (?:specialist|analyst|manager)",
+    # Product / design
+    r"product (?:manager|owner|analyst)",
+    r"ux(?:/ui)? designer",
+    r"ui(?:/ux)? designer",
+    r"(?:graphic|product|web) designer",
+    # Healthcare
+    r"(?:registered )?nurse",
+    r"care (?:assistant|worker|manager)",
+    r"(?:medical|healthcare) (?:assistant|administrator)",
+    # Generic families
+    r"business analyst",
+    r"project (?:manager|coordinator|analyst)",
+    r"programme? manager",
+    r"graduate (?:analyst|trainee|scheme|programme|engineer|developer)",
+    r"junior (?:analyst|manager|coordinator|executive|engineer|developer)",
+    r"senior (?:analyst|manager|coordinator|executive|specialist|engineer|developer)",
+    r"customer (?:operations|service|support) (?:specialist|analyst|advisor|executive|manager)",
+    r"consultant",
 ]
 
 # ---------------------------------------------------------------------------
@@ -265,7 +334,11 @@ def _is_valid_degree(match: str) -> bool:
 
 def _extract_skills(text: str) -> List[str]:
     tl = text.lower()
-    return [s for s in SKILLS_BANK if s in tl]
+    out: List[str] = []
+    for s in SKILLS_BANK:
+        if s in tl and s not in out:
+            out.append(s)
+    return out
 
 
 def _extract_roles(text: str) -> List[str]:

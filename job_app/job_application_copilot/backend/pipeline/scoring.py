@@ -15,7 +15,7 @@ in the drafting/orchestration code, not here.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 # ---------------------------------------------------------------------------
 # Sponsorship classifier
@@ -51,6 +51,44 @@ def classify_sponsorship(description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Sponsorship *tier* — separates an authoritative GOV.UK register match from a
+# weak, gameable JD-text mention. These must never be conflated: a job is only
+# "verified" if the employer is on the official register.
+# ---------------------------------------------------------------------------
+
+SPONSOR_VERIFIED  = "verified"   # employer matched against GOV.UK sponsor register
+SPONSOR_MENTIONED = "mentioned"  # JD text mentions sponsorship, employer NOT verified
+SPONSOR_NONE      = "none"       # JD explicitly rules sponsorship out
+SPONSOR_UNKNOWN   = "unknown"    # no signal either way
+
+
+def sponsorship_tier(job: dict, sponsor_verifier: Optional[Callable[[str], bool]] = None) -> str:
+    """Classify a job's sponsorship signal into a trust tier.
+
+    ``sponsor_verifier`` is an optional callable ``company_name -> bool`` (e.g.
+    ``SponsorRegister.verify``). It is injected rather than imported so this
+    module stays pure/network-free and unit-testable.
+
+    An explicit "no sponsorship" in the JD always wins so we never over-promise.
+    Otherwise a register match yields ``verified``; a JD-only mention yields the
+    clearly-weaker ``mentioned``; anything else is ``unknown``.
+    """
+    desc_class = classify_sponsorship(job.get("description", ""))
+    if desc_class == "no":
+        return SPONSOR_NONE
+    company = (job.get("company") or "").strip()
+    if sponsor_verifier is not None and company:
+        try:
+            if sponsor_verifier(company):
+                return SPONSOR_VERIFIED
+        except Exception:
+            pass
+    if desc_class == "yes":
+        return SPONSOR_MENTIONED
+    return SPONSOR_UNKNOWN
+
+
+# ---------------------------------------------------------------------------
 # Fit scoring
 # ---------------------------------------------------------------------------
 
@@ -59,14 +97,26 @@ ENTRY_LEVEL_TITLES = [
     "assistant", "associate", "coordinator", "analyst", "apprentice",
 ]
 
-SC_CORE_TERMS = [
-    "supply chain", "logistics", "procurement", "operations",
-    "warehouse", "transport", "inventory", "demand plan", "forecasting",
-    "s&op", "purchasing", "vendor", "freight", "distribution",
-    "sap", "erp", "excel",
-]
-
 SENIOR_TERMS = ["senior", "lead", "head of", "director", "principal", "vp ", "manager"]
+
+
+def _core_terms(profile: Optional[dict], keywords: List[str]) -> List[str]:
+    """The candidate's own domain vocabulary — derived 100% from the parsed
+    resume (skills + likely roles) and the keywords the user actually chose,
+    never a hardcoded industry. This is what the domain bonus / title-floor
+    reward, so scoring reflects THIS candidate rather than a baked-in persona.
+    """
+    terms = set()
+    for src in ((profile or {}).get("skills") or [], (profile or {}).get("likely_roles") or []):
+        for item in src:
+            item = (item or "").strip().lower()
+            if len(item) >= 2:
+                terms.add(item)
+    for kw in keywords or []:
+        kw = (kw or "").strip().lower()
+        if len(kw) >= 2:
+            terms.add(kw)
+    return list(terms)
 
 
 def score_job(job: dict, profile: Optional[dict], keywords: List[str]) -> dict:
@@ -74,14 +124,14 @@ def score_job(job: dict, profile: Optional[dict], keywords: List[str]) -> dict:
 
     Returns ``{"fit_score", "fit_level", "reasons", "gaps"}``.
 
-    Rules (kept identical to the field-proven original scorer so results are
-    stable across the app):
+    Rules — every signal is derived from the candidate (parsed resume skills/
+    roles + the keywords they chose), with NO hardcoded industry:
       * Keyword overlap with the search keywords (title-only when the JD is
         short, which LinkedIn/Adzuna teasers often are).
-      * Bonus for supply-chain core terms, entry-level titles and explicit
-        sponsorship.
-      * A title containing a supply-chain term earns a guaranteed floor of 15 so
-        strong-title/short-description jobs are never buried.
+      * Bonus when the job matches the candidate's own skill/role vocabulary.
+      * A title matching one of the candidate's core terms earns a guaranteed
+        floor of 15 so strong-title/short-description jobs are never buried.
+      * Bonus for entry-level titles and explicit sponsorship.
       * Penalty for senior titles when the candidate has no numeric experience.
     """
     title = (job.get("title") or "").lower()
@@ -97,15 +147,16 @@ def score_job(job: dict, profile: Optional[dict], keywords: List[str]) -> dict:
     if kw_hits:
         reasons.append(f"{kw_hits} keyword match(es)")
 
-    sc_hits = sum(1 for t in SC_CORE_TERMS if t in title) + (
-        sum(1 for t in SC_CORE_TERMS if t in desc) if not desc_is_short else 0
+    core_terms = _core_terms(profile, keywords)
+    core_hits = sum(1 for t in core_terms if t in title) + (
+        sum(1 for t in core_terms if t in desc) if not desc_is_short else 0
     )
-    sc_bonus = min(sc_hits * 3, 20)
-    if sc_hits:
-        reasons.append("supply-chain terms present")
+    core_bonus = min(core_hits * 3, 20)
+    if core_hits:
+        reasons.append("matches your background")
 
-    title_sc_match = any(t in title for t in SC_CORE_TERMS)
-    title_floor = 15 if title_sc_match else 0
+    title_core_match = any(t in title for t in core_terms)
+    title_floor = 15 if title_core_match else 0
 
     entry_bonus = 15 if any(t in title for t in ENTRY_LEVEL_TITLES) else 0
     if entry_bonus:
@@ -123,15 +174,23 @@ def score_job(job: dict, profile: Optional[dict], keywords: List[str]) -> dict:
 
     score = max(
         title_floor,
-        min(kw_score + sc_bonus + entry_bonus + spons_bonus + senior_penalty, 100),
+        min(kw_score + core_bonus + entry_bonus + spons_bonus + senior_penalty, 100),
     )
     score = max(0, score)
     level = "strong" if score >= 60 else ("moderate" if score >= 30 else "weak")
 
+    # Skill gaps: vocabulary terms the JD requires that the resume does not list.
+    # Sourced from the parser's cross-domain skills bank, not a fixed industry.
     gaps: List[str] = []
     resume_skills = {s.lower() for s in (profile or {}).get("skills", [])}
-    for term in ("sap", "excel", "forecasting", "erp"):
-        if term in desc and term not in resume_skills:
+    try:
+        from backend.services.parser.resume_parser import SKILLS_BANK as _BANK
+    except Exception:
+        _BANK = ["sap", "excel", "forecasting", "erp", "sql", "python"]
+    for term in _BANK:
+        if term in desc and term not in resume_skills and term not in gaps:
             gaps.append(term)
+        if len(gaps) >= 6:
+            break
 
     return {"fit_score": score, "fit_level": level, "reasons": reasons, "gaps": gaps}

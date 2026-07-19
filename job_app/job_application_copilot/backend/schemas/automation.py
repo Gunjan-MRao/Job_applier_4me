@@ -41,3 +41,7 @@ class AutomationStatusResponse(BaseModel):
     top_matches: List[Dict[str, Any]] = []
     applied_jobs: List[Dict[str, Any]] = []
     created_at: str
+    # Honest data-source signalling: True when results are built-in sample/mock
+    # listings rather than live job data (e.g. no API keys configured).
+    used_mock: bool = False
+    source_used: Optional[str] = None

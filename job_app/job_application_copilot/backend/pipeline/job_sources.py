@@ -136,7 +136,7 @@ def fetch_adzuna(
             "app_id": app_id,
             "app_key": app_key,
             "results_per_page": results_per_page,
-            "what": query or "supply chain",
+            "what": query or "jobs",
             "where": location or "UK",
             "content-type": "application/json",
         }
@@ -200,7 +200,7 @@ def fetch_reed(
 
     sess = session or requests.Session()
     params = {
-        "keywords": query or "supply chain",
+        "keywords": query or "jobs",
         "locationName": location or "United Kingdom",
         "resultsToTake": results,
     }
