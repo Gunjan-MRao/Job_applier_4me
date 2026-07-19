@@ -1,0 +1,41 @@
+{
+  "count": 1234,
+  "mean": 34500.0,
+  "results": [
+    {
+      "id": "4001",
+      "title": "Supply Chain Analyst",
+      "description": "We are seeking a supply chain analyst to support demand planning and inventory optimisation. SAP and advanced Excel essential. Visa sponsorship available under the Skilled Worker route.",
+      "company": { "display_name": "DHL Supply Chain" },
+      "location": { "display_name": "Coventry, West Midlands", "area": ["UK", "West Midlands", "Coventry"] },
+      "salary_min": 32000,
+      "salary_max": 38000,
+      "redirect_url": "https://www.adzuna.co.uk/jobs/details/4001",
+      "created": "2026-07-10T09:15:00Z",
+      "contract_type": "permanent"
+    },
+    {
+      "id": "4002",
+      "title": "Logistics Coordinator",
+      "description": "Coordinate freight shipments and manage documentation. You must already have the right to work in the UK; we cannot sponsor visas.",
+      "company": { "display_name": "Kuehne+Nagel" },
+      "location": { "display_name": "London", "area": ["UK", "London"] },
+      "salary_min": 28000,
+      "salary_max": 34000,
+      "redirect_url": "https://www.adzuna.co.uk/jobs/details/4002",
+      "created": "2026-07-12T11:00:00Z",
+      "contract_type": "permanent"
+    },
+    {
+      "id": "4003",
+      "title": "Procurement Assistant",
+      "description": "Support the procurement team with supplier onboarding and spend analysis.",
+      "company": { "display_name": "NHS Supply Chain" },
+      "location": { "display_name": "Nottingham" },
+      "salary_min": 27000,
+      "salary_max": null,
+      "redirect_url": "https://www.adzuna.co.uk/jobs/details/4003",
+      "created": "2026-07-14T08:30:00Z"
+    }
+  ]
+}

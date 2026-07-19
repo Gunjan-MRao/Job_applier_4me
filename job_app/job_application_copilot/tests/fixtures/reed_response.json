@@ -1,0 +1,27 @@
+{
+  "totalResults": 87,
+  "results": [
+    {
+      "jobId": 55001,
+      "jobTitle": "Demand Planner",
+      "employerName": "Unilever",
+      "locationName": "Leeds",
+      "minimumSalary": 35000,
+      "maximumSalary": 42000,
+      "jobDescription": "Own the S&OP forecast for a category and drive demand planning accuracy. SAP IBP and forecasting experience valued. Skilled Worker sponsorship available.",
+      "jobUrl": "https://www.reed.co.uk/jobs/demand-planner/55001",
+      "date": "10/07/2026"
+    },
+    {
+      "jobId": 55002,
+      "jobTitle": "Inventory Analyst",
+      "employerName": "Tesco",
+      "locationName": "Welwyn Garden City",
+      "minimumSalary": 30000,
+      "maximumSalary": 36000,
+      "jobDescription": "Drive stock accuracy and availability using data analysis, forecasting and replenishment tools. Advanced Excel and SQL welcome.",
+      "jobUrl": "https://www.reed.co.uk/jobs/inventory-analyst/55002",
+      "date": "12/07/2026"
+    }
+  ]
+}

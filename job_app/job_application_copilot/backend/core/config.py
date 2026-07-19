@@ -55,8 +55,12 @@ class _Settings:
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
 
     # Job search (all optional / keyless-friendly)
+    # Adzuna is the PRIMARY job source, Reed the secondary. Both are free,
+    # official JSON APIs — no scraping/anti-bot risk. When unset, the pipeline
+    # falls back to clearly-labelled mock listings so the flow is still demoable.
     adzuna_app_id:     str = os.getenv("ADZUNA_APP_ID",     "")
     adzuna_app_key:    str = os.getenv("ADZUNA_APP_KEY",    "")
+    reed_api_key:      str = os.getenv("REED_API_KEY",      "")
 
     # Lead finder (optional)
     hunter_api_key:    str = os.getenv("HUNTER_API_KEY",    "")

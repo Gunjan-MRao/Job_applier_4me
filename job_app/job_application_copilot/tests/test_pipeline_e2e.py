@@ -40,10 +40,24 @@ def test_resume_parser_extracts_real_fields(profile):
 
 
 def test_pipeline_produces_drafted_application(monkeypatch, profile):
-    """Full pipeline, no network, no API keys -> at least one drafted application."""
-    # Stub the two network scrapers so the run is deterministic and offline.
-    monkeypatch.setattr(ar, "scrape_all_jobspy", lambda *a, **k: [])
-    monkeypatch.setattr(ar, "scrape_all_html", lambda *a, **k: [])
+    """Full pipeline, no network, no API keys -> at least one drafted application.
+
+    The pipeline's primary source is now Adzuna/Reed via
+    ``backend.pipeline.orchestrator.gather_jobs``. With no API keys that source
+    returns the realistic mock listings, so we force that deterministic path by
+    stubbing the gather call to return the built-in mock jobs.
+    """
+    from backend.pipeline import job_sources as _js
+    from backend.pipeline import scoring as _sc
+
+    def _fake_gather(keywords, location="United Kingdom", allow_scraper_fallback=False, log_fn=None):
+        jobs = _js.mock_jobs()
+        for j in jobs:
+            j.setdefault("sponsorship_status", _sc.classify_sponsorship(j.get("description", "")))
+        return {"jobs": jobs, "source_used": "mock", "used_mock": True,
+                "notes": ["stubbed: using mock listings"]}
+
+    monkeypatch.setattr(ar, "_gather_jobs", _fake_gather)
 
     payload = AutomationStartPayload(
         candidate_email="bindu.sharma@example.com",

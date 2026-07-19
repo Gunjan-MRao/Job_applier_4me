@@ -76,6 +76,9 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
 
 from backend.core.config import settings
+from backend.pipeline import scoring as _scoring
+from backend.pipeline import drafting as _drafting
+from backend.pipeline.orchestrator import gather_jobs as _gather_jobs
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -269,77 +272,18 @@ def create_run(payload) -> dict:
 # ---------------------------------------------------------------------------
 
 def classify_sponsorship(description: str) -> str:
-    text = (description or "").lower()
-    negative = [
-        "no sponsorship", "unable to sponsor", "must have right to work",
-        "no visa sponsorship", "cannot sponsor", "not able to sponsor",
-        "without sponsorship", "you must already have the right to work",
-        "must already hold", "no tier 2", "must be eligible to work in the uk",
-        "no work permit", "will not sponsor",
-    ]
-    positive = [
-        "visa sponsorship", "sponsorship available", "skilled worker visa",
-        "certificate of sponsorship", "cos available", "we can sponsor",
-        "eligible for sponsorship", "sponsorship may be available",
-        "tier 2", "skilled worker", "sponsor a visa",
-    ]
-    if any(x in text for x in negative):
-        return "no"
-    if any(x in text for x in positive):
-        return "yes"
-    return "unknown"
+    # Canonical implementation now lives in backend.pipeline.scoring; kept here
+    # as a thin delegate so existing imports/tests keep working.
+    return _scoring.classify_sponsorship(description)
 
 # ---------------------------------------------------------------------------
 # Fit scoring
 # ---------------------------------------------------------------------------
 
-ENTRY_LEVEL_TITLES = [
-    "graduate", "junior", "entry level", "entry-level", "trainee",
-    "assistant", "associate", "coordinator", "analyst", "apprentice",
-]
-
-SC_CORE_TERMS = [
-    "supply chain", "logistics", "procurement", "operations",
-    "warehouse", "transport", "inventory", "demand plan", "forecasting",
-    "s&op", "purchasing", "vendor", "freight", "distribution",
-    "sap", "erp", "excel",
-]
-
 def ai_fit_score(job: dict, profile: Optional[dict], keywords: List[str]) -> dict:
-    title    = (job.get("title") or "").lower()
-    desc     = (job.get("description") or "").lower()
-    combined = f"{title} {desc}"
-    desc_is_short = len(desc.strip()) < 80  # LinkedIn often returns minimal description
-
-    # Keyword score — if description is short, score from title only so jobs aren't buried
-    target = title if desc_is_short else combined
-    kw_hits  = sum(1 for kw in keywords if kw and kw.strip().lower() in target)
-    kw_score = min(int(kw_hits / max(len(keywords), 1) * 60), 60)
-
-    # SC term bonus — always check title regardless of description length
-    sc_hits  = sum(1 for t in SC_CORE_TERMS if t in title) + (
-               sum(1 for t in SC_CORE_TERMS if t in desc) if not desc_is_short else 0)
-    sc_bonus = min(sc_hits * 3, 20)
-
-    # Title always earns guaranteed minimum if it contains a supply chain term
-    title_sc_match = any(t in title for t in SC_CORE_TERMS)
-    title_floor    = 15 if title_sc_match else 0
-
-    entry_bonus = 15 if any(t in title for t in ENTRY_LEVEL_TITLES) else 0
-    spons_bonus = 10 if job.get("sponsorship_status") == "yes" else 0
-
-    senior_terms   = ["senior", "lead", "head of", "director", "principal", "vp ", "manager"]
-    exp_hint       = (profile or {}).get("years_of_experience_hint") or ""
-    has_experience = any(c.isdigit() for c in exp_hint)
-    senior_penalty = -20 if any(t in title for t in senior_terms) and not has_experience else 0
-
-    score = max(
-        title_floor,
-        min(kw_score + sc_bonus + entry_bonus + spons_bonus + senior_penalty, 100)
-    )
-    score = max(0, score)
-    level = "strong" if score >= 60 else ("moderate" if score >= 30 else "weak")
-    return {"fit_score": score, "fit_level": level, "reasons": [], "gaps": []}
+    # Canonical scorer now lives in backend.pipeline.scoring; kept here as a thin
+    # delegate so existing imports/tests keep working.
+    return _scoring.score_job(job, profile, keywords)
 
 # ---------------------------------------------------------------------------
 # LLM — FREE first, paid optional, offline always works
@@ -451,179 +395,17 @@ def _llm(prompt: str, max_tokens: int = 500) -> Optional[str]:
     )
 
 # ---------------------------------------------------------------------------
-# Offline cover letter + cold email
-# Evidence-based structure: value first → achievement → sponsorship last (1-2 sentences)
-# ---------------------------------------------------------------------------
-
-def _offline_cover_letter(profile: dict, job: dict) -> str:
-    name      = profile.get("candidate_name") or "Applicant"
-    title     = job.get("title", "the role")
-    company   = job.get("company", "your company")
-    skills    = profile.get("skills") or []
-    exp       = profile.get("years_of_experience_hint") or "relevant"
-    roles     = profile.get("likely_roles") or []
-    spons     = job.get("sponsorship_status", "unknown")
-    sc_skills = [s for s in skills if s in (
-        "supply chain", "logistics", "procurement", "sap", "excel",
-        "forecasting", "demand planning", "inventory management",
-        "operations", "erp", "power bi", "sql",
-    )]
-    top_skills = ", ".join(sc_skills[:3]) if sc_skills else ", ".join(skills[:3]) or "my skills"
-    role_bg    = roles[0].title() if roles else "supply chain and logistics"
-    desc = (job.get("description") or "").lower()
-    if "sap" in desc:
-        detail = "I have hands-on experience with SAP which I understand is central to this role."
-    elif "excel" in desc or "spreadsheet" in desc:
-        detail = "I am proficient in Excel and comfortable building models and dashboards from scratch."
-    elif "forecasting" in desc or "demand" in desc:
-        detail = "I have worked on demand forecasting and inventory optimisation, and I am confident I can contribute quickly."
-    else:
-        detail = "I am confident my background in supply chain and logistics aligns well with what you are looking for."
-
-    # Sponsorship disclosure — always include unless explicitly 'no'
-    if spons == "no":
-        spons_para = ""
-    elif spons == "yes":
-        spons_para = (
-            f"\n\nOne practical note: I would require a Certificate of Sponsorship under the "
-            f"Skilled Worker route. I have noted that {company} holds a sponsor licence and am "
-            f"fully prepared to support the compliance process — this is straightforward from "
-            f"the candidate side and I am happy to discuss it."
-        )
-    else:
-        spons_para = (
-            f"\n\nOne practical note: I would require a Certificate of Sponsorship under the "
-            f"Skilled Worker route. I would welcome the chance to discuss whether {company} is "
-            f"able to support this — I am prepared to make the process as simple as possible."
-        )
-
-    return (
-        f"Dear Hiring Team at {company},\n\n"
-        f"The {title} role at {company} is exactly the kind of position I have been working towards.\n\n"
-        f"My background in {role_bg} has given me {exp} of hands-on experience with "
-        f"{top_skills}. {detail}\n\n"
-        f"I am ready to contribute from day one and would welcome the chance to discuss how "
-        f"I can add value — would you be open to a brief call this week?"
-        f"{spons_para}\n\n"
-        f"Thank you for your consideration.\n\nKind regards,\n{name}"
-    )
-
-def _offline_cold_email(profile: dict, job: dict) -> str:
-    name      = profile.get("candidate_name") or "Applicant"
-    title     = job.get("title", "the role")
-    company   = job.get("company", "your company")
-    skills    = profile.get("skills") or []
-    exp       = profile.get("years_of_experience_hint") or "relevant"
-    spons     = job.get("sponsorship_status", "unknown")
-    sc_skills = [s for s in skills if s in (
-        "supply chain", "logistics", "procurement", "sap", "excel", "operations",
-    )]
-    top_skills = ", ".join(sc_skills[:3]) if sc_skills else ", ".join(skills[:2]) or "supply chain"
-
-    if spons == "no":
-        spons_line = ""
-    else:
-        spons_line = (
-            "\n\nNote: I require a Certificate of Sponsorship (Skilled Worker route) — "
-            "happy to discuss this on a call."
-        )
-
-    return (
-        f"Subject: {title} — {name}\n\n"
-        f"Hi,\n\n"
-        f"I came across the {title} role at {company} and wanted to reach out directly.\n\n"
-        f"I have {exp} experience in {top_skills} and am actively looking for a "
-        f"supply chain or logistics role in the UK. "
-        f"I am a quick learner, detail-oriented, and ready to contribute from day one."
-        f"{spons_line}\n\n"
-        f"Would you have 15 minutes for a quick chat?\n\nBest,\n{name}"
-    )
-
-# ---------------------------------------------------------------------------
 # LLM generation (public)
 # ---------------------------------------------------------------------------
 
 def generate_cover_letter(profile: dict, job: dict) -> str:
-    name      = profile.get("candidate_name") or "Applicant"
-    title     = job.get("title", "the role")
-    company   = job.get("company", "your company")
-    spons     = job.get("sponsorship_status", "unknown")
-    sc_skills = [s for s in (profile.get("skills") or []) if s in (
-        "supply chain", "logistics", "procurement", "sap", "excel",
-        "forecasting", "demand planning", "inventory management",
-        "operations", "erp", "power bi", "sql", "s&op",
-    )]
-    skills_str = ", ".join(sc_skills[:6]) or ", ".join((profile.get("skills") or [])[:6])
-    exp        = profile.get("years_of_experience_hint") or "some"
-    desc_snip  = (job.get("description") or "")[:400]
-
-    # Build the sponsorship instruction for the LLM based on job's sponsorship status
-    if spons == "no":
-        spons_instruction = (
-            "Do NOT mention visa sponsorship — this employer cannot sponsor."
-        )
-    elif spons == "yes":
-        spons_instruction = (
-            f"IMPORTANT: In the FINAL paragraph add exactly 1-2 sentences disclosing that "
-            f"{name} requires a Certificate of Sponsorship (Skilled Worker route), and that "
-            f"they have noted {company} holds a sponsor licence and are prepared to support "
-            f"the compliance process. Frame as logistics, NOT as a request. Confident tone. "
-            f"Do NOT apologise for needing sponsorship."
-        )
-    else:
-        spons_instruction = (
-            f"IMPORTANT: In the FINAL paragraph add exactly 1-2 sentences disclosing that "
-            f"{name} requires a Certificate of Sponsorship (Skilled Worker route), and would "
-            f"welcome the chance to discuss whether {company} is able to support this. "
-            f"Frame as logistics, NOT as a request. Confident tone. "
-            f"Do NOT apologise for needing sponsorship."
-        )
-
-    prompt = (
-        f"Write a concise, genuine cover letter for {name} applying for '{title}' at {company}. "
-        f"The candidate has {exp} experience in supply chain and logistics with skills: {skills_str}. "
-        f"Job excerpt: {desc_snip}. "
-        f"Structure: (1) Opening — specific interest in role + company, "
-        f"(2) Value — strongest qualification matched to JD, "
-        f"(3) Evidence — one specific quantified supply chain achievement, "
-        f"(4) Sponsorship disclosure paragraph. "
-        f"Rules: under 230 words, warm human tone, no filler openers like 'I am writing to', "
-        f"no square brackets, first sentence names role + company, "
-        f"end paragraph 3 with a direct ask for a call. "
-        f"{spons_instruction}"
-    )
-    return _llm(prompt, max_tokens=450) or _offline_cover_letter(profile, job)
+    # Canonical drafting lives in backend.pipeline.drafting; the local _llm chain
+    # (Groq -> Gemini -> HF -> OpenAI -> Anthropic -> offline) is injected so the
+    # provider fallback behaviour is unchanged.
+    return _drafting.draft_cover_letter(profile, job, llm_fn=_llm)
 
 def generate_cold_email(profile: dict, job: dict) -> str:
-    name      = profile.get("candidate_name") or "Applicant"
-    title     = job.get("title", "the role")
-    company   = job.get("company", "your company")
-    spons     = job.get("sponsorship_status", "unknown")
-    sc_skills = [s for s in (profile.get("skills") or []) if s in (
-        "supply chain", "logistics", "procurement", "sap", "excel", "operations",
-    )]
-    skills_str = ", ".join(sc_skills[:4]) or ", ".join((profile.get("skills") or [])[:3])
-    exp        = profile.get("years_of_experience_hint") or "some"
-
-    if spons == "no":
-        spons_instruction = "Do NOT mention visa sponsorship — this employer cannot sponsor."
-    else:
-        spons_instruction = (
-            "IMPORTANT: Add a single final line disclosing that the candidate requires a "
-            "Certificate of Sponsorship (Skilled Worker route). Keep it brief, factual, "
-            "and confident — NOT apologetic. Example: "
-            "'Note: I require a Certificate of Sponsorship — happy to discuss on a call.'"
-        )
-
-    prompt = (
-        f"Write a short cold email from {name} to a recruiter at {company} about '{title}'. "
-        f"Background: {exp} experience in supply chain / logistics, skills: {skills_str}. "
-        f"Rules: subject line first starting 'Subject:', under 130 words total, "
-        f"sound human not corporate, no hollow openers, "
-        f"end with a low-friction ask for a 15-minute call. "
-        f"{spons_instruction}"
-    )
-    return _llm(prompt, max_tokens=300) or _offline_cold_email(profile, job)
+    return _drafting.draft_cold_email(profile, job, llm_fn=_llm)
 
 def generate_resume_tailoring(profile: dict, job: dict) -> dict:
     try:
@@ -1107,26 +889,31 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         auto_apply     = getattr(payload, "auto_apply", True)
         spons_required = getattr(payload, "sponsorship_required", False)
 
+        allow_scraper = getattr(payload, "allow_scraper_fallback", False)
         update_run(run_id,
-                   stage="📡 Searching LinkedIn, Indeed, Google, Reed, CV-Library, TotalJobs, "
-                         "CWJobs, Guardian, Glassdoor, Adzuna, GOV.UK, NHS Jobs, UK Visa Sponsorships...",
+                   stage="📡 Searching Adzuna (primary) and Reed (secondary) for UK jobs...",
                    progress_percent=5)
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_js = ex.submit(scrape_all_jobspy, payload.keywords, payload.location, run)
-            f_ht = ex.submit(scrape_all_html,   payload.keywords, payload.location, run)
-            jobspy_jobs = f_js.result()
-            html_jobs   = f_ht.result()
+        def _search_log(level, msg):
+            add_log(run, level, msg)
 
-        all_jobs = dedupe_jobs(jobspy_jobs + html_jobs)
+        gathered = _gather_jobs(
+            payload.keywords, payload.location,
+            allow_scraper_fallback=allow_scraper, log_fn=_search_log,
+        )
+        all_jobs = gathered["jobs"]
+        for note in gathered["notes"]:
+            add_log(run, "info", note)
+        add_log(run, "info",
+                f"Source used: {gathered['source_used']} "
+                f"({'MOCK — set ADZUNA_APP_ID/ADZUNA_APP_KEY for real data' if gathered['used_mock'] else 'live'})")
+
         all_jobs = apply_filters(all_jobs, blacklist, whitelist, spons_required)
         update_run(run_id, jobs_scanned=len(all_jobs), progress_percent=50)
-        add_log(run, "info",
-                f"Total after dedup+filter: {len(all_jobs)} "
-                f"(jobspy={len(jobspy_jobs)} html/api={len(html_jobs)})")
+        add_log(run, "info", f"Total after filter: {len(all_jobs)}")
 
         if not all_jobs:
-            add_log(run, "warning", "No live jobs found — showing sample jobs")
+            add_log(run, "warning", "No jobs after filtering — showing sample jobs")
             all_jobs = FALLBACK_JOBS[:]
             update_run(run_id, jobs_scanned=len(all_jobs))
 

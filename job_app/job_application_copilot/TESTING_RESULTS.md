@@ -9,6 +9,67 @@ job with a drafted cover letter and cold email — with zero API keys configured
 
 ---
 
+## 0. Core pipeline rebuild — Adzuna primary, LinkedIn scraping demoted
+
+**Root cause addressed.** The original pipeline's *primary* job source was
+LinkedIn/Indeed scraping (python-jobspy) plus HTML board scrapers. Those
+silently break the moment a site changes markup or rate-limits/CAPTCHAs an
+automated client, producing the "0 real jobs, always" failure. This rebuild
+makes a stable, documented API the primary source and demotes scraping to an
+opt-in fallback.
+
+**New architecture** — a self-contained, unit-tested `backend/pipeline/` package:
+
+| Module | Responsibility |
+| --- | --- |
+| `job_sources.py` | Canonical job fetch. **Adzuna JSON API = primary**, **Reed API = secondary**, legacy scraper = opt-in fallback, realistic mock listings = last resort. |
+| `scoring.py` | Pure `classify_sponsorship()` + `score_job()` (no network/LLM). |
+| `drafting.py` | Cover-letter / cold-email drafting with the LLM injected as a callable; offline templates when no key. |
+| `orchestrator.py` | `gather_jobs()` + `run_pipeline()` wiring the stages. |
+
+`backend/services/automation_runtime.py` now delegates `classify_sponsorship`,
+`ai_fit_score`, `generate_cover_letter`, and `generate_cold_email` to this
+package (single source of truth) and its search phase calls `gather_jobs()`
+instead of the scrapers. The Groq→Gemini→HF→OpenAI→Anthropic→offline provider
+chain is preserved by injecting the existing `_llm` callable into the drafts.
+
+**Verified end-to-end with NO API keys** (mirrors the app's backend path):
+
+```
+PARSED: Bindu Sharma | skills: ['supply chain', 'logistics', 'procurement', 'sap', 'excel']
+Adzuna unavailable (no key or no results)
+Reed unavailable (no key or no results)
+No live job source configured — using mock listings. Set ADZUNA_APP_ID / ADZUNA_APP_KEY ...
+Source used: mock (MOCK — set ADZUNA_APP_ID/ADZUNA_APP_KEY for real data)
+STATUS: completed | scanned: 6 | matched: 6
+TOP MATCH: Supply Chain Analyst @ DHL Supply Chain fit=65 source=Mock (no API key)
+COVER LETTER: Dear Hiring Team at DHL Supply Chain, The Supply Chain Analyst role ...
+COLD EMAIL: Subject: Supply Chain Analyst — Bindu Sharma ...
+```
+
+**New tests** (all green, `/tmp/venv/bin/python -m pytest tests/` → **229 passed**,
+up from the 184 baseline):
+
+- `tests/test_job_sources.py` — Adzuna & Reed adapters parsed against realistic
+  fixture JSON matching each provider's real schema
+  (`tests/fixtures/adzuna_response.json`, `reed_response.json`); no-credential
+  paths return `[]`; Adzuna 401 handled; mock listings realistic + isolated.
+- `tests/test_pipeline_scoring.py` — sponsorship classifier (negative beats
+  positive), title floor, keyword scoring, senior penalty, skill gaps.
+- `tests/test_pipeline_drafting.py` — offline templates + LLM-first path with a
+  stubbed callable, and fallback when the LLM returns `None`/raises.
+- `tests/test_pipeline_orchestrator.py` — source priority (Adzuna→Reed→scraper
+  →mock), dedupe, opt-in scraper, and `run_pipeline` full flow.
+- `tests/test_pipeline_e2e.py` — updated to stub the new `gather_jobs` source
+  (was stubbing the removed scrapers).
+
+**Could NOT verify without real keys:** live Adzuna/Reed HTTP responses. Those
+paths are covered by fixture-based tests using each API's documented response
+schema, but a real `ADZUNA_APP_ID`/`ADZUNA_APP_KEY` (and optionally
+`REED_API_KEY`) is required to confirm against the live services.
+
+---
+
 ## 1. What was broken
 
 | # | File | Bug | Impact |
