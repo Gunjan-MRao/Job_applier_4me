@@ -33,7 +33,15 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import warnings
 from pathlib import Path
+
+# Suppress the urllib3/charset-normalizer version mismatch warning that can
+# appear when requests is imported before the env is fully upgraded. This is
+# cosmetic only -- the warning does not break anything -- but it clutters the
+# launch console and worries users. The root cause (old requests pin) is fixed
+# in requirements.txt; this suppression is a belt-and-braces guard.
+warnings.filterwarnings("ignore", category=Warning, module="requests")
 
 BASE_DIR = Path(__file__).resolve().parent
 API_HOST = "127.0.0.1"
@@ -108,27 +116,47 @@ def _missing_deps():
 
 
 def ensure_dependencies():
+    """Install or upgrade all packages from requirements.txt.
+
+    We always run pip install --upgrade so that version-constraint changes
+    (such as the requests>=2.32 / urllib3>=2 / charset-normalizer>=3 fix that
+    silences the RequestsDependencyWarning) take effect without the user having
+    to manually re-run pip. The --quiet flag keeps the output tidy; errors still
+    surface as a non-zero return code and a RuntimeError.
+    """
     print("[1/4] Checking dependencies...")
-    missing = _missing_deps()
-    if not missing:
+    req = BASE_DIR / "requirements.txt"
+    if not req.exists():
+        print("      requirements.txt not found -- skipping upgrade step.")
+        missing = _missing_deps()
+        if missing:
+            raise RuntimeError(
+                f"Required packages not installed: {', '.join(missing)}\n"
+                f"requirements.txt is missing from {BASE_DIR}"
+            )
         print("      Dependencies OK.")
         return
-    print(f"      Missing: {', '.join(missing)} -- installing from requirements.txt ...")
-    req = BASE_DIR / "requirements.txt"
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip"])
+
+    # Always upgrade so pinned-version changes (e.g. requests pin bump) apply.
+    print("      Running pip install --upgrade -r requirements.txt ...")
     rc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", str(req)]
+        [
+            sys.executable, "-m", "pip", "install",
+            "--upgrade", "--quiet",
+            "-r", str(req),
+        ]
     ).returncode
     if rc != 0:
         raise RuntimeError(
             "pip install failed. Check your internet connection, then run manually:\n"
-            f'    "{sys.executable}" -m pip install -r "{req}"'
+            f'    "{sys.executable}" -m pip install --upgrade -r "{req}"'
         )
+
     still = _missing_deps()
     if still:
         raise RuntimeError(
             f"Required packages still not importable after install: {', '.join(still)}\n"
-            f'Try:  "{sys.executable}" -m pip install -r "{req}"'
+            f'Try:  "{sys.executable}" -m pip install --upgrade -r "{req}"'
         )
     print("      Dependencies OK.")
 
