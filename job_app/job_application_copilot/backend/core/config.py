@@ -24,7 +24,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(_PROJECT_ROOT / ".env")
+    # override=True: always write .env values into os.environ regardless of
+    # import order. Without this, if any module touched os.environ before
+    # config.py loaded, our keys would silently read as empty strings.
+    load_dotenv(_PROJECT_ROOT / ".env", override=True)
 except ImportError:
     pass
 
@@ -37,49 +40,77 @@ def _get_int(name: str, default: int) -> int:
 
 
 class _Settings:
-    # App metadata
-    app_name:          str  = os.getenv("APP_NAME",  "Job Application Copilot")
-    app_env:           str  = os.getenv("APP_ENV",   "development")
-    debug:             bool = os.getenv("DEBUG",     "false").lower() == "true"
+    """Lazy-read settings: every attribute calls os.getenv() at access time,
+    not at import time, so load_dotenv() is always guaranteed to have run first.
+    """
 
-    # Database (SQLite by default — file lives inside the project folder)
-    database_url:      str = os.getenv(
-        "DATABASE_URL", f"sqlite:///{_PROJECT_ROOT / 'storage' / 'jobs.db'}"
-    )
+    # -- App metadata --
+    @property
+    def app_name(self) -> str:  return os.getenv("APP_NAME",  "Job Application Copilot")
+    @property
+    def app_env(self) -> str:   return os.getenv("APP_ENV",   "development")
+    @property
+    def debug(self) -> bool:    return os.getenv("DEBUG", "false").lower() == "true"
 
-    # LLM providers — Groq is the free primary; the rest are optional fallbacks
-    groq_api_key:      str = os.getenv("GROQ_API_KEY",      "")
-    gemini_api_key:    str = os.getenv("GEMINI_API_KEY",    "")
-    hf_api_key:        str = os.getenv("HF_API_KEY",        "")
-    openai_api_key:    str = os.getenv("OPENAI_API_KEY",    "")
-    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    # -- Database --
+    @property
+    def database_url(self) -> str:
+        return os.getenv(
+            "DATABASE_URL",
+            f"sqlite:///{_PROJECT_ROOT / 'storage' / 'jobs.db'}"
+        )
 
-    # Job search (all optional / keyless-friendly)
-    # Adzuna is the PRIMARY job source, Reed the secondary. Both are free,
-    # official JSON APIs — no scraping/anti-bot risk. When unset, the pipeline
-    # falls back to clearly-labelled mock listings so the flow is still demoable.
-    adzuna_app_id:     str = os.getenv("ADZUNA_APP_ID",     "")
-    adzuna_app_key:    str = os.getenv("ADZUNA_APP_KEY",    "")
-    reed_api_key:      str = os.getenv("REED_API_KEY",      "")
+    # -- LLM providers (Groq = free primary; rest = optional fallbacks) --
+    @property
+    def groq_api_key(self) -> str:      return os.getenv("GROQ_API_KEY",      "")
+    @property
+    def gemini_api_key(self) -> str:    return os.getenv("GEMINI_API_KEY",    "")
+    @property
+    def hf_api_key(self) -> str:        return os.getenv("HF_API_KEY",        "")
+    @property
+    def openai_api_key(self) -> str:    return os.getenv("OPENAI_API_KEY",    "")
+    @property
+    def anthropic_api_key(self) -> str: return os.getenv("ANTHROPIC_API_KEY", "")
 
-    # Lead finder (optional)
-    hunter_api_key:    str = os.getenv("HUNTER_API_KEY",    "")
-    apollo_api_key:    str = os.getenv("APOLLO_API_KEY",    "")
+    # -- Job search APIs --
+    # Adzuna = PRIMARY (free, official JSON REST, UK-focused)
+    # Reed   = SECONDARY (free, official JSON REST, UK-focused)
+    # Both require keys; without them the pipeline falls back to mock listings.
+    @property
+    def adzuna_app_id(self) -> str:  return os.getenv("ADZUNA_APP_ID",  "")
+    @property
+    def adzuna_app_key(self) -> str: return os.getenv("ADZUNA_APP_KEY", "")
+    @property
+    def reed_api_key(self) -> str:   return os.getenv("REED_API_KEY",   "")
 
-    # Email / SMTP (free cold-email sending via e.g. Gmail App Password)
-    # EMAIL_ADDRESS / EMAIL_PASSWORD are the canonical names; SMTP_USER /
-    # SMTP_PASS are accepted as aliases for convenience.
-    email_address:     str = os.getenv("EMAIL_ADDRESS") or os.getenv("SMTP_USER", "")
-    email_password:    str = os.getenv("EMAIL_PASSWORD") or os.getenv("SMTP_PASS", "")
-    smtp_host:         str = os.getenv("SMTP_HOST",      "smtp.gmail.com")
-    smtp_port:         int = _get_int("SMTP_PORT", 465)
+    # -- Lead finder (optional) --
+    @property
+    def hunter_api_key(self) -> str: return os.getenv("HUNTER_API_KEY", "")
+    @property
+    def apollo_api_key(self) -> str: return os.getenv("APOLLO_API_KEY", "")
 
-    # Storage paths (relative to project root unless absolute)
-    storage_dir:       str = os.getenv("STORAGE_DIR",    "storage")
-    resume_dir:        str = os.getenv("RESUME_DIR",     "storage/resumes")
-    generated_dir:     str = os.getenv("GENERATED_DIR",  "storage/generated")
-    screenshot_dir:    str = os.getenv("SCREENSHOT_DIR", "storage/screenshots")
-    log_dir:           str = os.getenv("LOG_DIR",        "storage/logs")
+    # -- Email / SMTP --
+    # EMAIL_ADDRESS / EMAIL_PASSWORD are canonical; SMTP_USER / SMTP_PASS accepted as aliases.
+    @property
+    def email_address(self) -> str:  return os.getenv("EMAIL_ADDRESS") or os.getenv("SMTP_USER", "")
+    @property
+    def email_password(self) -> str: return os.getenv("EMAIL_PASSWORD") or os.getenv("SMTP_PASS", "")
+    @property
+    def smtp_host(self) -> str:      return os.getenv("SMTP_HOST", "smtp.gmail.com")
+    @property
+    def smtp_port(self) -> int:      return _get_int("SMTP_PORT", 465)
+
+    # -- Storage paths (relative to project root unless absolute) --
+    @property
+    def storage_dir(self) -> str:    return os.getenv("STORAGE_DIR",    "storage")
+    @property
+    def resume_dir(self) -> str:     return os.getenv("RESUME_DIR",     "storage/resumes")
+    @property
+    def generated_dir(self) -> str:  return os.getenv("GENERATED_DIR",  "storage/generated")
+    @property
+    def screenshot_dir(self) -> str: return os.getenv("SCREENSHOT_DIR", "storage/screenshots")
+    @property
+    def log_dir(self) -> str:        return os.getenv("LOG_DIR",        "storage/logs")
 
 
 settings = _Settings()
