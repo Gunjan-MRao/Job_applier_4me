@@ -37,6 +37,7 @@ VISA SPONSORSHIP STRATEGY (evidence-based, Jan 2027 deadline):
   Where to put it: FINAL paragraph of cover letter, LAST line of cold email.
   Exception: if job posting explicitly mentions sponsorship available, reference it early.
 """
+import asyncio
 import math
 import threading
 import time
@@ -85,6 +86,26 @@ from backend.pipeline.orchestrator import gather_jobs as _gather_jobs
 # ---------------------------------------------------------------------------
 RUNS: Dict[str, dict] = {}
 RUN_LOCK = threading.Lock()
+
+# Shared EmailWorker instance (rate-limited: 25 emails/day, 15-45 min gaps).
+# Lazy-initialised so the app boots even when smtplib is unavailable.
+_EMAIL_WORKER = None
+_EMAIL_WORKER_LOCK = threading.Lock()
+
+
+def _get_email_worker():
+    """Return a shared EmailWorker, or None if SMTP is not configured."""
+    global _EMAIL_WORKER
+    if not settings.email_address or not settings.email_password:
+        return None
+    with _EMAIL_WORKER_LOCK:
+        if _EMAIL_WORKER is None:
+            try:
+                from backend.services.email_worker import EmailWorker
+                _EMAIL_WORKER = EmailWorker()
+            except Exception:
+                return None
+    return _EMAIL_WORKER
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -253,7 +274,8 @@ def create_run(payload) -> dict:
         "progress_percent":  0,
         "jobs_scanned":      0,
         "jobs_matched":      0,
-        "jobs_applied":      0,
+        "jobs_drafted":      0,   # renamed from jobs_applied: counts docs produced
+        "jobs_emailed":      0,   # new: counts cold emails actually sent via SMTP
         "jobs_failed":       0,
         "current_url":       None,
         "logs":              [],
@@ -854,19 +876,44 @@ def stream_apply_job(job: dict, profile: Optional[dict], keywords: List[str],
     title   = job.get("title", "?")
     company = job.get("company", "?")
     fit     = job.get("fit_score", 0)
+
+    # --- Step 1: Discover real recruiter contact (lead_finder) --------------
+    # Use email already on the job if present (e.g. from JobSpy), otherwise
+    # try Hunter.io -> Apollo.io -> heuristic pattern. Never blocks on failure.
+    recruiter_email = job.get("recruiter_email") or None
+    recruiter_strategy = "job_listing"
+    if not recruiter_email:
+        try:
+            from backend.services.lead_finder import sync_find_recruiter_email
+            lead = sync_find_recruiter_email(
+                company=company,
+                job_title=title,
+            )
+            recruiter_email   = lead.get("email")
+            recruiter_strategy = lead.get("strategy", "heuristic")
+        except Exception as exc:
+            add_log(run, "warning", f"lead_finder failed for {company}: {exc}")
+
     entry = {
-        "title":              title,
-        "company":            company,
-        "url":                job.get("url", ""),
-        "fit_score":          fit,
-        "sponsorship_status": job.get("sponsorship_status", "unknown"),
-        "sponsor_tier":       job.get("sponsor_tier") or sponsor_tier(job),
-        "source":             job.get("source", ""),
-        "cover_letter":       None,
-        "cold_email":         None,
-        "resume_guidance":    None,
+        "title":                    title,
+        "company":                  company,
+        "url":                      job.get("url", ""),
+        "fit_score":                fit,
+        "sponsorship_status":       job.get("sponsorship_status", "unknown"),
+        "sponsor_tier":             job.get("sponsor_tier") or sponsor_tier(job),
+        "source":                   job.get("source", ""),
+        "recruiter_email":          recruiter_email,
+        "recruiter_email_strategy": recruiter_strategy,
+        # honest flags — set below
+        "cover_letter":             None,
+        "cold_email":               None,
+        "resume_guidance":          None,
+        "email_sent":               False,
+        "email_sent_at":            None,
     }
+
     if auto_apply and profile:
+        # --- Step 2: Generate documents -------------------------------------
         try:
             entry["resume_guidance"] = generate_resume_tailoring(
                 profile, {"title": title, "company": company,
@@ -882,9 +929,53 @@ def stream_apply_job(job: dict, profile: Optional[dict], keywords: List[str],
             entry["cold_email"] = generate_cold_email(profile, job)
         except Exception as exc:
             add_log(run, "warning", f"Cold email failed for {title}: {exc}")
+
+        # --- Step 3: Actually send the cold email (EmailWorker) -------------
+        # Only fires when EMAIL_ADDRESS + EMAIL_PASSWORD are set in .env.
+        # Rate-limited: max 25 emails/day, random 15-45 min delay between sends.
+        # Falls back silently to draft-only when SMTP not configured.
+        email_worker = _get_email_worker()
+        if email_worker and entry["cold_email"] and recruiter_email:
+            try:
+                candidate_name = (profile or {}).get("name", "Candidate")
+                subject = f"Application — {title} at {company} | {candidate_name}"
+                sent = asyncio.run(
+                    email_worker.send(
+                        to_address=recruiter_email,
+                        subject=subject,
+                        body=entry["cold_email"],
+                        from_name=candidate_name,
+                    )
+                )
+                entry["email_sent"]    = bool(sent)
+                entry["email_sent_at"] = now_iso() if sent else None
+                if sent:
+                    add_log(run, "info",
+                            f"✉️  Cold email sent → {recruiter_email} "
+                            f"({recruiter_strategy}) | {title} @ {company}")
+                    with RUN_LOCK:
+                        run_obj = RUNS.get(run_id)
+                        if run_obj:
+                            run_obj["jobs_emailed"] = run_obj.get("jobs_emailed", 0) + 1
+                else:
+                    add_log(run, "warning",
+                            f"Email not sent to {recruiter_email} "
+                            f"(daily cap or send error) | {title} @ {company}")
+            except Exception as exc:
+                add_log(run, "warning", f"EmailWorker error for {title}: {exc}")
+        elif not email_worker:
+            add_log(run, "debug",
+                    f"SMTP not configured (EMAIL_ADDRESS/EMAIL_PASSWORD missing) — "
+                    f"cold email drafted but not sent for {title} @ {company}")
+        elif not recruiter_email:
+            add_log(run, "debug",
+                    f"No recruiter email found for {company} — "
+                    f"cold email drafted but not sent for {title}")
+
         add_log(run, "info",
                 f"✅ {title} @ {company} | fit={fit}% | spons={job.get('sponsorship_status')} | "
-                f"cl={'yes' if entry['cover_letter'] else 'no'}")
+                f"cl={'yes' if entry['cover_letter'] else 'no'} | "
+                f"email={'sent' if entry['email_sent'] else 'drafted'}")
     else:
         add_log(run, "info", f"📌 {title} @ {company} | fit={fit}%")
 
@@ -892,7 +983,7 @@ def stream_apply_job(job: dict, profile: Optional[dict], keywords: List[str],
         run_obj = RUNS.get(run_id)
         if run_obj:
             run_obj["applied_jobs"].append(entry)
-            run_obj["jobs_applied"] = len(run_obj["applied_jobs"])
+            run_obj["jobs_drafted"] = len(run_obj["applied_jobs"])  # renamed from jobs_applied
             run_obj["top_matches"] = sorted(
                 run_obj["applied_jobs"],
                 key=lambda x: x.get("fit_score", 0), reverse=True,
@@ -931,8 +1022,6 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         all_jobs = gathered["jobs"]
         for note in gathered["notes"]:
             add_log(run, "info", note)
-        # Persist the source/mock status so the UI can show an honest, hard-to-miss
-        # banner when the results are not live job data.
         update_run(run_id,
                    used_mock=bool(gathered["used_mock"]),
                    source_used=gathered["source_used"])
@@ -947,7 +1036,6 @@ def run_automation_pipeline(run_id: str, payload) -> None:
         if not all_jobs:
             add_log(run, "warning", "No jobs after filtering — showing sample jobs")
             all_jobs = FALLBACK_JOBS[:]
-            # These are built-in sample jobs, not live data — flag it honestly.
             update_run(run_id, jobs_scanned=len(all_jobs),
                        used_mock=True, source_used="mock")
 
@@ -973,16 +1061,18 @@ def run_automation_pipeline(run_id: str, payload) -> None:
 
         final_run = get_run(run_id) or {}
         summary = {
-            "keywords":     payload.keywords,
-            "location":     payload.location,
-            "jobs_seen":    len(all_jobs),
-            "matched_jobs": matched,
-            "used_mock":    bool(final_run.get("used_mock")),
-            "source_used":  final_run.get("source_used"),
-            "applied_jobs": len(final_run.get("applied_jobs", [])),
+            "keywords":      payload.keywords,
+            "location":      payload.location,
+            "jobs_seen":     len(all_jobs),
+            "matched_jobs":  matched,
+            "used_mock":     bool(final_run.get("used_mock")),
+            "source_used":   final_run.get("source_used"),
+            "jobs_drafted":  len(final_run.get("applied_jobs", [])),   # honest: docs produced
+            "jobs_emailed":  final_run.get("jobs_emailed", 0),          # actual sends
             "top_matches": [
                 {"title": j["title"], "company": j["company"],
-                 "fit_score": j.get("fit_score"), "url": j["url"]}
+                 "fit_score": j.get("fit_score"), "url": j["url"],
+                 "email_sent": j.get("email_sent", False)}
                 for j in sorted(final_run.get("applied_jobs", []),
                                 key=lambda x: x.get("fit_score", 0), reverse=True)[:10]
             ],
@@ -991,7 +1081,8 @@ def run_automation_pipeline(run_id: str, payload) -> None:
                    progress_percent=100, current_url=None, result_summary=summary)
         add_log(run, "info",
                 f"✅ Done: {len(all_jobs)} scanned, {matched} matched, "
-                f"{summary['applied_jobs']} applications prepared")
+                f"{summary['jobs_drafted']} docs drafted, "
+                f"{summary['jobs_emailed']} cold emails sent")
     except Exception as exc:
         run = get_run(run_id)
         if run:
