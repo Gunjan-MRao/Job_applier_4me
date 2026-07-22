@@ -1,0 +1,19 @@
+# React backend additional dependencies
+# Install alongside the main requirements.txt:
+#   pip install -r backend_react/requirements.txt
+#
+# The launch.py react_mode() function handles this automatically.
+
+# MongoDB async driver
+motor~=3.4.0
+pymongo~=4.7.0
+
+# PDF parsing (pdfplumber used instead of PyMuPDF -- no C build needed)
+pdfplumber~=0.11.0
+
+# Email sending (optional -- only needed if RESEND_API_KEY is set)
+resend~=2.3.0
+
+# Already in main requirements.txt but listed here for clarity:
+# fastapi, uvicorn, pydantic, python-dotenv, requests, beautifulsoup4,
+# python-docx, reportlab
