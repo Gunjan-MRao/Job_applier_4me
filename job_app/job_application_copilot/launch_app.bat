@@ -28,6 +28,37 @@ REM ============================================================
 set "CONDA_BASE=%CONDA_BASE%"
 
 REM ============================================================
+REM  MODE SELECTION MENU
+REM ------------------------------------------------------------
+REM  If RUN_MODE is already set (e.g. from a wrapper script or
+REM  environment variable), skip the menu and use that value.
+REM  Otherwise, prompt the user to choose.
+REM ============================================================
+if not defined RUN_MODE (
+    echo  Choose launch mode:
+    echo    [1] Streamlit UI  ^(port 8501^) -- stable, default
+    echo    [2] React UI      ^(port 8001^) -- cinematic frontend
+    echo ============================================================
+    set /p "_CHOICE=Enter 1 or 2 (default = 1): "
+
+    if "!_CHOICE!"=="2" (
+        set "RUN_MODE=react"
+    ) else (
+        set "RUN_MODE=streamlit"
+    )
+)
+
+if /i "!RUN_MODE!"=="react" (
+    echo.
+    echo  Mode: React UI  ^(port 8001^)
+) else (
+    set "RUN_MODE=streamlit"
+    echo.
+    echo  Mode: Streamlit UI  ^(port 8501^)
+)
+echo.
+
+REM ============================================================
 REM  STEP 0 -- Locate + activate the "jobcopilot" Anaconda environment
 REM ============================================================
 echo [0/4] Locating conda...
@@ -141,15 +172,11 @@ echo.
 REM ============================================================
 REM  STEP 1-4 -- Hand off to the Python launcher
 REM ------------------------------------------------------------
-REM  Everything after conda activation (dependency check, port clearing, starting
-REM  the backend + Streamlit, health-polling, and opening the browser) is done by
-REM  launch.py. Python has far more reliable subprocess/polling/error-handling
-REM  than Windows batch -- and, crucially, any failure prints a real traceback
-REM  instead of the window silently vanishing (the exact regression we hit when
-REM  this orchestration lived in batch across several rounds of shell-poll bugs).
-REM  We `call` the interpreter (not `start`) so its output stays in THIS window,
-REM  and `pause` afterwards no matter what so the window can never close before
-REM  you have read whatever it printed (including any Python traceback).
+REM  RUN_MODE is passed as an environment variable so launch.py
+REM  can branch between Streamlit and React orchestration.
+REM  We `call` the interpreter (not `start`) so its output stays
+REM  in THIS window, and `pause` afterwards no matter what so the
+REM  window can never close before you have read whatever it printed.
 REM ============================================================
 call "!PYTHON_EXE!" "%~dp0launch.py"
 
